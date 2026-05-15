@@ -27,7 +27,7 @@ Then open:
 The dashboard has two pages:
 
 - `/` tracks Binance hot-wallet recipient flows.
-- `/masternodes` tracks the current network masternode list from RPC, setup/takedown dates, and whether the collateral destination is in the exchange notes.
+- `/masternodes` tracks the current network masternode list from RPC, setup/takedown dates, moved collateral destination, and exchange label when the moved-to address is known.
 
 ## Vercel
 
