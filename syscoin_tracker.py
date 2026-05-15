@@ -1805,29 +1805,17 @@ def masternodes_html(
     for wallet in load_exchange_hot_wallets():
         exchange_tags.setdefault(wallet["address"], wallet["label"])
 
-    roots = store.conn.execute(
-        """
-        SELECT path, address
-        FROM tracked_outputs
-        WHERE depth = 1
-        """
-    ).fetchall()
-    address_by_root = {row["path"]: row["address"] for row in roots}
-
     node_rows = store.conn.execute(
         """
-        SELECT t.*,
-               CASE WHEN v.outpoint IS NULL THEN 0 ELSE 1 END AS verified
-        FROM tracked_outputs t
-        LEFT JOIN verified_sentries v
+        SELECT t.*, v.outpoint, v.verified_at
+        FROM verified_sentries v
+        JOIN tracked_outputs t
           ON v.source_txid = t.source_txid
          AND v.source_vout = t.source_vout
          AND v.depth = t.depth
          AND v.path = t.path
-        WHERE t.value_sats = ?
         ORDER BY COALESCE(t.block_time, 0) DESC, t.address
-        """,
-        (SENTRY_COLLATERAL_SATS,),
+        """
     ).fetchall()
 
     spend_times = {
@@ -1882,20 +1870,20 @@ def masternodes_html(
 
     prepared_rows = []
     for row in node_rows:
-        origin_address = address_by_root.get(root_path(row["path"]), "")
-        origin_labels = exchange_labels_for_address(origin_address, exchange_tags, exchange_routes) if origin_address else set()
         children = child_outputs_for(row)
-        exit_labels: set[str] = set()
-        largest_exit = 0
+        exit_labels = exchange_labels_for_address(row["address"], exchange_tags, exchange_routes)
+        exit_address = ""
+        exit_value = 0
         for child in children:
             child_address = str(child["address"])
             child_value = int(child["value_sats"])
-            largest_exit = max(largest_exit, child_value)
-            if child_address == "unknown":
+            if child_address == "unknown" or child_address == row["address"]:
                 continue
-            exit_labels.update(exchange_labels_for_address(child_address, exchange_tags, exchange_routes))
-        if not exit_labels and row["spent"] == 1 and largest_exit >= int(SENTRY_COLLATERAL_SATS * Decimal("0.98")):
-            exit_labels.add("Ex-like")
+            if child_value > exit_value:
+                exit_address = child_address
+                exit_value = child_value
+            if child_value >= int(SENTRY_COLLATERAL_SATS * Decimal("0.95")):
+                exit_labels.update(exchange_labels_for_address(child_address, exchange_tags, exchange_routes))
 
         child_times = [int(child["block_time"]) for child in children if child.get("block_time")]
         spend_time = spend_times.get(row["spent_txid"]) if row["spent_txid"] else None
@@ -1903,36 +1891,33 @@ def masternodes_html(
             spend_time = max(child_times)
         taken_down_sort = spend_time or row["spent_height"] or 0
         is_taken_down = row["spent"] == 1
+        exchange_text = ", ".join(sorted(exit_labels)) if exit_labels else "-"
         prepared_rows.append(
             {
                 "row": row,
-                "type": "Verified" if row["verified"] else "Candidate",
-                "type_sort": 1 if row["verified"] else 0,
                 "status": "Taken down" if is_taken_down else "Active",
                 "status_sort": 0 if is_taken_down else 1,
-                "origin_address": origin_address,
-                "origin_labels": ", ".join(sorted(origin_labels)) if origin_labels else "-",
-                "exit": ", ".join(sorted(exit_labels)) if exit_labels else "-",
-                "exit_sort": ",".join(sorted(exit_labels)).lower() if exit_labels else "",
+                "exit_address": exit_address,
+                "exchange": exchange_text,
+                "exchange_sort": exchange_text.lower() if exchange_text != "-" else "",
                 "setup_time": row["block_time"],
                 "taken_down_time": spend_time,
                 "taken_down_sort": taken_down_sort,
             }
         )
 
-    verified_count = sum(1 for item in prepared_rows if item["type"] == "Verified")
     taken_down_count = sum(1 for item in prepared_rows if item["status"] == "Taken down")
-    exchange_exit_count = sum(1 for item in prepared_rows if item["status"] == "Taken down" and item["exit"] != "-")
+    exchange_exit_count = sum(1 for item in prepared_rows if item["exchange"] != "-")
     active_count = len(prepared_rows) - taken_down_count
 
     html_rows = []
     for item in prepared_rows:
         row = item["row"]
         outpoint = f"{row['source_txid']}:{row['source_vout']}"
-        origin_address = item["origin_address"]
-        origin_html = (
-            f"<a href='{explorer_address_url(origin_address)}' title='{html.escape(origin_address)}'>{html.escape(short_address(origin_address))}</a>"
-            if origin_address
+        exit_address = item["exit_address"]
+        exit_address_html = (
+            f"<a href='{explorer_address_url(exit_address)}' title='{html.escape(exit_address)}'>{html.escape(short_address(exit_address))}</a>"
+            if exit_address
             else "-"
         )
         spend_html = (
@@ -1942,14 +1927,12 @@ def masternodes_html(
         )
         html_rows.append(
             f"<tr>"
-            f"<td data-sort='{item['type_sort']}'><span class='badge {'verified' if item['type'] == 'Verified' else 'candidate'}'>{html.escape(item['type'])}</span></td>"
-            f"<td data-sort='{item['status_sort']}'><span class='status {'down' if item['status'] == 'Taken down' else 'active'}'>{html.escape(item['status'])}</span></td>"
-            f"<td data-sort='{html.escape(item['origin_labels'].lower())}'>{html.escape(item['origin_labels'])}</td>"
-            f"<td class='address' data-sort='{html.escape(origin_address.lower())}'>{origin_html}</td>"
-            f"<td class='address' data-sort='{html.escape(row['address'].lower())}'><a href='{explorer_address_url(row['address'])}' title='{html.escape(row['address'])}'>{html.escape(short_address(row['address']))}</a></td>"
             f"<td data-sort='{row['block_time'] or 0}' title='{html.escape(fmt_local_datetime(row['block_time']))}'>{html.escape(fmt_table_datetime(row['block_time']))}</td>"
             f"<td data-sort='{item['taken_down_sort']}' title='{html.escape(fmt_local_datetime(item['taken_down_time']))}'>{html.escape(fmt_table_datetime(item['taken_down_time'])) if item['taken_down_time'] else '-'}</td>"
-            f"<td data-sort='{html.escape(item['exit_sort'])}'>{html.escape(item['exit'])}</td>"
+            f"<td class='address' data-sort='{html.escape(row['address'].lower())}'><a href='{explorer_address_url(row['address'])}' title='{html.escape(row['address'])}'>{html.escape(short_address(row['address']))}</a></td>"
+            f"<td class='address' data-sort='{html.escape(exit_address.lower())}'>{exit_address_html}</td>"
+            f"<td data-sort='{html.escape(item['exchange_sort'])}'>{html.escape(item['exchange'])}</td>"
+            f"<td data-sort='{item['status_sort']}'><span class='status {'down' if item['status'] == 'Taken down' else 'active'}'>{html.escape(item['status'])}</span></td>"
             f"<td class='address' data-sort='{html.escape(outpoint.lower())}'><a href='{explorer_tx_url(row['source_txid'])}' title='{html.escape(outpoint)}'>{html.escape(short_txid(outpoint))}</a></td>"
             f"<td class='address' data-sort='{html.escape((row['spent_txid'] or '').lower())}'>{spend_html}</td>"
             f"</tr>"
@@ -1982,7 +1965,7 @@ def masternodes_html(
     .nav a.active {{ background: #f8fafc; color: #142026; }}
     main {{ display: grid; gap: 22px; margin-top: 22px; margin-bottom: 22px; padding: 0; }}
     main > * {{ min-width: 0; }}
-    .metrics {{ display: grid; grid-template-columns: repeat(5, minmax(130px, 1fr)); gap: 12px; }}
+    .metrics {{ display: grid; grid-template-columns: repeat(4, minmax(130px, 1fr)); gap: 12px; }}
     .metric {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; padding: 14px 16px; min-width: 0; }}
     .metric span {{ display: block; color: #687177; font-size: 0.84rem; margin-bottom: 6px; }}
     .metric b {{ display: block; font-size: clamp(1.25rem, 2vw, 1.65rem); line-height: 1.1; overflow-wrap: anywhere; }}
@@ -1990,7 +1973,7 @@ def masternodes_html(
     .panel-title h2 {{ margin: 0; font-size: 1.25rem; }}
     .panel-title p {{ margin: 0; color: #687177; font-size: 0.9rem; }}
     .table-wrap {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; max-width: 100%; min-width: 0; overflow-x: auto; width: 100%; }}
-    table {{ width: 100%; min-width: 1250px; border-collapse: separate; border-spacing: 0; background: #fff; table-layout: fixed; }}
+    table {{ width: 100%; min-width: 1040px; border-collapse: separate; border-spacing: 0; background: #fff; table-layout: fixed; }}
     th, td {{ padding: 8px 10px; border-bottom: 1px solid #e4e8e2; text-align: left; font-size: 0.88rem; overflow: hidden; text-overflow: ellipsis; }}
     th {{ background: #eaf0ec; position: sticky; top: 0; z-index: 10; box-shadow: 0 1px 0 #d9ded8; }}
     .sort-button {{ appearance: none; border: 0; background: transparent; color: inherit; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; font: inherit; font-weight: 700; padding: 0; text-align: inherit; white-space: nowrap; }}
@@ -1999,20 +1982,16 @@ def masternodes_html(
     th[aria-sort="ascending"] .sort-icon::before {{ content: "^"; }}
     th[aria-sort="descending"] .sort-icon::before {{ content: "v"; }}
     th[aria-sort="none"] .sort-icon::before {{ content: ""; }}
-    th:nth-child(1), td:nth-child(1) {{ width: 92px; }}
-    th:nth-child(2), td:nth-child(2) {{ width: 110px; }}
-    th:nth-child(3), td:nth-child(3) {{ width: 110px; }}
-    th:nth-child(4), td:nth-child(4) {{ width: 205px; }}
-    th:nth-child(5), td:nth-child(5) {{ width: 205px; }}
-    th:nth-child(6), td:nth-child(6) {{ width: 122px; }}
-    th:nth-child(7), td:nth-child(7) {{ width: 122px; }}
-    th:nth-child(8), td:nth-child(8) {{ width: 100px; }}
-    th:nth-child(9), td:nth-child(9) {{ width: 150px; }}
-    th:nth-child(10), td:nth-child(10) {{ width: 150px; }}
+    th:nth-child(1), td:nth-child(1) {{ width: 128px; }}
+    th:nth-child(2), td:nth-child(2) {{ width: 128px; }}
+    th:nth-child(3), td:nth-child(3) {{ width: 220px; }}
+    th:nth-child(4), td:nth-child(4) {{ width: 220px; }}
+    th:nth-child(5), td:nth-child(5) {{ width: 140px; }}
+    th:nth-child(6), td:nth-child(6) {{ width: 112px; }}
+    th:nth-child(7), td:nth-child(7) {{ width: 150px; }}
+    th:nth-child(8), td:nth-child(8) {{ width: 150px; }}
     .address {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; white-space: nowrap; }}
-    .badge, .status {{ border-radius: 999px; display: inline-flex; font-size: 0.78rem; font-weight: 700; padding: 4px 8px; white-space: nowrap; }}
-    .badge.verified {{ background: #dceee7; color: #0d5d40; }}
-    .badge.candidate {{ background: #eef1f3; color: #48535a; }}
+    .status {{ border-radius: 999px; display: inline-flex; font-size: 0.78rem; font-weight: 700; padding: 4px 8px; white-space: nowrap; }}
     .status.active {{ background: #e7f2ff; color: #095c9f; }}
     .status.down {{ background: #fff0df; color: #8a4c00; }}
     a {{ color: #086788; text-decoration: none; }}
@@ -2032,8 +2011,6 @@ def masternodes_html(
       .subtitle {{ color: #b6c3c7; }}
       .metric span, .panel-title p, .sort-icon {{ color: #a7b0b5; }}
       .sort-button:hover, .sort-button:focus-visible {{ color: #67d7ff; }}
-      .badge.verified {{ background: #15382b; color: #b4f0d8; }}
-      .badge.candidate {{ background: #2a3339; color: #d7dee2; }}
       .status.active {{ background: #15304a; color: #b9dcff; }}
       .status.down {{ background: #442d13; color: #ffd9a8; }}
     }}
@@ -2045,7 +2022,7 @@ def masternodes_html(
       <div class="topbar">
         <div>
           <h1>Syscoin Masternode Tracker</h1>
-          <div class="subtitle">100k SYS collateral outputs tied to Binance wallet flows since {html.escape(since_text)}</div>
+          <div class="subtitle">Masternode-list 100k SYS collateral outputs tied to Binance wallet flows since {html.escape(since_text)}</div>
         </div>
         <nav class="nav" aria-label="Dashboard pages">
           <a href="/">Wallet Flows</a>
@@ -2056,31 +2033,28 @@ def masternodes_html(
   </header>
   <main>
     <section class="metrics">
-      <div class="metric"><span>Total 100k Outputs</span><b>{total_count}</b></div>
-      <div class="metric"><span>Verified Nodes</span><b>{verified_count}</b></div>
+      <div class="metric"><span>Masternodes</span><b>{total_count}</b></div>
       <div class="metric"><span>Active</span><b>{active_count}</b></div>
       <div class="metric"><span>Taken Down</span><b>{taken_down_count}</b></div>
-      <div class="metric"><span>Exit To Exchange</span><b>{exchange_exit_count}</b></div>
+      <div class="metric"><span>Exchange From Notes</span><b>{exchange_exit_count}</b></div>
     </section>
     <section>
       <div class="panel-title">
-        <h2>Masternode Collateral Timeline</h2>
+        <h2>Masternodes From Node List</h2>
         <p>Updated {html.escape(updated_text)}</p>
       </div>
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
-              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Type<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="descending"><button class="sort-button" type="button">Date Setup<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Date Taken Down<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Address 100k Moved To<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Taken Down To<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Exchange From Notes?<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="number" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Status<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Funding Trail<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Funding Address<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Node Address<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="number" data-default-dir="desc" aria-sort="descending"><button class="sort-button" type="button">Setup<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Taken Down<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Exit<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Outpoint<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Spend Tx<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Setup Tx<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Takedown Tx<span class="sort-icon" aria-hidden="true"></span></button></th>
             </tr>
           </thead>
           <tbody>{rows_html}</tbody>
@@ -2094,7 +2068,7 @@ def masternodes_html(
       if (!table) return;
       const headers = Array.from(table.querySelectorAll("th[data-sort]"));
       const tbody = table.tBodies[0];
-      let activeIndex = 5;
+      let activeIndex = 0;
       let activeDirection = "desc";
 
       const cellValue = (row, index, type) => {{

@@ -27,7 +27,7 @@ Then open:
 The dashboard has two pages:
 
 - `/` tracks Binance hot-wallet recipient flows.
-- `/masternodes` tracks 100,000 SYS collateral outputs, whether they are still active or spent, and whether a takedown appears to exit through a known or exchange-like address.
+- `/masternodes` tracks masternode-list 100,000 SYS collateral outputs, setup/takedown dates, and whether the destination is in the exchange notes.
 
 ## Vercel
 
