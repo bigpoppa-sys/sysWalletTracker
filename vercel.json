@@ -21,6 +21,10 @@
     {
       "source": "/masternodes.html",
       "destination": "/api/index.py"
+    },
+    {
+      "source": "/sysWalletTracker-vps.tgz",
+      "destination": "/api/index.py"
     }
   ]
 }

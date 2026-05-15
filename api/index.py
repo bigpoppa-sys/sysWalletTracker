@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import csv
+import io
 import os
 import sys
+import tarfile
 import threading
 import time
 import urllib.parse
@@ -42,6 +44,25 @@ DEFAULT_FROM_HEIGHT = 2221358
 DB_PATH = Path(os.getenv("SYS_TRACKER_DB", "/tmp/syscoin_tracker.sqlite"))
 VERIFIED_SENTRIES_PATH = ROOT / "verified_sentries.csv"
 NODE_OUTPUTS_PATH = ROOT / "node_outputs.csv"
+INSTALL_BUNDLE_FILES = (
+    "syscoin_tracker.py",
+    "README.md",
+    "vercel.json",
+    ".gitignore",
+    ".vercelignore",
+    "destinations.csv",
+    "destinations_since_monitoring.csv",
+    "destinations_since_monitoring_all_ranked.csv",
+    "exchange_hot_wallets.csv",
+    "exchange_routes.csv",
+    "exchange_tags.csv",
+    "network_masternodes.csv",
+    "node_outputs.csv",
+    "verified_sentries.csv",
+    "api/index.py",
+    "scripts/install_vps_cron.sh",
+    "scripts/masternode_cron_sync.sh",
+)
 
 _lock = threading.Lock()
 _store: Store | None = None
@@ -249,8 +270,30 @@ def sync_for_request(force: bool = False) -> tuple[Store, int | None, str | None
 
 
 class handler(BaseHTTPRequestHandler):
+    def send_install_bundle(self, include_body: bool = True) -> None:
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+            for relative_path in INSTALL_BUNDLE_FILES:
+                path = ROOT / relative_path
+                if path.exists():
+                    tar.add(path, arcname=relative_path)
+
+        body = buffer.getvalue()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/gzip")
+        self.send_header("Content-Disposition", 'attachment; filename="sysWalletTracker-vps.tgz"')
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if include_body:
+            self.wfile.write(body)
+
     def send_dashboard(self, include_body: bool = True) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/sysWalletTracker-vps.tgz":
+            self.send_install_bundle(include_body=include_body)
+            return
+
         if parsed.path not in ("/", "/index.html", "/api/index.py", "/masternodes", "/masternodes.html"):
             self.send_error(404)
             return
