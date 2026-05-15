@@ -13,7 +13,14 @@
     {
       "source": "/index.html",
       "destination": "/api/index.py"
+    },
+    {
+      "source": "/masternodes",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/masternodes.html",
+      "destination": "/api/index.py"
     }
   ]
 }
-

@@ -24,6 +24,11 @@ Then open:
 
 `http://127.0.0.1:8787`
 
+The dashboard has two pages:
+
+- `/` tracks Binance hot-wallet recipient flows.
+- `/masternodes` tracks 100,000 SYS collateral outputs, whether they are still active or spent, and whether a takedown appears to exit through a known or exchange-like address.
+
 ## Vercel
 
 This repo includes a Vercel Python function at `api/index.py`, so the same
@@ -46,6 +51,7 @@ SYS_TRACKER_SINCE_DATE="2026-04-14 12:30"
 SYS_TRACKER_FROM_HEIGHT="2221358"
 SYS_TRACKER_SYNC_INTERVAL="60"
 SYS_TRACKER_NEXT_HOP_LIMIT="8"
+SYS_TRACKER_NODE_SPEND_LIMIT="12"
 ```
 
 ## Watch Mode

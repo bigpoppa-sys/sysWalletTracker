@@ -20,11 +20,14 @@ from syscoin_tracker import (  # noqa: E402
     DEFAULT_ADDRESS,
     DEFAULT_BLOCKBOOK_URL,
     DEFAULT_TIMEZONE,
+    SENTRY_COLLATERAL_SATS,
     BlockbookClient,
     Store,
     block_height_at_or_after,
     dashboard_html,
+    masternodes_html,
     parse_since_date,
+    refresh_node_spends,
     refresh_spent_first_hops,
     sync_address,
     sys_to_sats,
@@ -97,6 +100,24 @@ def load_verified_sentries(store: Store) -> None:
                     row["verified_at"],
                 ),
             )
+            store.save_output(
+                {
+                    "source_txid": row["source_txid"],
+                    "source_vout": int(row["source_vout"]),
+                    "depth": int(row["depth"]),
+                    "parent_txid": None,
+                    "parent_vout": None,
+                    "address": row["address"],
+                    "value_sats": SENTRY_COLLATERAL_SATS,
+                    "attributed_sats": SENTRY_COLLATERAL_SATS,
+                    "block_height": int(row["block_height"]),
+                    "block_time": int(row["block_time"]),
+                    "spent": None,
+                    "spent_txid": None,
+                    "spent_height": None,
+                    "path": row["path"],
+                }
+            )
     store.conn.commit()
 
 
@@ -147,6 +168,14 @@ def sync_for_request(force: bool = False) -> tuple[Store, int | None, str | None
             page_size=min(env_int("SYS_TRACKER_PAGE_SIZE", 1000), 100),
             max_pages_per_address=1,
         )
+        refresh_node_spends(
+            store,
+            client,
+            watched,
+            limit=env_int("SYS_TRACKER_NODE_SPEND_LIMIT", 12),
+            page_size=min(env_int("SYS_TRACKER_PAGE_SIZE", 1000), 100),
+            max_pages_per_address=1,
+        )
         _last_sync_at = now
         return store, since_time, since_label
 
@@ -154,19 +183,29 @@ def sync_for_request(force: bool = False) -> tuple[Store, int | None, str | None
 class handler(BaseHTTPRequestHandler):
     def send_dashboard(self, include_body: bool = True) -> None:
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path not in ("/", "/index.html", "/api/index.py"):
+        if parsed.path not in ("/", "/index.html", "/api/index.py", "/masternodes", "/masternodes.html"):
             self.send_error(404)
             return
 
         force = urllib.parse.parse_qs(parsed.query).get("force", ["0"])[0] == "1"
         try:
             store, since_time, since_label = sync_for_request(force=force)
-            body = dashboard_html(
-                store,
-                since_time=since_time,
-                since_label=f"{since_label} (from {os.getenv('SYS_TRACKER_SINCE_DATE', DEFAULT_SINCE_DATE)} {os.getenv('SYS_TRACKER_TIMEZONE', DEFAULT_TIMEZONE)})",
-                refresh_seconds=env_int("SYS_TRACKER_SYNC_INTERVAL", 60),
-            ).encode("utf-8")
+            label = f"{since_label} (from {os.getenv('SYS_TRACKER_SINCE_DATE', DEFAULT_SINCE_DATE)} {os.getenv('SYS_TRACKER_TIMEZONE', DEFAULT_TIMEZONE)})"
+            if parsed.path in ("/masternodes", "/masternodes.html"):
+                html_body = masternodes_html(
+                    store,
+                    since_time=since_time,
+                    since_label=label,
+                    refresh_seconds=env_int("SYS_TRACKER_SYNC_INTERVAL", 60),
+                )
+            else:
+                html_body = dashboard_html(
+                    store,
+                    since_time=since_time,
+                    since_label=label,
+                    refresh_seconds=env_int("SYS_TRACKER_SYNC_INTERVAL", 60),
+                )
+            body = html_body.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
@@ -189,4 +228,3 @@ class handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self) -> None:  # noqa: N802
         self.send_dashboard(include_body=False)
-

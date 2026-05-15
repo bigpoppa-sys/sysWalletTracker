@@ -113,6 +113,29 @@ def short_address(address: str) -> str:
     return f"{address[:10]}...{address[-8:]}"
 
 
+def short_txid(txid: str) -> str:
+    if len(txid) <= 18:
+        return txid
+    return f"{txid[:10]}...{txid[-8:]}"
+
+
+def explorer_address_url(address: str) -> str:
+    return f"https://explorer-blockbook.syscoin.org/address/{urllib.parse.quote(address)}"
+
+
+def explorer_tx_url(txid: str) -> str:
+    return f"https://explorer-blockbook.syscoin.org/tx/{urllib.parse.quote(txid)}"
+
+
+def exchange_labels_for_address(address: str, exchange_tags: dict[str, str], exchange_routes: dict[str, str]) -> set[str]:
+    labels = set()
+    if address in exchange_tags:
+        labels.add(exchange_tags[address])
+    if address in exchange_routes:
+        labels.add(exchange_routes[address])
+    return labels
+
+
 def load_exchange_tags(path: Path = DEFAULT_EXCHANGE_TAGS_PATH) -> dict[str, str]:
     if not path.exists():
         return {}
@@ -615,6 +638,16 @@ class Store:
             (spent_txid, spent_height, now_iso(), source_txid, source_vout, depth, path),
         )
 
+    def mark_unspent(self, source_txid: str, source_vout: int, depth: int, path: str) -> None:
+        self.conn.execute(
+            """
+            UPDATE tracked_outputs
+            SET spent = 0, spent_txid = NULL, spent_height = NULL, updated_at = ?
+            WHERE source_txid = ? AND source_vout = ? AND depth = ? AND path = ?
+            """,
+            (now_iso(), source_txid, source_vout, depth, path),
+        )
+
     def unsent_alerts(self) -> list[sqlite3.Row]:
         return self.conn.execute(
             """
@@ -1022,6 +1055,155 @@ def refresh_spent_first_hops(
     return {"examined": examined, "found_spends": found_spends, "created": created, "errors": errors}
 
 
+def refresh_node_spends(
+    store: Store,
+    client: BlockbookClient,
+    watched: set[str],
+    *,
+    limit: int,
+    page_size: int,
+    max_pages_per_address: int,
+) -> dict[str, int]:
+    rows = store.conn.execute(
+        """
+        SELECT t.*
+        FROM tracked_outputs t
+        LEFT JOIN verified_sentries v
+          ON v.source_txid = t.source_txid
+         AND v.source_vout = t.source_vout
+         AND v.depth = t.depth
+         AND v.path = t.path
+        WHERE t.value_sats = ?
+          AND (
+            t.spent IS NULL
+            OR t.spent = 0
+            OR (
+              t.spent = 1
+              AND t.spent_txid IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1
+                FROM tracked_outputs c
+                WHERE c.parent_txid = t.source_txid
+                  AND c.parent_vout = t.source_vout
+                  AND c.source_txid = t.spent_txid
+              )
+            )
+          )
+        ORDER BY CASE WHEN v.outpoint IS NULL THEN 1 ELSE 0 END,
+                 COALESCE(t.block_time, 0) DESC
+        LIMIT ?
+        """,
+        (SENTRY_COLLATERAL_SATS, limit),
+    ).fetchall()
+
+    examined = 0
+    found_spends = 0
+    active = 0
+    created = 0
+    errors = 0
+
+    for row in rows:
+        examined += 1
+        spend = None
+        spent_txid = row["spent_txid"]
+        spent_height = row["spent_height"]
+
+        if row["spent"] != 1 or not spent_txid:
+            try:
+                source_tx = client.tx(row["source_txid"])
+                store.save_tx(source_tx)
+                source_vout = next(
+                    (vout for vout in source_tx.get("vout") or [] if int(vout.get("n", 0)) == int(row["source_vout"])),
+                    None,
+                )
+            except Exception:
+                errors += 1
+                continue
+
+            if not source_vout:
+                errors += 1
+                continue
+
+            if source_vout.get("spent") is False:
+                store.mark_unspent(row["source_txid"], row["source_vout"], row["depth"], row["path"])
+                store.conn.commit()
+                active += 1
+                continue
+
+            if source_vout.get("spent") is True:
+                spent_txid = source_vout.get("spentTxId") or spent_txid
+                spent_height = source_vout.get("spentHeight") or spent_height
+
+        if spent_txid:
+            try:
+                spend = client.tx(spent_txid)
+            except Exception:
+                spend = None
+
+        if spend is None:
+            try:
+                spend = find_spending_tx(
+                    client,
+                    row["address"],
+                    row["source_txid"],
+                    row["source_vout"],
+                    page_size=page_size,
+                    max_pages=max_pages_per_address,
+                    from_height=row["block_height"],
+                )
+            except Exception:
+                errors += 1
+                continue
+
+        if not spend:
+            continue
+
+        found_spends += 1
+        store.save_tx(spend)
+        store.mark_spent(
+            row["source_txid"],
+            row["source_vout"],
+            row["depth"],
+            row["path"],
+            spend["txid"],
+            spend.get("blockHeight") or spent_height,
+        )
+
+        value_in = max(sats(spend.get("valueIn")), 1)
+        tracked_share = Decimal(row["attributed_sats"]) / Decimal(value_in)
+        for vout in spend.get("vout") or []:
+            out_addresses = addresses_from(vout)
+            value = sats(vout.get("value"))
+            if not value or watched.intersection(out_addresses):
+                continue
+            attributed = int(Decimal(value) * tracked_share)
+            if attributed <= 0:
+                continue
+            for address in out_addresses or ["unknown"]:
+                store.save_output(
+                    {
+                        "source_txid": spend["txid"],
+                        "source_vout": int(vout.get("n", 0)),
+                        "depth": int(row["depth"]) + 1,
+                        "parent_txid": row["source_txid"],
+                        "parent_vout": row["source_vout"],
+                        "address": address,
+                        "value_sats": value,
+                        "attributed_sats": attributed,
+                        "block_height": spend.get("blockHeight"),
+                        "block_time": spend.get("blockTime"),
+                        "spent": 1 if vout.get("spent") else 0 if vout.get("spent") is False else None,
+                        "spent_txid": vout.get("spentTxId"),
+                        "spent_height": vout.get("spentHeight"),
+                        "path": f"{row['path']} > {spend['txid']}:{int(vout.get('n', 0))}",
+                    }
+                )
+                created += 1
+        store.conn.commit()
+
+    return {"examined": examined, "found_spends": found_spends, "active": active, "created": created, "errors": errors}
+
+
 def rows_to_markdown(headers: list[str], rows: Iterable[Iterable[Any]]) -> str:
     table = ["| " + " | ".join(headers) + " |", "| " + " | ".join(["---"] * len(headers)) + " |"]
     for row in rows:
@@ -1393,8 +1575,12 @@ def dashboard_html(
     body {{ background: #f7f5f0; color: #1c2227; }}
     header {{ background: #142026; color: #f8fafc; padding: 24px 0 22px; width: 100%; }}
     .header-inner, main {{ margin-left: var(--page-gutter); margin-right: var(--page-gutter); width: auto; }}
+    .topbar {{ display: flex; align-items: end; justify-content: space-between; gap: 16px; }}
     h1 {{ font-size: 1.8rem; margin: 0 0 8px; letter-spacing: 0; }}
     .subtitle {{ color: #c9d5d8; font-size: 0.98rem; line-height: 1.45; }}
+    .nav {{ display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }}
+    .nav a {{ border: 1px solid rgba(248, 250, 252, 0.28); border-radius: 999px; color: #dbe6e9; font-size: 0.84rem; padding: 7px 11px; }}
+    .nav a.active {{ background: #f8fafc; color: #142026; }}
     main {{ display: grid; gap: 22px; margin-top: 22px; margin-bottom: 22px; padding: 0; }}
     main > * {{ min-width: 0; }}
     .metrics {{ display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); gap: 12px; }}
@@ -1447,6 +1633,8 @@ def dashboard_html(
     @media(max-width: 820px) {{
       .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .panel-title {{ align-items: start; flex-direction: column; }}
+      .topbar {{ align-items: start; flex-direction: column; }}
+      .nav {{ justify-content: flex-start; }}
       .header-inner, main {{ margin-left: 12px; margin-right: 12px; }}
       table {{ min-width: 1060px; }}
     }}
@@ -1465,8 +1653,16 @@ def dashboard_html(
 <body>
   <header>
     <div class="header-inner">
-      <h1>Syscoin Hot Wallet Tracker</h1>
-      <div class="subtitle">Binance hot wallet movements since {html.escape(since_text)}</div>
+      <div class="topbar">
+        <div>
+          <h1>Syscoin Hot Wallet Tracker</h1>
+          <div class="subtitle">Binance hot wallet movements since {html.escape(since_text)}</div>
+        </div>
+        <nav class="nav" aria-label="Dashboard pages">
+          <a class="active" href="/">Wallet Flows</a>
+          <a href="/masternodes">Masternodes</a>
+        </nav>
+      </div>
     </div>
   </header>
   <main>
@@ -1598,6 +1794,351 @@ def dashboard_html(
 </html>"""
 
 
+def masternodes_html(
+    store: Store,
+    since_time: int | None = None,
+    since_label: str | None = None,
+    refresh_seconds: int = 60,
+) -> str:
+    exchange_tags = load_exchange_tags()
+    exchange_routes = load_exchange_routes()
+    for wallet in load_exchange_hot_wallets():
+        exchange_tags.setdefault(wallet["address"], wallet["label"])
+
+    roots = store.conn.execute(
+        """
+        SELECT path, address
+        FROM tracked_outputs
+        WHERE depth = 1
+        """
+    ).fetchall()
+    address_by_root = {row["path"]: row["address"] for row in roots}
+
+    node_rows = store.conn.execute(
+        """
+        SELECT t.*,
+               CASE WHEN v.outpoint IS NULL THEN 0 ELSE 1 END AS verified
+        FROM tracked_outputs t
+        LEFT JOIN verified_sentries v
+          ON v.source_txid = t.source_txid
+         AND v.source_vout = t.source_vout
+         AND v.depth = t.depth
+         AND v.path = t.path
+        WHERE t.value_sats = ?
+        ORDER BY COALESCE(t.block_time, 0) DESC, t.address
+        """,
+        (SENTRY_COLLATERAL_SATS,),
+    ).fetchall()
+
+    spend_times = {
+        row["txid"]: row["block_time"]
+        for row in store.conn.execute(
+            """
+            SELECT txid, block_time
+            FROM transactions
+            WHERE txid IN (
+                SELECT spent_txid
+                FROM tracked_outputs
+                WHERE value_sats = ? AND spent_txid IS NOT NULL
+            )
+            """,
+            (SENTRY_COLLATERAL_SATS,),
+        ).fetchall()
+    }
+
+    def child_outputs_for(row: sqlite3.Row) -> list[dict[str, Any]]:
+        if not row["spent_txid"]:
+            return []
+        tracked_children = store.conn.execute(
+            """
+            SELECT address, value_sats, attributed_sats
+            FROM tracked_outputs
+            WHERE parent_txid = ?
+              AND parent_vout = ?
+              AND source_txid = ?
+            ORDER BY value_sats DESC
+            """,
+            (row["source_txid"], row["source_vout"], row["spent_txid"]),
+        ).fetchall()
+        if tracked_children:
+            return [dict(child) for child in tracked_children]
+
+        tx_row = store.conn.execute("SELECT raw_json FROM transactions WHERE txid = ?", (row["spent_txid"],)).fetchone()
+        if not tx_row:
+            return []
+        try:
+            tx = json.loads(tx_row["raw_json"])
+        except json.JSONDecodeError:
+            return []
+        children = []
+        for vout in tx.get("vout") or []:
+            value = sats(vout.get("value"))
+            if not value:
+                continue
+            for address in addresses_from(vout) or ["unknown"]:
+                children.append({"address": address, "value_sats": value, "attributed_sats": value})
+        return children
+
+    prepared_rows = []
+    for row in node_rows:
+        origin_address = address_by_root.get(root_path(row["path"]), "")
+        origin_labels = exchange_labels_for_address(origin_address, exchange_tags, exchange_routes) if origin_address else set()
+        children = child_outputs_for(row)
+        exit_labels: set[str] = set()
+        largest_exit = 0
+        for child in children:
+            child_address = str(child["address"])
+            child_value = int(child["value_sats"])
+            largest_exit = max(largest_exit, child_value)
+            if child_address == "unknown":
+                continue
+            exit_labels.update(exchange_labels_for_address(child_address, exchange_tags, exchange_routes))
+        if not exit_labels and row["spent"] == 1 and largest_exit >= int(SENTRY_COLLATERAL_SATS * Decimal("0.98")):
+            exit_labels.add("Ex-like")
+
+        spend_time = spend_times.get(row["spent_txid"]) if row["spent_txid"] else None
+        taken_down_sort = spend_time or row["spent_height"] or 0
+        is_taken_down = row["spent"] == 1
+        prepared_rows.append(
+            {
+                "row": row,
+                "type": "Verified" if row["verified"] else "Candidate",
+                "type_sort": 1 if row["verified"] else 0,
+                "status": "Taken down" if is_taken_down else "Active",
+                "status_sort": 0 if is_taken_down else 1,
+                "origin_address": origin_address,
+                "origin_labels": ", ".join(sorted(origin_labels)) if origin_labels else "-",
+                "exit": ", ".join(sorted(exit_labels)) if exit_labels else "-",
+                "exit_sort": ",".join(sorted(exit_labels)).lower() if exit_labels else "",
+                "setup_time": row["block_time"],
+                "taken_down_time": spend_time,
+                "taken_down_sort": taken_down_sort,
+            }
+        )
+
+    verified_count = sum(1 for item in prepared_rows if item["type"] == "Verified")
+    taken_down_count = sum(1 for item in prepared_rows if item["status"] == "Taken down")
+    exchange_exit_count = sum(1 for item in prepared_rows if item["status"] == "Taken down" and item["exit"] != "-")
+    active_count = len(prepared_rows) - taken_down_count
+
+    html_rows = []
+    for item in prepared_rows:
+        row = item["row"]
+        outpoint = f"{row['source_txid']}:{row['source_vout']}"
+        origin_address = item["origin_address"]
+        origin_html = (
+            f"<a href='{explorer_address_url(origin_address)}' title='{html.escape(origin_address)}'>{html.escape(short_address(origin_address))}</a>"
+            if origin_address
+            else "-"
+        )
+        spend_html = (
+            f"<a href='{explorer_tx_url(row['spent_txid'])}' title='{html.escape(row['spent_txid'])}'>{html.escape(short_txid(row['spent_txid']))}</a>"
+            if row["spent_txid"]
+            else "-"
+        )
+        html_rows.append(
+            f"<tr>"
+            f"<td data-sort='{item['type_sort']}'><span class='badge {'verified' if item['type'] == 'Verified' else 'candidate'}'>{html.escape(item['type'])}</span></td>"
+            f"<td data-sort='{item['status_sort']}'><span class='status {'down' if item['status'] == 'Taken down' else 'active'}'>{html.escape(item['status'])}</span></td>"
+            f"<td data-sort='{html.escape(item['origin_labels'].lower())}'>{html.escape(item['origin_labels'])}</td>"
+            f"<td class='address' data-sort='{html.escape(origin_address.lower())}'>{origin_html}</td>"
+            f"<td class='address' data-sort='{html.escape(row['address'].lower())}'><a href='{explorer_address_url(row['address'])}' title='{html.escape(row['address'])}'>{html.escape(short_address(row['address']))}</a></td>"
+            f"<td data-sort='{row['block_time'] or 0}' title='{html.escape(fmt_local_datetime(row['block_time']))}'>{html.escape(fmt_table_datetime(row['block_time']))}</td>"
+            f"<td data-sort='{item['taken_down_sort']}' title='{html.escape(fmt_local_datetime(item['taken_down_time']))}'>{html.escape(fmt_table_datetime(item['taken_down_time'])) if item['taken_down_time'] else '-'}</td>"
+            f"<td data-sort='{html.escape(item['exit_sort'])}'>{html.escape(item['exit'])}</td>"
+            f"<td class='address' data-sort='{html.escape(outpoint.lower())}'><a href='{explorer_tx_url(row['source_txid'])}' title='{html.escape(outpoint)}'>{html.escape(short_txid(outpoint))}</a></td>"
+            f"<td class='address' data-sort='{html.escape((row['spent_txid'] or '').lower())}'>{spend_html}</td>"
+            f"</tr>"
+        )
+
+    rows_html = "\n".join(html_rows)
+    since_text = f"{fmt_local_datetime(since_time)} Sydney" if since_time else "all tracked history"
+    updated_text = fmt_iso_local_datetime(store.get_meta("last_summary", {}).get("synced_at"))
+    total_count = len(prepared_rows)
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="{max(refresh_seconds, 1)}">
+  <title>Syscoin Masternode Tracker</title>
+  <style>
+    :root {{ color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --page-gutter: clamp(24px, 3.8vw, 80px); }}
+    *, *::before, *::after {{ box-sizing: border-box; }}
+    html, body {{ margin: 0; max-width: 100%; overflow-x: hidden; }}
+    body {{ background: #f7f5f0; color: #1c2227; }}
+    header {{ background: #142026; color: #f8fafc; padding: 24px 0 22px; width: 100%; }}
+    .header-inner, main {{ margin-left: var(--page-gutter); margin-right: var(--page-gutter); width: auto; }}
+    .topbar {{ display: flex; align-items: end; justify-content: space-between; gap: 16px; }}
+    h1 {{ font-size: 1.8rem; margin: 0 0 8px; letter-spacing: 0; }}
+    .subtitle {{ color: #c9d5d8; font-size: 0.98rem; line-height: 1.45; }}
+    .nav {{ display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }}
+    .nav a {{ border: 1px solid rgba(248, 250, 252, 0.28); border-radius: 999px; color: #dbe6e9; font-size: 0.84rem; padding: 7px 11px; text-decoration: none; }}
+    .nav a.active {{ background: #f8fafc; color: #142026; }}
+    main {{ display: grid; gap: 22px; margin-top: 22px; margin-bottom: 22px; padding: 0; }}
+    main > * {{ min-width: 0; }}
+    .metrics {{ display: grid; grid-template-columns: repeat(5, minmax(130px, 1fr)); gap: 12px; }}
+    .metric {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; padding: 14px 16px; min-width: 0; }}
+    .metric span {{ display: block; color: #687177; font-size: 0.84rem; margin-bottom: 6px; }}
+    .metric b {{ display: block; font-size: clamp(1.25rem, 2vw, 1.65rem); line-height: 1.1; overflow-wrap: anywhere; }}
+    .panel-title {{ display: flex; align-items: end; justify-content: space-between; gap: 16px; }}
+    .panel-title h2 {{ margin: 0; font-size: 1.25rem; }}
+    .panel-title p {{ margin: 0; color: #687177; font-size: 0.9rem; }}
+    .table-wrap {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; max-width: 100%; min-width: 0; overflow-x: auto; width: 100%; }}
+    table {{ width: 100%; min-width: 1250px; border-collapse: separate; border-spacing: 0; background: #fff; table-layout: fixed; }}
+    th, td {{ padding: 8px 10px; border-bottom: 1px solid #e4e8e2; text-align: left; font-size: 0.88rem; overflow: hidden; text-overflow: ellipsis; }}
+    th {{ background: #eaf0ec; position: sticky; top: 0; z-index: 10; box-shadow: 0 1px 0 #d9ded8; }}
+    .sort-button {{ appearance: none; border: 0; background: transparent; color: inherit; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; font: inherit; font-weight: 700; padding: 0; text-align: inherit; white-space: nowrap; }}
+    .sort-button:hover, .sort-button:focus-visible {{ color: #086788; outline: none; }}
+    .sort-icon {{ color: #687177; display: inline-block; font-size: 0.75rem; min-width: 1ch; }}
+    th[aria-sort="ascending"] .sort-icon::before {{ content: "^"; }}
+    th[aria-sort="descending"] .sort-icon::before {{ content: "v"; }}
+    th[aria-sort="none"] .sort-icon::before {{ content: ""; }}
+    th:nth-child(1), td:nth-child(1) {{ width: 92px; }}
+    th:nth-child(2), td:nth-child(2) {{ width: 110px; }}
+    th:nth-child(3), td:nth-child(3) {{ width: 110px; }}
+    th:nth-child(4), td:nth-child(4) {{ width: 205px; }}
+    th:nth-child(5), td:nth-child(5) {{ width: 205px; }}
+    th:nth-child(6), td:nth-child(6) {{ width: 122px; }}
+    th:nth-child(7), td:nth-child(7) {{ width: 122px; }}
+    th:nth-child(8), td:nth-child(8) {{ width: 100px; }}
+    th:nth-child(9), td:nth-child(9) {{ width: 150px; }}
+    th:nth-child(10), td:nth-child(10) {{ width: 150px; }}
+    .address {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; white-space: nowrap; }}
+    .badge, .status {{ border-radius: 999px; display: inline-flex; font-size: 0.78rem; font-weight: 700; padding: 4px 8px; white-space: nowrap; }}
+    .badge.verified {{ background: #dceee7; color: #0d5d40; }}
+    .badge.candidate {{ background: #eef1f3; color: #48535a; }}
+    .status.active {{ background: #e7f2ff; color: #095c9f; }}
+    .status.down {{ background: #fff0df; color: #8a4c00; }}
+    a {{ color: #086788; text-decoration: none; }}
+    @media(max-width: 920px) {{
+      .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .panel-title {{ align-items: start; flex-direction: column; }}
+      .topbar {{ align-items: start; flex-direction: column; }}
+      .nav {{ justify-content: flex-start; }}
+      .header-inner, main {{ margin-left: 12px; margin-right: 12px; }}
+    }}
+    @media (prefers-color-scheme: dark) {{
+      body {{ background: #121619; color: #f3f4f6; }}
+      .metric, .table-wrap, table {{ background: #1c2328; border-color: #334047; }}
+      th {{ background: #263139; }}
+      th, td {{ border-color: #334047; }}
+      a {{ color: #67d7ff; }}
+      .subtitle {{ color: #b6c3c7; }}
+      .metric span, .panel-title p, .sort-icon {{ color: #a7b0b5; }}
+      .sort-button:hover, .sort-button:focus-visible {{ color: #67d7ff; }}
+      .badge.verified {{ background: #15382b; color: #b4f0d8; }}
+      .badge.candidate {{ background: #2a3339; color: #d7dee2; }}
+      .status.active {{ background: #15304a; color: #b9dcff; }}
+      .status.down {{ background: #442d13; color: #ffd9a8; }}
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <div class="topbar">
+        <div>
+          <h1>Syscoin Masternode Tracker</h1>
+          <div class="subtitle">100k SYS collateral outputs tied to Binance wallet flows since {html.escape(since_text)}</div>
+        </div>
+        <nav class="nav" aria-label="Dashboard pages">
+          <a href="/">Wallet Flows</a>
+          <a class="active" href="/masternodes">Masternodes</a>
+        </nav>
+      </div>
+    </div>
+  </header>
+  <main>
+    <section class="metrics">
+      <div class="metric"><span>Total 100k Outputs</span><b>{total_count}</b></div>
+      <div class="metric"><span>Verified Nodes</span><b>{verified_count}</b></div>
+      <div class="metric"><span>Active</span><b>{active_count}</b></div>
+      <div class="metric"><span>Taken Down</span><b>{taken_down_count}</b></div>
+      <div class="metric"><span>Exit To Exchange</span><b>{exchange_exit_count}</b></div>
+    </section>
+    <section>
+      <div class="panel-title">
+        <h2>Masternode Collateral Timeline</h2>
+        <p>Updated {html.escape(updated_text)}</p>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Type<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Status<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Funding Trail<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Funding Address<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Node Address<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="descending"><button class="sort-button" type="button">Setup<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Taken Down<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Exit<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Outpoint<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Spend Tx<span class="sort-icon" aria-hidden="true"></span></button></th>
+            </tr>
+          </thead>
+          <tbody>{rows_html}</tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+  <script>
+    (() => {{
+      const table = document.querySelector("table");
+      if (!table) return;
+      const headers = Array.from(table.querySelectorAll("th[data-sort]"));
+      const tbody = table.tBodies[0];
+      let activeIndex = 5;
+      let activeDirection = "desc";
+
+      const cellValue = (row, index, type) => {{
+        const raw = row.cells[index]?.dataset.sort ?? row.cells[index]?.textContent ?? "";
+        if (type === "number") return Number(raw) || 0;
+        return raw.toLowerCase();
+      }};
+
+      const updateHeaderState = (index, direction) => {{
+        headers.forEach((header, headerIndex) => {{
+          header.setAttribute(
+            "aria-sort",
+            headerIndex === index ? (direction === "asc" ? "ascending" : "descending") : "none",
+          );
+        }});
+      }};
+
+      const sortRows = (index, direction) => {{
+        const type = headers[index].dataset.sort;
+        const multiplier = direction === "asc" ? 1 : -1;
+        const rows = Array.from(tbody.rows);
+        rows.sort((left, right) => {{
+          const leftValue = cellValue(left, index, type);
+          const rightValue = cellValue(right, index, type);
+          if (type === "number") return (leftValue - rightValue) * multiplier;
+          return String(leftValue).localeCompare(String(rightValue)) * multiplier;
+        }});
+        rows.forEach((row) => tbody.appendChild(row));
+        activeIndex = index;
+        activeDirection = direction;
+        updateHeaderState(index, direction);
+      }};
+
+      headers.forEach((header, index) => {{
+        header.querySelector("button")?.addEventListener("click", () => {{
+          const nextDirection =
+            activeIndex === index
+              ? (activeDirection === "asc" ? "desc" : "asc")
+              : (header.dataset.defaultDir || "asc");
+          sortRows(index, nextDirection);
+        }});
+      }});
+    }})();
+  </script>
+</body>
+</html>"""
+
+
 def dashboard_sync_loop(
     db_path: Path,
     blockbook_url: str,
@@ -1635,10 +2176,20 @@ def dashboard_sync_loop(
                 page_size=min(page_size, 100),
                 max_pages_per_address=1,
             )
+            node_stats = refresh_node_spends(
+                sync_store,
+                sync_client,
+                watched,
+                limit=12,
+                page_size=min(page_size, 100),
+                max_pages_per_address=1,
+            )
             print(
                 f"{now_iso()} dashboard sync seen={stats['seen']} new={stats['inserted']} "
                 f"next_hop_found={follow_stats['found_spends']} next_hop_outputs={follow_stats['created']} "
-                f"next_hop_errors={follow_stats['errors']}",
+                f"next_hop_errors={follow_stats['errors']} "
+                f"node_spends={node_stats['found_spends']} node_outputs={node_stats['created']} "
+                f"node_errors={node_stats['errors']}",
                 file=sys.stderr,
             )
         except Exception as exc:
@@ -1656,13 +2207,27 @@ def serve(
     refresh_seconds: int = 60,
 ) -> None:
     class Handler(http.server.BaseHTTPRequestHandler):
-        def send_dashboard(self, include_body: bool = True) -> None:
-            body = dashboard_html(
-                store,
-                since_time=since_time,
-                since_label=since_label,
-                refresh_seconds=refresh_seconds,
-            ).encode("utf-8")
+        def send_page(self, include_body: bool = True) -> None:
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path in ("/", "/index.html"):
+                html_body = dashboard_html(
+                    store,
+                    since_time=since_time,
+                    since_label=since_label,
+                    refresh_seconds=refresh_seconds,
+                )
+            elif parsed.path in ("/masternodes", "/masternodes.html"):
+                html_body = masternodes_html(
+                    store,
+                    since_time=since_time,
+                    since_label=since_label,
+                    refresh_seconds=refresh_seconds,
+                )
+            else:
+                self.send_error(404)
+                return
+
+            body = html_body.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -1671,16 +2236,10 @@ def serve(
                 self.wfile.write(body)
 
         def do_GET(self) -> None:  # noqa: N802
-            if self.path not in ("/", "/index.html"):
-                self.send_error(404)
-                return
-            self.send_dashboard(include_body=True)
+            self.send_page(include_body=True)
 
         def do_HEAD(self) -> None:  # noqa: N802
-            if self.path not in ("/", "/index.html"):
-                self.send_error(404)
-                return
-            self.send_dashboard(include_body=False)
+            self.send_page(include_body=False)
 
         def log_message(self, fmt: str, *args: Any) -> None:
             print(fmt % args, file=sys.stderr)
