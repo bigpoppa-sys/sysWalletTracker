@@ -1851,7 +1851,7 @@ def masternodes_html(
             return []
         tracked_children = store.conn.execute(
             """
-            SELECT address, value_sats, attributed_sats
+            SELECT address, value_sats, attributed_sats, block_time
             FROM tracked_outputs
             WHERE parent_txid = ?
               AND parent_vout = ?
@@ -1871,12 +1871,13 @@ def masternodes_html(
         except json.JSONDecodeError:
             return []
         children = []
+        tx_time = tx.get("blockTime")
         for vout in tx.get("vout") or []:
             value = sats(vout.get("value"))
             if not value:
                 continue
             for address in addresses_from(vout) or ["unknown"]:
-                children.append({"address": address, "value_sats": value, "attributed_sats": value})
+                children.append({"address": address, "value_sats": value, "attributed_sats": value, "block_time": tx_time})
         return children
 
     prepared_rows = []
@@ -1896,7 +1897,10 @@ def masternodes_html(
         if not exit_labels and row["spent"] == 1 and largest_exit >= int(SENTRY_COLLATERAL_SATS * Decimal("0.98")):
             exit_labels.add("Ex-like")
 
+        child_times = [int(child["block_time"]) for child in children if child.get("block_time")]
         spend_time = spend_times.get(row["spent_txid"]) if row["spent_txid"] else None
+        if spend_time is None and child_times:
+            spend_time = max(child_times)
         taken_down_sort = spend_time or row["spent_height"] or 0
         is_taken_down = row["spent"] == 1
         prepared_rows.append(

@@ -38,6 +38,7 @@ DEFAULT_SINCE_DATE = "2026-04-14 12:30"
 DEFAULT_FROM_HEIGHT = 2221358
 DB_PATH = Path(os.getenv("SYS_TRACKER_DB", "/tmp/syscoin_tracker.sqlite"))
 VERIFIED_SENTRIES_PATH = ROOT / "verified_sentries.csv"
+NODE_OUTPUTS_PATH = ROOT / "node_outputs.csv"
 
 _lock = threading.Lock()
 _store: Store | None = None
@@ -100,21 +101,62 @@ def load_verified_sentries(store: Store) -> None:
                     row["verified_at"],
                 ),
             )
+            exists = store.conn.execute(
+                """
+                SELECT 1
+                FROM tracked_outputs
+                WHERE source_txid = ? AND source_vout = ? AND depth = ? AND path = ?
+                """,
+                (row["source_txid"], int(row["source_vout"]), int(row["depth"]), row["path"]),
+            ).fetchone()
+            if not exists:
+                store.save_output(
+                    {
+                        "source_txid": row["source_txid"],
+                        "source_vout": int(row["source_vout"]),
+                        "depth": int(row["depth"]),
+                        "parent_txid": None,
+                        "parent_vout": None,
+                        "address": row["address"],
+                        "value_sats": SENTRY_COLLATERAL_SATS,
+                        "attributed_sats": SENTRY_COLLATERAL_SATS,
+                        "block_height": int(row["block_height"]),
+                        "block_time": int(row["block_time"]),
+                        "spent": None,
+                        "spent_txid": None,
+                        "spent_height": None,
+                        "path": row["path"],
+                    }
+                )
+    store.conn.commit()
+
+
+def load_node_outputs(store: Store) -> None:
+    if not NODE_OUTPUTS_PATH.exists():
+        return
+
+    def maybe_int(value: str | None) -> int | None:
+        if value is None or value == "":
+            return None
+        return int(value)
+
+    with NODE_OUTPUTS_PATH.open(newline="") as f:
+        for row in csv.DictReader(f):
             store.save_output(
                 {
                     "source_txid": row["source_txid"],
                     "source_vout": int(row["source_vout"]),
                     "depth": int(row["depth"]),
-                    "parent_txid": None,
-                    "parent_vout": None,
+                    "parent_txid": row["parent_txid"] or None,
+                    "parent_vout": maybe_int(row["parent_vout"]),
                     "address": row["address"],
-                    "value_sats": SENTRY_COLLATERAL_SATS,
-                    "attributed_sats": SENTRY_COLLATERAL_SATS,
-                    "block_height": int(row["block_height"]),
-                    "block_time": int(row["block_time"]),
-                    "spent": None,
-                    "spent_txid": None,
-                    "spent_height": None,
+                    "value_sats": int(row["value_sats"]),
+                    "attributed_sats": int(row["attributed_sats"]),
+                    "block_height": maybe_int(row["block_height"]),
+                    "block_time": maybe_int(row["block_time"]),
+                    "spent": maybe_int(row["spent"]),
+                    "spent_txid": row["spent_txid"] or None,
+                    "spent_height": maybe_int(row["spent_height"]),
                     "path": row["path"],
                 }
             )
@@ -157,6 +199,7 @@ def sync_for_request(force: bool = False) -> tuple[Store, int | None, str | None
             watched=watched,
             quiet=True,
         )
+        load_node_outputs(store)
         load_verified_sentries(store)
         refresh_spent_first_hops(
             store,
