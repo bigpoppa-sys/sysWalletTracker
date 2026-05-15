@@ -134,6 +134,18 @@ SYS_RPC_URL="http://127.0.0.1:8370/" \
 bash <(curl -fsSL https://raw.githubusercontent.com/bigpoppa-sys/sysWalletTracker/main/scripts/install_vps_cron.sh)
 ```
 
+If the repo is private, clone it on the VPS with your GitHub auth first, then run
+the installer from that checkout:
+
+```sh
+git clone https://github.com/bigpoppa-sys/sysWalletTracker.git ~/sysWalletTracker
+cd ~/sysWalletTracker
+SYS_RPC_USER="your-user" \
+SYS_RPC_PASSWORD="your-password" \
+SYS_RPC_URL="http://127.0.0.1:8370/" \
+./scripts/install_vps_cron.sh
+```
+
 Cron logs go to `$HOME/sysWalletTracker/logs/masternode_cron.log`. The cron job
 uses a lock so a slow RPC check cannot overlap the next minute's run.
 
