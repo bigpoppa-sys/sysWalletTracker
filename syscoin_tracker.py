@@ -2843,6 +2843,8 @@ def main(argv: list[str] | None = None) -> int:
         if rpc is None:
             print("No RPC URL/host supplied. Use --rpc-host/--rpc-url or SYS_RPC_URL.")
             return 1
+        if store.conn.execute("SELECT COUNT(*) AS count FROM network_masternodes").fetchone()["count"] == 0 and args.csv:
+            load_network_masternodes_csv(store, args.csv)
         stats = sync_network_masternodes(store, rpc, client)
         if args.csv:
             write_network_masternodes_csv(network_masternode_rows_from_store(store), args.csv)

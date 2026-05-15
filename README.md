@@ -122,6 +122,21 @@ python3 syscoin_tracker.py sync-masternodes --csv network_masternodes.csv
 python3 syscoin_tracker.py verify-sentries --since-date "2026-04-14 12:30"
 ```
 
+For always-on masternode monitoring, run the watcher from the VPS that has
+local RPC access. The installer clones or updates the repo at
+`$HOME/sysWalletTracker`, writes a private `.env`, runs one sync, then installs a
+once-per-minute cron job:
+
+```sh
+SYS_RPC_USER="your-user" \
+SYS_RPC_PASSWORD="your-password" \
+SYS_RPC_URL="http://127.0.0.1:8370/" \
+bash <(curl -fsSL https://raw.githubusercontent.com/bigpoppa-sys/sysWalletTracker/main/scripts/install_vps_cron.sh)
+```
+
+Cron logs go to `$HOME/sysWalletTracker/logs/masternode_cron.log`. The cron job
+uses a lock so a slow RPC check cannot overlap the next minute's run.
+
 `verify-sentries` compares exact 100,000 SYS candidates against
 `masternode_list` outpoints. If RPC is only bound locally on a remote node, use an
 SSH tunnel or adjust `rpcbind` / `rpcallowip` carefully.
