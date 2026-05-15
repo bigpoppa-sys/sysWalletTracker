@@ -2009,6 +2009,8 @@ def dashboard_html(
     since_text = f"{fmt_local_datetime(since_time)} Sydney" if since_time else "all tracked history"
     updated_text = fmt_iso_local_datetime(last_summary.get("synced_at"))
     total_sent_full = fmt_sys(window_summary["external_sats"])
+    wallet_balance_sats = int(last_summary.get("balance_sats") or 0)
+    wallet_balance_full = fmt_sys(wallet_balance_sats)
 
     return f"""<!doctype html>
 <html lang="en">
@@ -2032,7 +2034,7 @@ def dashboard_html(
     .nav a.active {{ background: #f8fafc; color: #142026; }}
     main {{ display: grid; gap: 22px; margin-top: 22px; margin-bottom: 22px; padding: 0; }}
     main > * {{ min-width: 0; }}
-    .metrics {{ display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); gap: 12px; }}
+    .metrics {{ display: grid; grid-template-columns: repeat(5, minmax(150px, 1fr)); gap: 12px; }}
     .metric {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; padding: 14px 16px; min-width: 0; }}
     .metric span {{ display: block; color: #687177; font-size: 0.84rem; margin-bottom: 6px; }}
     .metric b {{ display: block; font-size: clamp(1.25rem, 2vw, 1.65rem); line-height: 1.1; overflow-wrap: anywhere; }}
@@ -2117,6 +2119,7 @@ def dashboard_html(
   <main>
     <section class="metrics">
       <div class="metric"><span>SYS Sent</span><b title="{html.escape(total_sent_full)} SYS">{fmt_compact_sys(window_summary["external_sats"])}</b></div>
+      <div class="metric"><span>Wallet Balance</span><b title="{html.escape(wallet_balance_full)} SYS">{fmt_compact_sys(wallet_balance_sats)}</b></div>
       <div class="metric"><span>Transfers</span><b>{window_summary["txs"]}</b></div>
       <div class="metric"><span>Recipients</span><b>{destination_count}</b></div>
       <div class="metric"><span>Updated</span><b>{html.escape(updated_text)}</b></div>
