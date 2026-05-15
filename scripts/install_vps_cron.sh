@@ -6,13 +6,14 @@ APP_DIR="${SYS_TRACKER_APP_DIR:-$HOME/sysWalletTracker}"
 RPC_URL="${SYS_RPC_URL:-http://127.0.0.1:8370/}"
 RPC_USER="${SYS_RPC_USER:-u}"
 BLOCKBOOK_URL="${SYS_BLOCKBOOK_URL:-https://explorer-blockbook.syscoin.org}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [ -z "${SYS_RPC_PASSWORD:-}" ]; then
   echo "Set SYS_RPC_PASSWORD before running this installer." >&2
   exit 1
 fi
 
-for required in git python3 crontab; do
+for required in python3 crontab; do
   if ! command -v "$required" >/dev/null 2>&1; then
     echo "Missing required command: $required" >&2
     exit 1
@@ -20,8 +21,21 @@ for required in git python3 crontab; do
 done
 
 if [ -d "$APP_DIR/.git" ]; then
+  if ! command -v git >/dev/null 2>&1; then
+    echo "Missing required command: git" >&2
+    exit 1
+  fi
   git -C "$APP_DIR" pull --ff-only
+elif [ "$SCRIPT_DIR" = "$APP_DIR/scripts" ] && [ -f "$APP_DIR/syscoin_tracker.py" ]; then
+  :
+elif [ -f "$SCRIPT_DIR/../syscoin_tracker.py" ]; then
+  mkdir -p "$APP_DIR"
+  cp -R "$SCRIPT_DIR/.."/* "$APP_DIR"/
 else
+  if ! command -v git >/dev/null 2>&1; then
+    echo "Missing required command: git" >&2
+    exit 1
+  fi
   git clone "$REPO_URL" "$APP_DIR"
 fi
 
