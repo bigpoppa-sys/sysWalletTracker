@@ -1995,12 +1995,9 @@ def dashboard_html(
         wallet_balance = exchange_hot_wallet_balances.get(wallet["address"], {})
         if isinstance(wallet_balance, dict) and "balance_sats" in wallet_balance:
             balance_sats = int(wallet_balance.get("balance_sats") or 0)
-            if balance_sats == 0:
-                balance_text = "0 SYS"
-            elif 0 < balance_sats < SATOSHI // 100:
-                balance_text = "<0.01 SYS"
-            else:
-                balance_text = fmt_compact_sys(balance_sats)
+            if balance_sats < SATOSHI:
+                continue
+            balance_text = fmt_compact_sys(balance_sats)
             balance_html = (
                 f"<span class='wallet-balance'>Final balance: "
                 f"<b title='{fmt_sys(balance_sats)} SYS'>{html.escape(balance_text)}</b></span>"
@@ -2012,11 +2009,12 @@ def dashboard_html(
             f"<strong>{html.escape(wallet['label'])}</strong>"
             f"{note_html}"
             f"<a href='{explorer_addr(wallet['address'])}' title='{html.escape(wallet['address'])}'>"
-            f"{html.escape(wallet['address'])}</a>"
+            f"{html.escape(short_address(wallet['address']))}</a>"
             f"{balance_html}"
             f"</article>"
         )
     hot_wallet_html = "\n".join(hot_wallet_rows)
+    visible_hot_wallet_count = len(hot_wallet_rows)
 
     html_rows = []
     for rank, row in enumerate(top_rows, 1):
@@ -2102,8 +2100,8 @@ def dashboard_html(
     .panel-title {{ display: flex; align-items: end; justify-content: space-between; gap: 16px; }}
     .panel-title h2 {{ margin: 0; font-size: 1.25rem; }}
     .panel-title p {{ margin: 0; color: #687177; font-size: 0.9rem; }}
-    .wallet-list {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap: 10px; margin-top: 10px; }}
-    .wallet-card {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; padding: 12px 14px; min-width: 0; display: grid; gap: 5px; }}
+    .wallet-list {{ display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }}
+    .wallet-card {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; padding: 12px 12px; min-width: 0; display: grid; gap: 5px; }}
     .wallet-card strong {{ font-size: 0.95rem; }}
     .wallet-card span {{ color: #687177; font-size: 0.82rem; }}
     .wallet-card a {{ display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 0.72rem; }}
@@ -2147,11 +2145,15 @@ def dashboard_html(
     code {{ overflow-wrap: anywhere; }}
     @media(max-width: 820px) {{
       .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .wallet-list {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .panel-title {{ align-items: start; flex-direction: column; }}
       .topbar {{ align-items: start; flex-direction: column; }}
       .nav {{ justify-content: flex-start; }}
       .header-inner, main {{ margin-left: 12px; margin-right: 12px; }}
       table {{ min-width: 1060px; }}
+    }}
+    @media(max-width: 520px) {{
+      .metrics, .wallet-list {{ grid-template-columns: 1fr; }}
     }}
     @media (prefers-color-scheme: dark) {{
       body {{ background: #121619; color: #f3f4f6; }}
@@ -2191,7 +2193,7 @@ def dashboard_html(
     <section class="hot-wallets">
       <div class="panel-title">
         <h2>Known Exchange Hot Wallets</h2>
-        <p>{len(exchange_hot_wallets)} Blockbook links</p>
+        <p>{visible_hot_wallet_count} Blockbook links</p>
       </div>
       <div class="wallet-list">{hot_wallet_html}</div>
     </section>
