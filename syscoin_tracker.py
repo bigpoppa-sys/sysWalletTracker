@@ -1504,6 +1504,49 @@ def refresh_spent_first_hops(
     return {"examined": examined, "found_spends": found_spends, "created": created, "errors": errors}
 
 
+def refresh_exchange_hot_wallet_balances(
+    store: Store,
+    client: BlockbookClient,
+    wallets: list[dict[str, str]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    wallets = wallets if wallets is not None else load_exchange_hot_wallets()
+    known_addresses = {wallet["address"] for wallet in wallets}
+    previous = store.get_meta("exchange_hot_wallet_balances", {}) or {}
+    updated: dict[str, dict[str, Any]] = {
+        address: values
+        for address, values in previous.items()
+        if address in known_addresses and isinstance(values, dict)
+    }
+    synced_at = now_iso()
+
+    for wallet in wallets:
+        address = wallet["address"]
+        try:
+            payload = client.address(address, details="basic", page_size=1)
+            updated[address] = {
+                "label": wallet["label"],
+                "address": address,
+                "balance_sats": sats(payload.get("balance")),
+                "total_received_sats": sats(payload.get("totalReceived")),
+                "total_sent_sats": sats(payload.get("totalSent")),
+                "txs": payload.get("txs"),
+                "synced_at": synced_at,
+            }
+        except Exception as exc:
+            cached = dict(updated.get(address, {}))
+            cached.update(
+                {
+                    "label": wallet["label"],
+                    "address": address,
+                    "error": str(exc),
+                }
+            )
+            updated[address] = cached
+
+    store.set_meta("exchange_hot_wallet_balances", updated)
+    return updated
+
+
 def refresh_node_spends(
     store: Store,
     client: BlockbookClient,
@@ -1909,6 +1952,7 @@ def dashboard_html(
     exchange_tags = load_exchange_tags()
     exchange_routes = load_exchange_routes()
     exchange_hot_wallets = load_exchange_hot_wallets()
+    exchange_hot_wallet_balances = store.get_meta("exchange_hot_wallet_balances", {}) or {}
     later_exchanges_by_address: dict[str, set[str]] = {}
     downstream_sentry_by_address: dict[str, int] = {}
     verified_sentry_by_address: dict[str, int] = {}
@@ -1948,11 +1992,28 @@ def dashboard_html(
     for wallet in exchange_hot_wallets:
         note = wallet["note"]
         note_html = f"<span>{html.escape(note)}</span>" if note else ""
+        wallet_balance = exchange_hot_wallet_balances.get(wallet["address"], {})
+        if isinstance(wallet_balance, dict) and "balance_sats" in wallet_balance:
+            balance_sats = int(wallet_balance.get("balance_sats") or 0)
+            if balance_sats == 0:
+                balance_text = "0 SYS"
+            elif 0 < balance_sats < SATOSHI // 100:
+                balance_text = "<0.01 SYS"
+            else:
+                balance_text = fmt_compact_sys(balance_sats)
+            balance_html = (
+                f"<span class='wallet-balance'>Final balance: "
+                f"<b title='{fmt_sys(balance_sats)} SYS'>{html.escape(balance_text)}</b></span>"
+            )
+        else:
+            balance_html = "<span class='wallet-balance muted'>Final balance: -</span>"
         hot_wallet_rows.append(
             f"<article class='wallet-card'>"
             f"<strong>{html.escape(wallet['label'])}</strong>"
             f"{note_html}"
-            f"<a href='{explorer_addr(wallet['address'])}'>{html.escape(wallet['address'])}</a>"
+            f"<a href='{explorer_addr(wallet['address'])}' title='{html.escape(wallet['address'])}'>"
+            f"{html.escape(wallet['address'])}</a>"
+            f"{balance_html}"
             f"</article>"
         )
     hot_wallet_html = "\n".join(hot_wallet_rows)
@@ -2045,7 +2106,10 @@ def dashboard_html(
     .wallet-card {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; padding: 12px 14px; min-width: 0; display: grid; gap: 5px; }}
     .wallet-card strong {{ font-size: 0.95rem; }}
     .wallet-card span {{ color: #687177; font-size: 0.82rem; }}
-    .wallet-card a {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 0.78rem; overflow-wrap: anywhere; }}
+    .wallet-card a {{ display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 0.72rem; }}
+    .wallet-card .wallet-balance {{ color: #1c2227; font-size: 0.82rem; }}
+    .wallet-card .wallet-balance b {{ font-weight: 800; }}
+    .wallet-card .muted {{ color: #7b858a; }}
     .table-wrap {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; max-width: 100%; min-width: 0; overflow-x: auto; width: 100%; }}
     table {{ width: 100%; min-width: 1100px; border-collapse: separate; border-spacing: 0; background: #fff; table-layout: fixed; }}
     th, td {{ padding: 8px 10px; border-bottom: 1px solid #e4e8e2; text-align: left; font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; }}
@@ -2624,12 +2688,14 @@ def dashboard_sync_loop(
                     page_size=min(page_size, 100),
                     max_pages_per_address=1,
                 )
+                exchange_balance_stats = refresh_exchange_hot_wallet_balances(sync_store, sync_client)
             print(
                 f"{now_iso()} dashboard sync seen={stats['seen']} new={stats['inserted']} "
                 f"next_hop_found={follow_stats['found_spends']} next_hop_outputs={follow_stats['created']} "
                 f"next_hop_errors={follow_stats['errors']} "
                 f"node_spends={node_stats['found_spends']} node_outputs={node_stats['created']} "
-                f"node_errors={node_stats['errors']}",
+                f"node_errors={node_stats['errors']} "
+                f"exchange_wallets={len(exchange_balance_stats)}",
                 file=sys.stderr,
             )
         except Exception as exc:

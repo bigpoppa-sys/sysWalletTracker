@@ -31,6 +31,7 @@ from syscoin_tracker import (  # noqa: E402
     load_network_masternodes_csv,
     masternodes_html,
     parse_since_date,
+    refresh_exchange_hot_wallet_balances,
     refresh_node_spends,
     refresh_spent_first_hops,
     sync_address,
@@ -241,6 +242,7 @@ def sync_for_request(force: bool = False) -> tuple[Store, int | None, str | None
         load_node_outputs(store)
         load_verified_sentries(store)
         load_network_masternodes_csv(store)
+        refresh_exchange_hot_wallet_balances(store, client)
         rpc = get_rpc_client()
         if rpc is not None:
             try:
