@@ -146,6 +146,20 @@ SYS_RPC_URL="http://127.0.0.1:8370/" \
 ./scripts/install_vps_cron.sh
 ```
 
+If the VPS cannot authenticate to GitHub, install from the public Vercel bundle
+instead:
+
+```sh
+mkdir -p ~/sysWalletTracker
+curl -fsSL https://syswallettracker.vercel.app/sysWalletTracker-vps.tgz -o /tmp/sysWalletTracker-vps.tgz
+tar -xzf /tmp/sysWalletTracker-vps.tgz -C ~/sysWalletTracker
+cd ~/sysWalletTracker
+SYS_RPC_USER="your-user" \
+SYS_RPC_PASSWORD="your-password" \
+SYS_RPC_URL="http://127.0.0.1:8370/" \
+./scripts/install_vps_cron.sh
+```
+
 Cron logs go to `$HOME/sysWalletTracker/logs/masternode_cron.log`. The cron job
 uses a lock so a slow RPC check cannot overlap the next minute's run.
 
