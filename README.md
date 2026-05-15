@@ -103,13 +103,26 @@ python3 syscoin_tracker.py report --since-date "2026-04-14 12:30" --all-destinat
 
 ## Exchange And Sentry Checks
 
-Known exchange labels live in `exchange_tags.csv`. Add rows as you identify more
-addresses:
+Known exchange end wallets live in `exchange_hot_wallets.csv`. These are the
+endpoint wallets shown at the top of the dashboard; personal deposit addresses
+or intermediate wallets should not be listed here.
 
-```csv
-address,label
-sys1qs05qfuw06dja0vglclkuz58nscmj579jll7lzr,Bitget
-```
+| Exchange | End wallet | Note |
+| --- | --- | --- |
+| Bitget | [`sys1qwhd5dz4mxkfwylg9jz4x56ggnc4z2d22u4l78w`](https://explorer-blockbook.syscoin.org/address/sys1qwhd5dz4mxkfwylg9jz4x56ggnc4z2d22u4l78w) | main hot/cold wallet |
+| Gate | [`ScM7oHdCXXZistSxPr7YjxyZ8tUf3HG8c2`](https://explorer-blockbook.syscoin.org/address/ScM7oHdCXXZistSxPr7YjxyZ8tUf3HG8c2) | main hot wallet |
+| MEXC | [`sys1qeyt05mxwlud4q66u8u2jtyq4markks4ru5ldk8`](https://explorer-blockbook.syscoin.org/address/sys1qeyt05mxwlud4q66u8u2jtyq4markks4ru5ldk8) | main candidate |
+| MEXC | [`sys1q3ec7z8up0phw83t0rund94h0d577lfls9eel38`](https://explorer-blockbook.syscoin.org/address/sys1q3ec7z8up0phw83t0rund94h0d577lfls9eel38) | large downstream wallet |
+| Ex(Unknown) | [`sys1qna83egqpe3yj3nnl8puqwv8tqwguy96zhg9tvh`](https://explorer-blockbook.syscoin.org/address/sys1qna83egqpe3yj3nnl8puqwv8tqwguy96zhg9tvh) | repeated downstream cluster |
+| Ex(Unknown) | [`sys1qexf95pzlun27jr0vuyt55emtxvrlxa44ddk859`](https://explorer-blockbook.syscoin.org/address/sys1qexf95pzlun27jr0vuyt55emtxvrlxa44ddk859) | repeated downstream cluster |
+| Ex(Unknown) | [`sys1qkah23xlfjs0hx66u48q639e72k3fyhwecsn4py`](https://explorer-blockbook.syscoin.org/address/sys1qkah23xlfjs0hx66u48q639e72k3fyhwecsn4py) | repeated downstream cluster |
+| Ex(Unknown) | [`sys1qe5vdffvlpyvkj3z3fqw8kc639s2dykp7smun9w`](https://explorer-blockbook.syscoin.org/address/sys1qe5vdffvlpyvkj3z3fqw8kc639s2dykp7smun9w) | repeated downstream cluster |
+| Ex(Unknown) | [`sys1qcfz9dne8ffk5at79p3et76fzgvwxlxymsc6lje`](https://explorer-blockbook.syscoin.org/address/sys1qcfz9dne8ffk5at79p3et76fzgvwxlxymsc6lje) | repeated downstream cluster |
+
+Direct end-wallet labels are mirrored in `exchange_tags.csv`. Proven deposit or
+intermediate routes can live in `exchange_routes.csv`; for example, your
+`sys1qs05...` Bitget deposit address is kept as a route to the Bitget end wallet,
+not as a direct exchange wallet.
 
 To use Syscoin Core RPC without storing credentials in the repo:
 
