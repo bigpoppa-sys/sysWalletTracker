@@ -23,6 +23,7 @@ from syscoin_tracker import (  # noqa: E402
     SENTRY_COLLATERAL_SATS,
     BlockbookClient,
     Store,
+    SyscoinRpcClient,
     block_height_at_or_after,
     dashboard_html,
     load_network_masternodes_csv,
@@ -31,6 +32,7 @@ from syscoin_tracker import (  # noqa: E402
     refresh_node_spends,
     refresh_spent_first_hops,
     sync_address,
+    sync_network_masternodes,
     sys_to_sats,
 )
 
@@ -44,6 +46,7 @@ NODE_OUTPUTS_PATH = ROOT / "node_outputs.csv"
 _lock = threading.Lock()
 _store: Store | None = None
 _client: BlockbookClient | None = None
+_rpc_client: SyscoinRpcClient | None = None
 _from_height: int | None = None
 _last_sync_at = 0.0
 
@@ -68,6 +71,20 @@ def get_client() -> BlockbookClient:
     if _client is None:
         _client = BlockbookClient(os.getenv("SYS_BLOCKBOOK_URL", DEFAULT_BLOCKBOOK_URL))
     return _client
+
+
+def get_rpc_client() -> SyscoinRpcClient | None:
+    global _rpc_client
+    url = os.getenv("SYS_RPC_URL")
+    host = os.getenv("SYS_RPC_HOST")
+    port = os.getenv("SYS_RPC_PORT", "8370")
+    if not url and host:
+        url = f"http://{host}:{port}/"
+    if not url:
+        return None
+    if _rpc_client is None:
+        _rpc_client = SyscoinRpcClient(url, os.getenv("SYS_RPC_USER"), os.getenv("SYS_RPC_PASSWORD"))
+    return _rpc_client
 
 
 def load_verified_sentries(store: Store) -> None:
@@ -203,6 +220,12 @@ def sync_for_request(force: bool = False) -> tuple[Store, int | None, str | None
         load_node_outputs(store)
         load_verified_sentries(store)
         load_network_masternodes_csv(store)
+        rpc = get_rpc_client()
+        if rpc is not None:
+            try:
+                sync_network_masternodes(store, rpc, client)
+            except Exception:
+                pass
         refresh_spent_first_hops(
             store,
             client,

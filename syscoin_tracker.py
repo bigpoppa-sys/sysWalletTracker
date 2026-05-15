@@ -38,8 +38,33 @@ DEFAULT_EXCHANGE_TAGS_PATH = Path("exchange_tags.csv")
 DEFAULT_EXCHANGE_ROUTES_PATH = Path("exchange_routes.csv")
 DEFAULT_EXCHANGE_HOT_WALLETS_PATH = Path("exchange_hot_wallets.csv")
 DEFAULT_NETWORK_MASTERNODES_PATH = Path("network_masternodes.csv")
+NETWORK_MASTERNODE_HEADERS = [
+    "outpoint",
+    "source_txid",
+    "source_vout",
+    "pro_tx_hash",
+    "service",
+    "payee",
+    "status",
+    "collateral_address",
+    "owner_address",
+    "voting_address",
+    "collateral_height",
+    "collateral_time",
+    "registered_height",
+    "registered_time",
+    "last_paid_time",
+    "last_paid_block",
+    "first_seen_at",
+    "last_seen_at",
+    "removed_at",
+    "taken_down_txid",
+    "taken_down_time",
+    "moved_to_address",
+]
 SENTRY_COLLATERAL_SATS = 100_000 * 100_000_000
 SATOSHI = Decimal("100000000")
+DB_WRITE_LOCK = threading.Lock()
 
 
 def utc(ts: int | None) -> str:
@@ -479,37 +504,30 @@ def network_masternode_rows_from_rpc(rpc: SyscoinRpcClient) -> list[dict[str, An
                 "first_seen_at": seen_at,
                 "last_seen_at": seen_at,
                 "removed_at": "",
+                "taken_down_txid": "",
+                "taken_down_time": None,
+                "moved_to_address": "",
             }
         )
     return rows
 
 
 def write_network_masternodes_csv(rows: list[dict[str, Any]], path: Path) -> None:
-    headers = [
-        "outpoint",
-        "source_txid",
-        "source_vout",
-        "pro_tx_hash",
-        "service",
-        "payee",
-        "status",
-        "collateral_address",
-        "owner_address",
-        "voting_address",
-        "collateral_height",
-        "collateral_time",
-        "registered_height",
-        "registered_time",
-        "last_paid_time",
-        "last_paid_block",
-        "first_seen_at",
-        "last_seen_at",
-        "removed_at",
-    ]
     with path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=headers)
+        writer = csv.DictWriter(f, fieldnames=NETWORK_MASTERNODE_HEADERS, extrasaction="ignore", lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def network_masternode_rows_from_store(store: Store) -> list[dict[str, Any]]:
+    rows = store.conn.execute(
+        f"""
+        SELECT {", ".join(NETWORK_MASTERNODE_HEADERS)}
+        FROM network_masternodes
+        ORDER BY COALESCE(registered_time, collateral_time, 0) DESC, collateral_address
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def load_network_masternodes_csv(store: Store, path: Path = DEFAULT_NETWORK_MASTERNODES_PATH) -> None:
@@ -544,6 +562,9 @@ def load_network_masternodes_csv(store: Store, path: Path = DEFAULT_NETWORK_MAST
                     "first_seen_at": row.get("first_seen_at") or now_iso(),
                     "last_seen_at": row.get("last_seen_at") or now_iso(),
                     "removed_at": row.get("removed_at") or "",
+                    "taken_down_txid": row.get("taken_down_txid") or "",
+                    "taken_down_time": maybe_int(row.get("taken_down_time")),
+                    "moved_to_address": row.get("moved_to_address") or "",
                 }
             )
     store.conn.commit()
@@ -600,8 +621,9 @@ def block_height_at_or_after(client: BlockbookClient, target_ts: int) -> int:
 class Store:
     def __init__(self, path: Path) -> None:
         self.path = path
-        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn = sqlite3.connect(path, check_same_thread=False, timeout=30, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA busy_timeout=30000")
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.init()
@@ -695,7 +717,10 @@ class Store:
                 last_paid_block INTEGER,
                 first_seen_at TEXT NOT NULL,
                 last_seen_at TEXT NOT NULL,
-                removed_at TEXT
+                removed_at TEXT,
+                taken_down_txid TEXT,
+                taken_down_time INTEGER,
+                moved_to_address TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_movements_block
@@ -708,7 +733,19 @@ class Store:
                 ON network_masternodes(status);
             """
         )
+        self.ensure_network_masternode_columns()
         self.conn.commit()
+
+    def ensure_network_masternode_columns(self) -> None:
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(network_masternodes)").fetchall()}
+        additions = {
+            "taken_down_txid": "taken_down_txid TEXT",
+            "taken_down_time": "taken_down_time INTEGER",
+            "moved_to_address": "moved_to_address TEXT",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                self.conn.execute(f"ALTER TABLE network_masternodes ADD COLUMN {definition}")
 
     def set_meta(self, key: str, value: Any) -> None:
         self.conn.execute(
@@ -910,9 +947,10 @@ class Store:
                 status, collateral_address, owner_address, voting_address,
                 collateral_height, collateral_time, registered_height,
                 registered_time, last_paid_time, last_paid_block, first_seen_at,
-                last_seen_at, removed_at
+                last_seen_at, removed_at, taken_down_txid, taken_down_time,
+                moved_to_address
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(outpoint) DO UPDATE SET
                 pro_tx_hash=excluded.pro_tx_hash,
                 service=excluded.service,
@@ -928,7 +966,10 @@ class Store:
                 last_paid_time=excluded.last_paid_time,
                 last_paid_block=excluded.last_paid_block,
                 last_seen_at=excluded.last_seen_at,
-                removed_at=excluded.removed_at
+                removed_at=excluded.removed_at,
+                taken_down_txid=excluded.taken_down_txid,
+                taken_down_time=excluded.taken_down_time,
+                moved_to_address=excluded.moved_to_address
             """,
             (
                 row["outpoint"],
@@ -950,6 +991,40 @@ class Store:
                 row.get("first_seen_at") or now_iso(),
                 row.get("last_seen_at") or now_iso(),
                 row.get("removed_at") or None,
+                row.get("taken_down_txid") or None,
+                row.get("taken_down_time"),
+                row.get("moved_to_address") or None,
+            ),
+        )
+
+    def mark_network_masternode_removed(
+        self,
+        outpoint: str,
+        *,
+        removed_at: str,
+        taken_down_txid: str | None = None,
+        taken_down_time: int | None = None,
+        moved_to_address: str | None = None,
+    ) -> None:
+        self.conn.execute(
+            """
+            UPDATE network_masternodes
+            SET status = ?,
+                removed_at = ?,
+                last_seen_at = ?,
+                taken_down_txid = COALESCE(?, taken_down_txid),
+                taken_down_time = COALESCE(?, taken_down_time),
+                moved_to_address = COALESCE(?, moved_to_address)
+            WHERE outpoint = ?
+            """,
+            (
+                "REMOVED",
+                removed_at,
+                removed_at,
+                taken_down_txid,
+                taken_down_time,
+                moved_to_address,
+                outpoint,
             ),
         )
 
@@ -1099,6 +1174,108 @@ def find_spending_tx(
                     return tx
         page += 1
     return None
+
+
+def trace_masternode_collateral_spend(client: BlockbookClient, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    address = str(row["collateral_address"] or "")
+    source_txid = str(row["source_txid"])
+    source_vout = int(row["source_vout"])
+    if not address or not source_txid:
+        return {}
+
+    spend: dict[str, Any] | None = None
+    try:
+        source_tx = client.tx(source_txid)
+        for vout in source_tx.get("vout") or []:
+            if int(vout.get("n", 0) or 0) == source_vout and vout.get("spentTxId"):
+                spend = client.tx(str(vout["spentTxId"]))
+                break
+    except Exception:
+        spend = None
+
+    if spend is None:
+        try:
+            spend = find_spending_tx(
+                client,
+                address,
+                source_txid,
+                source_vout,
+                page_size=100,
+                max_pages=5,
+                from_height=row["collateral_height"] or row["registered_height"],
+            )
+        except Exception:
+            spend = None
+    if not spend:
+        return {}
+
+    threshold = int(Decimal(SENTRY_COLLATERAL_SATS) * Decimal("0.95"))
+    candidates: list[tuple[int, str]] = []
+    fallback: list[tuple[int, str]] = []
+    for vout in spend.get("vout") or []:
+        value = sats(vout.get("value"))
+        out_addresses = [addr for addr in addresses_from(vout) if addr != address]
+        if not out_addresses:
+            continue
+        fallback.append((value, out_addresses[0]))
+        if value >= threshold:
+            candidates.append((value, out_addresses[0]))
+
+    moved_to_address = ""
+    if candidates:
+        moved_to_address = max(candidates, key=lambda item: item[0])[1]
+    elif fallback:
+        moved_to_address = max(fallback, key=lambda item: item[0])[1]
+
+    return {
+        "taken_down_txid": spend.get("txid") or "",
+        "taken_down_time": spend.get("blockTime"),
+        "moved_to_address": moved_to_address,
+    }
+
+
+def sync_network_masternodes(
+    store: Store,
+    rpc: SyscoinRpcClient,
+    client: BlockbookClient | None = None,
+) -> dict[str, int]:
+    rows = network_masternode_rows_from_rpc(rpc)
+    current_outpoints = {row["outpoint"] for row in rows}
+    existing_rows = store.conn.execute("SELECT * FROM network_masternodes").fetchall()
+    existing_outpoints = {row["outpoint"] for row in existing_rows}
+
+    for row in rows:
+        store.save_network_masternode(row)
+
+    removed = 0
+    traced = 0
+    synced_at = now_iso()
+    removed_at = synced_at
+    for row in existing_rows:
+        if row["outpoint"] in current_outpoints or row["removed_at"]:
+            continue
+        trace = trace_masternode_collateral_spend(client, row) if client is not None else {}
+        if trace.get("taken_down_txid"):
+            traced += 1
+        store.mark_network_masternode_removed(
+            row["outpoint"],
+            removed_at=removed_at,
+            taken_down_txid=trace.get("taken_down_txid"),
+            taken_down_time=trace.get("taken_down_time"),
+            moved_to_address=trace.get("moved_to_address"),
+        )
+        removed += 1
+
+    store.conn.commit()
+    stats = {
+        "current": len(rows),
+        "added": len(current_outpoints - existing_outpoints),
+        "removed": removed,
+        "traced": traced,
+        "enabled": sum(1 for row in rows if str(row.get("status", "")).upper() == "ENABLED"),
+    }
+    store.set_meta("last_masternode_sync", {"synced_at": synced_at, **stats})
+    return stats
 
 
 def follow_outputs(
@@ -2084,6 +2261,8 @@ def masternodes_html(
         return int(parsed.timestamp())
 
     def moved_to_address_for(row: sqlite3.Row) -> str:
+        if row["moved_to_address"]:
+            return str(row["moved_to_address"])
         children = store.conn.execute(
             """
             SELECT address, value_sats
@@ -2101,24 +2280,39 @@ def masternodes_html(
                 return child["address"]
         return ""
 
+    baseline_seen = [
+        (iso_timestamp(row["first_seen_at"]), row["first_seen_at"])
+        for row in network_rows
+        if iso_timestamp(row["first_seen_at"]) > 0
+    ]
+    baseline_ts, baseline_iso = min(baseline_seen, default=(0, ""))
+
     for row in network_rows:
         collateral_address = row["collateral_address"]
         moved_to_address = moved_to_address_for(row)
         exchange_labels = exchange_labels_for_address(moved_to_address, exchange_tags, exchange_routes) if moved_to_address else set()
         exchange_text = ", ".join(sorted(exchange_labels)) if exchange_labels else "-"
         setup_time = row["registered_time"] or row["collateral_time"]
-        taken_down_sort = iso_timestamp(row["removed_at"])
+        taken_down_sort = row["taken_down_time"] or iso_timestamp(row["removed_at"])
+        taken_down_text = fmt_table_datetime(row["taken_down_time"]) if row["taken_down_time"] else fmt_iso_local_datetime(row["removed_at"])
+        first_seen_sort = iso_timestamp(row["first_seen_at"])
+        is_new = bool(baseline_ts and first_seen_sort > baseline_ts)
+        is_removed = bool(row["removed_at"])
+        change_type = "Taken down" if is_removed else "New setup" if is_new else ""
+        change_sort = taken_down_sort if is_removed else first_seen_sort
         status = row["status"] or ("Taken down" if row["removed_at"] else "Unknown")
         prepared_rows.append(
             {
                 "row": row,
+                "change_type": change_type,
+                "change_sort": change_sort,
                 "status": status,
                 "status_sort": status.lower(),
                 "moved_to_address": moved_to_address,
                 "exchange": exchange_text,
                 "exchange_sort": exchange_text.lower() if exchange_text != "-" else "",
                 "setup_time": setup_time,
-                "taken_down_time": row["removed_at"] or "",
+                "taken_down_text": taken_down_text,
                 "taken_down_sort": taken_down_sort,
             }
         )
@@ -2127,8 +2321,7 @@ def masternodes_html(
     other_status_count = len(prepared_rows) - enabled_count
     exchange_exit_count = sum(1 for item in prepared_rows if item["exchange"] != "-")
 
-    html_rows = []
-    for item in prepared_rows:
+    def masternode_row_html(item: dict[str, Any], include_change: bool = False) -> str:
         row = item["row"]
         collateral_address = row["collateral_address"]
         moved_to_address = item["moved_to_address"]
@@ -2137,10 +2330,16 @@ def masternodes_html(
             if moved_to_address
             else "-"
         )
-        html_rows.append(
+        change_cell = (
+            f"<td data-sort='{item['change_sort']}'><span class='status {'down' if item['change_type'] == 'Taken down' else 'active'}'>{html.escape(item['change_type'])}</span></td>"
+            if include_change
+            else ""
+        )
+        return (
             f"<tr>"
+            f"{change_cell}"
             f"<td data-sort='{item['setup_time'] or 0}' title='{html.escape(fmt_local_datetime(item['setup_time']))}'>{html.escape(fmt_table_datetime(item['setup_time']))}</td>"
-            f"<td data-sort='{item['taken_down_sort']}'>{html.escape(fmt_iso_local_datetime(item['taken_down_time'])) if item['taken_down_time'] else '-'}</td>"
+            f"<td data-sort='{item['taken_down_sort']}'>{html.escape(item['taken_down_text']) if item['taken_down_text'] else '-'}</td>"
             f"<td class='address' data-sort='{html.escape(collateral_address.lower())}'><a href='{explorer_address_url(collateral_address)}' title='{html.escape(collateral_address)}'>{html.escape(short_address(collateral_address))}</a></td>"
             f"<td class='address' data-sort='{html.escape(moved_to_address.lower())}'>{moved_to_html}</td>"
             f"<td data-sort='{html.escape(item['exchange_sort'])}'>{html.escape(item['exchange'])}</td>"
@@ -2148,9 +2347,15 @@ def masternodes_html(
             f"</tr>"
         )
 
-    rows_html = "\n".join(html_rows)
+    rows_html = "\n".join(masternode_row_html(item) for item in prepared_rows)
+    change_items = sorted((item for item in prepared_rows if item["change_type"]), key=lambda item: item["change_sort"], reverse=True)
+    change_rows_html = "\n".join(masternode_row_html(item, include_change=True) for item in change_items)
+    if not change_rows_html:
+        change_rows_html = "<tr><td class='empty' colspan='7'>No new setups or takedowns since the banked snapshot.</td></tr>"
     since_text = f"{fmt_local_datetime(since_time)} Sydney" if since_time else "all tracked history"
-    updated_text = fmt_iso_local_datetime(store.get_meta("last_summary", {}).get("synced_at"))
+    masternode_meta = store.get_meta("last_masternode_sync", {})
+    updated_text = fmt_iso_local_datetime(masternode_meta.get("synced_at") or store.get_meta("last_summary", {}).get("synced_at"))
+    baseline_text = fmt_iso_local_datetime(baseline_iso) if baseline_iso else "not set"
     total_count = len(prepared_rows)
 
     return f"""<!doctype html>
@@ -2192,13 +2397,21 @@ def masternodes_html(
     th[aria-sort="ascending"] .sort-icon::before {{ content: "^"; }}
     th[aria-sort="descending"] .sort-icon::before {{ content: "v"; }}
     th[aria-sort="none"] .sort-icon::before {{ content: ""; }}
-    th:nth-child(1), td:nth-child(1) {{ width: 125px; }}
-    th:nth-child(2), td:nth-child(2) {{ width: 135px; }}
-    th:nth-child(3), td:nth-child(3) {{ width: 220px; }}
-    th:nth-child(4), td:nth-child(4) {{ width: 220px; }}
-    th:nth-child(5), td:nth-child(5) {{ width: 125px; }}
-    th:nth-child(6), td:nth-child(6) {{ width: 120px; }}
+    .mn-current th:nth-child(1), .mn-current td:nth-child(1) {{ width: 125px; }}
+    .mn-current th:nth-child(2), .mn-current td:nth-child(2) {{ width: 135px; }}
+    .mn-current th:nth-child(3), .mn-current td:nth-child(3) {{ width: 220px; }}
+    .mn-current th:nth-child(4), .mn-current td:nth-child(4) {{ width: 220px; }}
+    .mn-current th:nth-child(5), .mn-current td:nth-child(5) {{ width: 125px; }}
+    .mn-current th:nth-child(6), .mn-current td:nth-child(6) {{ width: 120px; }}
+    .mn-changes th:nth-child(1), .mn-changes td:nth-child(1) {{ width: 125px; }}
+    .mn-changes th:nth-child(2), .mn-changes td:nth-child(2) {{ width: 125px; }}
+    .mn-changes th:nth-child(3), .mn-changes td:nth-child(3) {{ width: 135px; }}
+    .mn-changes th:nth-child(4), .mn-changes td:nth-child(4) {{ width: 205px; }}
+    .mn-changes th:nth-child(5), .mn-changes td:nth-child(5) {{ width: 205px; }}
+    .mn-changes th:nth-child(6), .mn-changes td:nth-child(6) {{ width: 120px; }}
+    .mn-changes th:nth-child(7), .mn-changes td:nth-child(7) {{ width: 115px; }}
     .address {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; white-space: nowrap; }}
+    .empty {{ color: #687177; padding: 18px 14px; text-align: center; }}
     .status {{ border-radius: 999px; display: inline-flex; font-size: 0.78rem; font-weight: 700; padding: 4px 8px; white-space: nowrap; }}
     .status.active {{ background: #e7f2ff; color: #095c9f; }}
     .status.down {{ background: #fff0df; color: #8a4c00; }}
@@ -2217,7 +2430,7 @@ def masternodes_html(
       th, td {{ border-color: #334047; }}
       a {{ color: #67d7ff; }}
       .subtitle {{ color: #b6c3c7; }}
-      .metric span, .panel-title p, .sort-icon {{ color: #a7b0b5; }}
+      .metric span, .panel-title p, .sort-icon, .empty {{ color: #a7b0b5; }}
       .sort-button:hover, .sort-button:focus-visible {{ color: #67d7ff; }}
       .status.active {{ background: #15304a; color: #b9dcff; }}
       .status.down {{ background: #442d13; color: #ffd9a8; }}
@@ -2248,11 +2461,33 @@ def masternodes_html(
     </section>
     <section>
       <div class="panel-title">
+        <h2>Changes Since Snapshot</h2>
+        <p>Snapshot banked {html.escape(baseline_text)}</p>
+      </div>
+      <div class="table-wrap">
+        <table class="mn-table mn-changes">
+          <thead>
+            <tr>
+              <th data-sort="number" data-default-dir="desc" aria-sort="descending"><button class="sort-button" type="button">Change<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Date Setup<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Date Taken Down<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Collateral Address<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Address 100k Moved To<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Exchange<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Status<span class="sort-icon" aria-hidden="true"></span></button></th>
+            </tr>
+          </thead>
+          <tbody>{change_rows_html}</tbody>
+        </table>
+      </div>
+    </section>
+    <section>
+      <div class="panel-title">
         <h2>Current Masternode List</h2>
         <p>Updated {html.escape(updated_text)}</p>
       </div>
       <div class="table-wrap">
-        <table>
+        <table class="mn-table mn-current">
           <thead>
             <tr>
               <th data-sort="number" data-default-dir="desc" aria-sort="descending"><button class="sort-button" type="button">Date Setup<span class="sort-icon" aria-hidden="true"></span></button></th>
@@ -2270,51 +2505,51 @@ def masternodes_html(
   </main>
   <script>
     (() => {{
-      const table = document.querySelector("table");
-      if (!table) return;
-      const headers = Array.from(table.querySelectorAll("th[data-sort]"));
-      const tbody = table.tBodies[0];
-      let activeIndex = 0;
-      let activeDirection = "desc";
+      document.querySelectorAll("table").forEach((table) => {{
+        const headers = Array.from(table.querySelectorAll("th[data-sort]"));
+        const tbody = table.tBodies[0];
+        let activeIndex = 0;
+        let activeDirection = "desc";
 
-      const cellValue = (row, index, type) => {{
-        const raw = row.cells[index]?.dataset.sort ?? row.cells[index]?.textContent ?? "";
-        if (type === "number") return Number(raw) || 0;
-        return raw.toLowerCase();
-      }};
+        const cellValue = (row, index, type) => {{
+          const raw = row.cells[index]?.dataset.sort ?? row.cells[index]?.textContent ?? "";
+          if (type === "number") return Number(raw) || 0;
+          return raw.toLowerCase();
+        }};
 
-      const updateHeaderState = (index, direction) => {{
-        headers.forEach((header, headerIndex) => {{
-          header.setAttribute(
-            "aria-sort",
-            headerIndex === index ? (direction === "asc" ? "ascending" : "descending") : "none",
-          );
-        }});
-      }};
+        const updateHeaderState = (index, direction) => {{
+          headers.forEach((header, headerIndex) => {{
+            header.setAttribute(
+              "aria-sort",
+              headerIndex === index ? (direction === "asc" ? "ascending" : "descending") : "none",
+            );
+          }});
+        }};
 
-      const sortRows = (index, direction) => {{
-        const type = headers[index].dataset.sort;
-        const multiplier = direction === "asc" ? 1 : -1;
-        const rows = Array.from(tbody.rows);
-        rows.sort((left, right) => {{
-          const leftValue = cellValue(left, index, type);
-          const rightValue = cellValue(right, index, type);
-          if (type === "number") return (leftValue - rightValue) * multiplier;
-          return String(leftValue).localeCompare(String(rightValue)) * multiplier;
-        }});
-        rows.forEach((row) => tbody.appendChild(row));
-        activeIndex = index;
-        activeDirection = direction;
-        updateHeaderState(index, direction);
-      }};
+        const sortRows = (index, direction) => {{
+          const type = headers[index].dataset.sort;
+          const multiplier = direction === "asc" ? 1 : -1;
+          const rows = Array.from(tbody.rows);
+          rows.sort((left, right) => {{
+            const leftValue = cellValue(left, index, type);
+            const rightValue = cellValue(right, index, type);
+            if (type === "number") return (leftValue - rightValue) * multiplier;
+            return String(leftValue).localeCompare(String(rightValue)) * multiplier;
+          }});
+          rows.forEach((row) => tbody.appendChild(row));
+          activeIndex = index;
+          activeDirection = direction;
+          updateHeaderState(index, direction);
+        }};
 
-      headers.forEach((header, index) => {{
-        header.querySelector("button")?.addEventListener("click", () => {{
-          const nextDirection =
-            activeIndex === index
-              ? (activeDirection === "asc" ? "desc" : "asc")
-              : (header.dataset.defaultDir || "asc");
-          sortRows(index, nextDirection);
+        headers.forEach((header, index) => {{
+          header.querySelector("button")?.addEventListener("click", () => {{
+            const nextDirection =
+              activeIndex === index
+                ? (activeDirection === "asc" ? "desc" : "asc")
+                : (header.dataset.defaultDir || "asc");
+            sortRows(index, nextDirection);
+          }});
         }});
       }});
     }})();
@@ -2340,34 +2575,35 @@ def dashboard_sync_loop(
     while True:
         started = time.monotonic()
         try:
-            stats = sync_address(
-                sync_store,
-                sync_client,
-                address,
-                page_size=page_size,
-                max_pages=max_pages,
-                from_height=from_height,
-                watched=watched,
-                quiet=True,
-            )
-            follow_stats = refresh_spent_first_hops(
-                sync_store,
-                sync_client,
-                watched,
-                since_time=since_time,
-                limit=8,
-                min_sats=sys_to_sats("100"),
-                page_size=min(page_size, 100),
-                max_pages_per_address=1,
-            )
-            node_stats = refresh_node_spends(
-                sync_store,
-                sync_client,
-                watched,
-                limit=12,
-                page_size=min(page_size, 100),
-                max_pages_per_address=1,
-            )
+            with DB_WRITE_LOCK:
+                stats = sync_address(
+                    sync_store,
+                    sync_client,
+                    address,
+                    page_size=page_size,
+                    max_pages=max_pages,
+                    from_height=from_height,
+                    watched=watched,
+                    quiet=True,
+                )
+                follow_stats = refresh_spent_first_hops(
+                    sync_store,
+                    sync_client,
+                    watched,
+                    since_time=since_time,
+                    limit=8,
+                    min_sats=sys_to_sats("100"),
+                    page_size=min(page_size, 100),
+                    max_pages_per_address=1,
+                )
+                node_stats = refresh_node_spends(
+                    sync_store,
+                    sync_client,
+                    watched,
+                    limit=12,
+                    page_size=min(page_size, 100),
+                    max_pages_per_address=1,
+                )
             print(
                 f"{now_iso()} dashboard sync seen={stats['seen']} new={stats['inserted']} "
                 f"next_hop_found={follow_stats['found_spends']} next_hop_outputs={follow_stats['created']} "
@@ -2377,7 +2613,34 @@ def dashboard_sync_loop(
                 file=sys.stderr,
             )
         except Exception as exc:
+            sync_store.conn.rollback()
             print(f"{now_iso()} dashboard sync failed: {exc}", file=sys.stderr)
+        elapsed = time.monotonic() - started
+        time.sleep(max(1, interval - int(elapsed)))
+
+
+def masternode_sync_loop(
+    db_path: Path,
+    rpc: SyscoinRpcClient,
+    blockbook_url: str,
+    insecure_tls: bool,
+    interval: int,
+) -> None:
+    sync_store = Store(db_path)
+    sync_client = BlockbookClient(blockbook_url, insecure_tls=insecure_tls)
+    while True:
+        started = time.monotonic()
+        try:
+            with DB_WRITE_LOCK:
+                stats = sync_network_masternodes(sync_store, rpc, sync_client)
+            print(
+                f"{now_iso()} masternode sync current={stats['current']} enabled={stats['enabled']} "
+                f"added={stats['added']} removed={stats['removed']} traced={stats['traced']}",
+                file=sys.stderr,
+            )
+        except Exception as exc:
+            sync_store.conn.rollback()
+            print(f"{now_iso()} masternode sync failed: {exc}", file=sys.stderr)
         elapsed = time.monotonic() - started
         time.sleep(max(1, interval - int(elapsed)))
 
@@ -2393,23 +2656,24 @@ def serve(
     class Handler(http.server.BaseHTTPRequestHandler):
         def send_page(self, include_body: bool = True) -> None:
             parsed = urllib.parse.urlparse(self.path)
-            if parsed.path in ("/", "/index.html"):
-                html_body = dashboard_html(
-                    store,
-                    since_time=since_time,
-                    since_label=since_label,
-                    refresh_seconds=refresh_seconds,
-                )
-            elif parsed.path in ("/masternodes", "/masternodes.html"):
-                html_body = masternodes_html(
-                    store,
-                    since_time=since_time,
-                    since_label=since_label,
-                    refresh_seconds=refresh_seconds,
-                )
-            else:
-                self.send_error(404)
-                return
+            with DB_WRITE_LOCK:
+                if parsed.path in ("/", "/index.html"):
+                    html_body = dashboard_html(
+                        store,
+                        since_time=since_time,
+                        since_label=since_label,
+                        refresh_seconds=refresh_seconds,
+                    )
+                elif parsed.path in ("/masternodes", "/masternodes.html"):
+                    html_body = masternodes_html(
+                        store,
+                        since_time=since_time,
+                        since_label=since_label,
+                        refresh_seconds=refresh_seconds,
+                    )
+                else:
+                    self.send_error(404)
+                    return
 
             body = html_body.encode("utf-8")
             self.send_response(200)
@@ -2488,6 +2752,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p.add_argument("--port", type=int, default=8787)
     serve_p.add_argument("--since-date", help="Only show dashboard movements from this date/time; e.g. '2026-04-14 12:30'")
     serve_p.add_argument("--sync-interval", type=int, default=60, help="Seconds between Blockbook syncs and page refreshes; use 0 to disable auto-sync")
+    serve_p.add_argument("--masternode-sync-interval", type=int, default=60, help="Seconds between masternode RPC checks; use 0 to disable")
     serve_p.add_argument("--sync-max-pages", type=int, help="Limit address pages per dashboard sync")
 
     return parser
@@ -2578,14 +2843,13 @@ def main(argv: list[str] | None = None) -> int:
         if rpc is None:
             print("No RPC URL/host supplied. Use --rpc-host/--rpc-url or SYS_RPC_URL.")
             return 1
-        rows = network_masternode_rows_from_rpc(rpc)
-        for row in rows:
-            store.save_network_masternode(row)
-        store.conn.commit()
+        stats = sync_network_masternodes(store, rpc, client)
         if args.csv:
-            write_network_masternodes_csv(rows, args.csv)
-        enabled = sum(1 for row in rows if str(row.get("status", "")).upper() == "ENABLED")
-        print(f"Synced {len(rows)} masternodes ({enabled} enabled)")
+            write_network_masternodes_csv(network_masternode_rows_from_store(store), args.csv)
+        print(
+            f"Synced {stats['current']} masternodes ({stats['enabled']} enabled); "
+            f"added {stats['added']}, removed {stats['removed']}, traced {stats['traced']}"
+        )
         return 0
 
     if args.command == "watch":
@@ -2642,13 +2906,30 @@ def main(argv: list[str] | None = None) -> int:
                 daemon=True,
             )
             sync_thread.start()
+        rpc = build_rpc_client(args)
+        if args.masternode_sync_interval > 0 and rpc is not None:
+            masternode_thread = threading.Thread(
+                target=masternode_sync_loop,
+                args=(
+                    Path(args.db),
+                    rpc,
+                    args.blockbook_url,
+                    args.insecure_tls,
+                    args.masternode_sync_interval,
+                ),
+                daemon=True,
+            )
+            masternode_thread.start()
+        elif args.masternode_sync_interval > 0:
+            print("Masternode live sync disabled: no RPC URL/host supplied.", file=sys.stderr)
+        refresh_candidates = [value for value in (args.sync_interval, args.masternode_sync_interval) if value > 0]
         serve(
             store,
             args.host,
             args.port,
             since_time=since_time,
             since_label=display_label,
-            refresh_seconds=args.sync_interval if args.sync_interval > 0 else 60,
+            refresh_seconds=min(refresh_candidates) if refresh_candidates else 60,
         )
         return 0
 
