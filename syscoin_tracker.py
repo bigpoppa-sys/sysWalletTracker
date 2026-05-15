@@ -37,6 +37,7 @@ DEFAULT_TIMEZONE = "Australia/Sydney"
 DEFAULT_EXCHANGE_TAGS_PATH = Path("exchange_tags.csv")
 DEFAULT_EXCHANGE_ROUTES_PATH = Path("exchange_routes.csv")
 DEFAULT_EXCHANGE_HOT_WALLETS_PATH = Path("exchange_hot_wallets.csv")
+DEFAULT_NETWORK_MASTERNODES_PATH = Path("network_masternodes.csv")
 SENTRY_COLLATERAL_SATS = 100_000 * 100_000_000
 SATOSHI = Decimal("100000000")
 
@@ -334,6 +335,31 @@ class SyscoinRpcClient:
             raise RuntimeError(data["error"])
         return data.get("result")
 
+    def batch_call(self, calls: list[tuple[str, list[Any]]]) -> list[Any]:
+        payload = json.dumps(
+            [
+                {"jsonrpc": "1.0", "id": str(index), "method": method, "params": params}
+                for index, (method, params) in enumerate(calls)
+            ]
+        ).encode()
+        headers = {"Content-Type": "application/json", "User-Agent": "syscoin-tracker/0.1"}
+        if self.username is not None and self.password is not None:
+            token = base64.b64encode(f"{self.username}:{self.password}".encode()).decode()
+            headers["Authorization"] = f"Basic {token}"
+        req = urllib.request.Request(self.url, data=payload, headers=headers)
+        with urllib.request.urlopen(req, timeout=max(self.timeout, 60)) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if not isinstance(data, list):
+            raise RuntimeError("RPC batch response was not a list")
+        by_id = {int(item["id"]): item for item in data}
+        results = []
+        for index in range(len(calls)):
+            item = by_id[index]
+            if item.get("error"):
+                raise RuntimeError(item["error"])
+            results.append(item.get("result"))
+        return results
+
 
 def build_rpc_client(args: argparse.Namespace) -> SyscoinRpcClient | None:
     url = args.rpc_url or os.getenv("SYS_RPC_URL")
@@ -367,6 +393,160 @@ def collect_masternode_outpoints(rpc: SyscoinRpcClient) -> set[str]:
                 if txid is not None and n is not None:
                     outpoints.add(f"{txid}:{n}")
     return outpoints
+
+
+def block_time_from_height(rpc: SyscoinRpcClient, height: int | None, cache: dict[int, int | None]) -> int | None:
+    if not height:
+        return None
+    if height in cache:
+        return cache[height]
+    try:
+        block_hash = rpc.call("getblockhash", [height])
+        header = rpc.call("getblockheader", [block_hash])
+        cache[height] = int(header.get("time")) if isinstance(header, dict) and header.get("time") else None
+    except Exception:
+        cache[height] = None
+    return cache[height]
+
+
+def block_times_from_heights(rpc: SyscoinRpcClient, heights: Iterable[int]) -> dict[int, int | None]:
+    unique_heights = sorted(set(int(height) for height in heights if height))
+    times: dict[int, int | None] = {}
+    chunk_size = 500
+    for index in range(0, len(unique_heights), chunk_size):
+        chunk = unique_heights[index : index + chunk_size]
+        try:
+            hashes = rpc.batch_call([("getblockhash", [height]) for height in chunk])
+            headers = rpc.batch_call([("getblockheader", [block_hash]) for block_hash in hashes])
+            for height, header in zip(chunk, headers):
+                times[height] = int(header.get("time")) if isinstance(header, dict) and header.get("time") else None
+        except Exception:
+            cache: dict[int, int | None] = {}
+            for height in chunk:
+                times[height] = block_time_from_height(rpc, height, cache)
+    return times
+
+
+def network_masternode_rows_from_rpc(rpc: SyscoinRpcClient) -> list[dict[str, Any]]:
+    result = rpc.call("masternode_list", ["json"])
+    if not isinstance(result, dict):
+        return []
+
+    parsed_rows: list[tuple[str, int, dict[str, Any], int | None, int | None]] = []
+    heights: set[int] = set()
+    for outpoint_key, info in result.items():
+        if not isinstance(info, dict):
+            continue
+        outpoint = normalize_outpoint(str(outpoint_key))
+        if ":" not in outpoint:
+            continue
+        source_txid, source_vout_text = outpoint.rsplit(":", 1)
+        try:
+            source_vout = int(source_vout_text)
+        except ValueError:
+            continue
+        collateral_height = int(info["collateralheight"]) if info.get("collateralheight") is not None else None
+        registered_height = int(info["registeredheight"]) if info.get("registeredheight") is not None else None
+        if collateral_height:
+            heights.add(collateral_height)
+        if registered_height:
+            heights.add(registered_height)
+        parsed_rows.append((source_txid, source_vout, info, collateral_height, registered_height))
+
+    height_times = block_times_from_heights(rpc, heights)
+    rows: list[dict[str, Any]] = []
+    seen_at = now_iso()
+    for source_txid, source_vout, info, collateral_height, registered_height in parsed_rows:
+        outpoint = f"{source_txid}:{source_vout}"
+        rows.append(
+            {
+                "outpoint": outpoint,
+                "source_txid": source_txid,
+                "source_vout": source_vout,
+                "pro_tx_hash": info.get("proTxHash") or "",
+                "service": info.get("address") or "",
+                "payee": info.get("payee") or "",
+                "status": info.get("status") or "",
+                "collateral_address": info.get("collateraladdress") or "",
+                "owner_address": info.get("owneraddress") or "",
+                "voting_address": info.get("votingaddress") or "",
+                "collateral_height": collateral_height,
+                "collateral_time": height_times.get(collateral_height) if collateral_height else None,
+                "registered_height": registered_height,
+                "registered_time": height_times.get(registered_height) if registered_height else None,
+                "last_paid_time": int(info["lastpaidtime"]) if info.get("lastpaidtime") else None,
+                "last_paid_block": int(info["lastpaidblock"]) if info.get("lastpaidblock") else None,
+                "first_seen_at": seen_at,
+                "last_seen_at": seen_at,
+                "removed_at": "",
+            }
+        )
+    return rows
+
+
+def write_network_masternodes_csv(rows: list[dict[str, Any]], path: Path) -> None:
+    headers = [
+        "outpoint",
+        "source_txid",
+        "source_vout",
+        "pro_tx_hash",
+        "service",
+        "payee",
+        "status",
+        "collateral_address",
+        "owner_address",
+        "voting_address",
+        "collateral_height",
+        "collateral_time",
+        "registered_height",
+        "registered_time",
+        "last_paid_time",
+        "last_paid_block",
+        "first_seen_at",
+        "last_seen_at",
+        "removed_at",
+    ]
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def load_network_masternodes_csv(store: Store, path: Path = DEFAULT_NETWORK_MASTERNODES_PATH) -> None:
+    if not path.exists():
+        return
+
+    def maybe_int(value: str | None) -> int | None:
+        if value is None or value == "":
+            return None
+        return int(value)
+
+    with path.open(newline="") as f:
+        for row in csv.DictReader(f):
+            store.save_network_masternode(
+                {
+                    "outpoint": row["outpoint"],
+                    "source_txid": row["source_txid"],
+                    "source_vout": int(row["source_vout"]),
+                    "pro_tx_hash": row.get("pro_tx_hash") or "",
+                    "service": row.get("service") or "",
+                    "payee": row.get("payee") or "",
+                    "status": row.get("status") or "",
+                    "collateral_address": row.get("collateral_address") or "",
+                    "owner_address": row.get("owner_address") or "",
+                    "voting_address": row.get("voting_address") or "",
+                    "collateral_height": maybe_int(row.get("collateral_height")),
+                    "collateral_time": maybe_int(row.get("collateral_time")),
+                    "registered_height": maybe_int(row.get("registered_height")),
+                    "registered_time": maybe_int(row.get("registered_time")),
+                    "last_paid_time": maybe_int(row.get("last_paid_time")),
+                    "last_paid_block": maybe_int(row.get("last_paid_block")),
+                    "first_seen_at": row.get("first_seen_at") or now_iso(),
+                    "last_seen_at": row.get("last_seen_at") or now_iso(),
+                    "removed_at": row.get("removed_at") or "",
+                }
+            )
+    store.conn.commit()
 
 
 def verify_sentry_candidates(store: Store, rpc: SyscoinRpcClient, since_time: int | None = None) -> str:
@@ -496,12 +676,36 @@ class Store:
                 verified_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS network_masternodes (
+                outpoint TEXT PRIMARY KEY,
+                source_txid TEXT NOT NULL,
+                source_vout INTEGER NOT NULL,
+                pro_tx_hash TEXT,
+                service TEXT,
+                payee TEXT,
+                status TEXT,
+                collateral_address TEXT NOT NULL,
+                owner_address TEXT,
+                voting_address TEXT,
+                collateral_height INTEGER,
+                collateral_time INTEGER,
+                registered_height INTEGER,
+                registered_time INTEGER,
+                last_paid_time INTEGER,
+                last_paid_block INTEGER,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                removed_at TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS idx_movements_block
                 ON movements(block_height, block_time);
             CREATE INDEX IF NOT EXISTS idx_tracked_outputs_address
                 ON tracked_outputs(address);
             CREATE INDEX IF NOT EXISTS idx_tracked_outputs_spent
                 ON tracked_outputs(spent, spent_txid);
+            CREATE INDEX IF NOT EXISTS idx_network_masternodes_status
+                ON network_masternodes(status);
             """
         )
         self.conn.commit()
@@ -697,6 +901,57 @@ class Store:
             ),
         )
         self.conn.commit()
+
+    def save_network_masternode(self, row: dict[str, Any]) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO network_masternodes(
+                outpoint, source_txid, source_vout, pro_tx_hash, service, payee,
+                status, collateral_address, owner_address, voting_address,
+                collateral_height, collateral_time, registered_height,
+                registered_time, last_paid_time, last_paid_block, first_seen_at,
+                last_seen_at, removed_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(outpoint) DO UPDATE SET
+                pro_tx_hash=excluded.pro_tx_hash,
+                service=excluded.service,
+                payee=excluded.payee,
+                status=excluded.status,
+                collateral_address=excluded.collateral_address,
+                owner_address=excluded.owner_address,
+                voting_address=excluded.voting_address,
+                collateral_height=excluded.collateral_height,
+                collateral_time=excluded.collateral_time,
+                registered_height=excluded.registered_height,
+                registered_time=excluded.registered_time,
+                last_paid_time=excluded.last_paid_time,
+                last_paid_block=excluded.last_paid_block,
+                last_seen_at=excluded.last_seen_at,
+                removed_at=excluded.removed_at
+            """,
+            (
+                row["outpoint"],
+                row["source_txid"],
+                row["source_vout"],
+                row.get("pro_tx_hash"),
+                row.get("service"),
+                row.get("payee"),
+                row.get("status"),
+                row["collateral_address"],
+                row.get("owner_address"),
+                row.get("voting_address"),
+                row.get("collateral_height"),
+                row.get("collateral_time"),
+                row.get("registered_height"),
+                row.get("registered_time"),
+                row.get("last_paid_time"),
+                row.get("last_paid_block"),
+                row.get("first_seen_at") or now_iso(),
+                row.get("last_seen_at") or now_iso(),
+                row.get("removed_at") or None,
+            ),
+        )
 
 
 def analyze_tx(tx: dict[str, Any], watched: set[str]) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
@@ -1805,136 +2060,68 @@ def masternodes_html(
     for wallet in load_exchange_hot_wallets():
         exchange_tags.setdefault(wallet["address"], wallet["label"])
 
-    node_rows = store.conn.execute(
+    if store.conn.execute("SELECT COUNT(*) AS count FROM network_masternodes").fetchone()["count"] == 0:
+        load_network_masternodes_csv(store)
+
+    prepared_rows = []
+    network_rows = store.conn.execute(
         """
-        SELECT t.*, v.outpoint, v.verified_at
-        FROM verified_sentries v
-        JOIN tracked_outputs t
-          ON v.source_txid = t.source_txid
-         AND v.source_vout = t.source_vout
-         AND v.depth = t.depth
-         AND v.path = t.path
-        ORDER BY COALESCE(t.block_time, 0) DESC, t.address
+        SELECT *
+        FROM network_masternodes
+        ORDER BY COALESCE(registered_time, collateral_time, 0) DESC, collateral_address
         """
     ).fetchall()
 
-    spend_times = {
-        row["txid"]: row["block_time"]
-        for row in store.conn.execute(
-            """
-            SELECT txid, block_time
-            FROM transactions
-            WHERE txid IN (
-                SELECT spent_txid
-                FROM tracked_outputs
-                WHERE value_sats = ? AND spent_txid IS NOT NULL
-            )
-            """,
-            (SENTRY_COLLATERAL_SATS,),
-        ).fetchall()
-    }
-
-    def child_outputs_for(row: sqlite3.Row) -> list[dict[str, Any]]:
-        if not row["spent_txid"]:
-            return []
-        tracked_children = store.conn.execute(
-            """
-            SELECT address, value_sats, attributed_sats, block_time
-            FROM tracked_outputs
-            WHERE parent_txid = ?
-              AND parent_vout = ?
-              AND source_txid = ?
-            ORDER BY value_sats DESC
-            """,
-            (row["source_txid"], row["source_vout"], row["spent_txid"]),
-        ).fetchall()
-        if tracked_children:
-            return [dict(child) for child in tracked_children]
-
-        tx_row = store.conn.execute("SELECT raw_json FROM transactions WHERE txid = ?", (row["spent_txid"],)).fetchone()
-        if not tx_row:
-            return []
+    def iso_timestamp(value: str | None) -> int:
+        if not value:
+            return 0
         try:
-            tx = json.loads(tx_row["raw_json"])
-        except json.JSONDecodeError:
-            return []
-        children = []
-        tx_time = tx.get("blockTime")
-        for vout in tx.get("vout") or []:
-            value = sats(vout.get("value"))
-            if not value:
-                continue
-            for address in addresses_from(vout) or ["unknown"]:
-                children.append({"address": address, "value_sats": value, "attributed_sats": value, "block_time": tx_time})
-        return children
+            parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return 0
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return int(parsed.timestamp())
 
-    prepared_rows = []
-    for row in node_rows:
-        children = child_outputs_for(row)
-        exit_labels = exchange_labels_for_address(row["address"], exchange_tags, exchange_routes)
-        exit_address = ""
-        exit_value = 0
-        for child in children:
-            child_address = str(child["address"])
-            child_value = int(child["value_sats"])
-            if child_address == "unknown" or child_address == row["address"]:
-                continue
-            if child_value > exit_value:
-                exit_address = child_address
-                exit_value = child_value
-            if child_value >= int(SENTRY_COLLATERAL_SATS * Decimal("0.95")):
-                exit_labels.update(exchange_labels_for_address(child_address, exchange_tags, exchange_routes))
-
-        child_times = [int(child["block_time"]) for child in children if child.get("block_time")]
-        spend_time = spend_times.get(row["spent_txid"]) if row["spent_txid"] else None
-        if spend_time is None and child_times:
-            spend_time = max(child_times)
-        taken_down_sort = spend_time or row["spent_height"] or 0
-        is_taken_down = row["spent"] == 1
-        exchange_text = ", ".join(sorted(exit_labels)) if exit_labels else "-"
+    for row in network_rows:
+        collateral_address = row["collateral_address"]
+        exchange_labels = exchange_labels_for_address(collateral_address, exchange_tags, exchange_routes)
+        exchange_text = ", ".join(sorted(exchange_labels)) if exchange_labels else "-"
+        setup_time = row["registered_time"] or row["collateral_time"]
+        taken_down_sort = iso_timestamp(row["removed_at"])
+        status = row["status"] or ("Taken down" if row["removed_at"] else "Unknown")
         prepared_rows.append(
             {
                 "row": row,
-                "status": "Taken down" if is_taken_down else "Active",
-                "status_sort": 0 if is_taken_down else 1,
-                "exit_address": exit_address,
+                "status": status,
+                "status_sort": status.lower(),
                 "exchange": exchange_text,
                 "exchange_sort": exchange_text.lower() if exchange_text != "-" else "",
-                "setup_time": row["block_time"],
-                "taken_down_time": spend_time,
+                "setup_time": setup_time,
+                "taken_down_time": row["removed_at"] or "",
                 "taken_down_sort": taken_down_sort,
             }
         )
 
-    taken_down_count = sum(1 for item in prepared_rows if item["status"] == "Taken down")
+    enabled_count = sum(1 for item in prepared_rows if item["status"].upper() == "ENABLED")
+    other_status_count = len(prepared_rows) - enabled_count
     exchange_exit_count = sum(1 for item in prepared_rows if item["exchange"] != "-")
-    active_count = len(prepared_rows) - taken_down_count
 
     html_rows = []
     for item in prepared_rows:
         row = item["row"]
-        outpoint = f"{row['source_txid']}:{row['source_vout']}"
-        exit_address = item["exit_address"]
-        exit_address_html = (
-            f"<a href='{explorer_address_url(exit_address)}' title='{html.escape(exit_address)}'>{html.escape(short_address(exit_address))}</a>"
-            if exit_address
-            else "-"
-        )
-        spend_html = (
-            f"<a href='{explorer_tx_url(row['spent_txid'])}' title='{html.escape(row['spent_txid'])}'>{html.escape(short_txid(row['spent_txid']))}</a>"
-            if row["spent_txid"]
-            else "-"
-        )
+        collateral_address = row["collateral_address"]
+        outpoint = row["outpoint"]
         html_rows.append(
             f"<tr>"
-            f"<td data-sort='{row['block_time'] or 0}' title='{html.escape(fmt_local_datetime(row['block_time']))}'>{html.escape(fmt_table_datetime(row['block_time']))}</td>"
-            f"<td data-sort='{item['taken_down_sort']}' title='{html.escape(fmt_local_datetime(item['taken_down_time']))}'>{html.escape(fmt_table_datetime(item['taken_down_time'])) if item['taken_down_time'] else '-'}</td>"
-            f"<td class='address' data-sort='{html.escape(row['address'].lower())}'><a href='{explorer_address_url(row['address'])}' title='{html.escape(row['address'])}'>{html.escape(short_address(row['address']))}</a></td>"
-            f"<td class='address' data-sort='{html.escape(exit_address.lower())}'>{exit_address_html}</td>"
+            f"<td data-sort='{item['setup_time'] or 0}' title='{html.escape(fmt_local_datetime(item['setup_time']))}'>{html.escape(fmt_table_datetime(item['setup_time']))}</td>"
+            f"<td data-sort='{item['taken_down_sort']}'>{html.escape(fmt_iso_local_datetime(item['taken_down_time'])) if item['taken_down_time'] else '-'}</td>"
+            f"<td class='address' data-sort='{html.escape(collateral_address.lower())}'><a href='{explorer_address_url(collateral_address)}' title='{html.escape(collateral_address)}'>{html.escape(short_address(collateral_address))}</a></td>"
             f"<td data-sort='{html.escape(item['exchange_sort'])}'>{html.escape(item['exchange'])}</td>"
-            f"<td data-sort='{item['status_sort']}'><span class='status {'down' if item['status'] == 'Taken down' else 'active'}'>{html.escape(item['status'])}</span></td>"
+            f"<td data-sort='{html.escape(item['status_sort'])}'><span class='status {'active' if item['status'].upper() == 'ENABLED' else 'down'}'>{html.escape(item['status'])}</span></td>"
+            f"<td data-sort='{html.escape((row['service'] or '').lower())}'>{html.escape(row['service'] or '-')}</td>"
             f"<td class='address' data-sort='{html.escape(outpoint.lower())}'><a href='{explorer_tx_url(row['source_txid'])}' title='{html.escape(outpoint)}'>{html.escape(short_txid(outpoint))}</a></td>"
-            f"<td class='address' data-sort='{html.escape((row['spent_txid'] or '').lower())}'>{spend_html}</td>"
+            f"<td class='address' data-sort='{html.escape((row['pro_tx_hash'] or '').lower())}'>{html.escape(short_txid(row['pro_tx_hash'] or '-'))}</td>"
             f"</tr>"
         )
 
@@ -1973,7 +2160,7 @@ def masternodes_html(
     .panel-title h2 {{ margin: 0; font-size: 1.25rem; }}
     .panel-title p {{ margin: 0; color: #687177; font-size: 0.9rem; }}
     .table-wrap {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; max-width: 100%; min-width: 0; overflow-x: auto; width: 100%; }}
-    table {{ width: 100%; min-width: 1040px; border-collapse: separate; border-spacing: 0; background: #fff; table-layout: fixed; }}
+    table {{ width: 100%; min-width: 1140px; border-collapse: separate; border-spacing: 0; background: #fff; table-layout: fixed; }}
     th, td {{ padding: 8px 10px; border-bottom: 1px solid #e4e8e2; text-align: left; font-size: 0.88rem; overflow: hidden; text-overflow: ellipsis; }}
     th {{ background: #eaf0ec; position: sticky; top: 0; z-index: 10; box-shadow: 0 1px 0 #d9ded8; }}
     .sort-button {{ appearance: none; border: 0; background: transparent; color: inherit; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; font: inherit; font-weight: 700; padding: 0; text-align: inherit; white-space: nowrap; }}
@@ -1982,12 +2169,12 @@ def masternodes_html(
     th[aria-sort="ascending"] .sort-icon::before {{ content: "^"; }}
     th[aria-sort="descending"] .sort-icon::before {{ content: "v"; }}
     th[aria-sort="none"] .sort-icon::before {{ content: ""; }}
-    th:nth-child(1), td:nth-child(1) {{ width: 128px; }}
-    th:nth-child(2), td:nth-child(2) {{ width: 128px; }}
-    th:nth-child(3), td:nth-child(3) {{ width: 220px; }}
-    th:nth-child(4), td:nth-child(4) {{ width: 220px; }}
-    th:nth-child(5), td:nth-child(5) {{ width: 140px; }}
-    th:nth-child(6), td:nth-child(6) {{ width: 112px; }}
+    th:nth-child(1), td:nth-child(1) {{ width: 122px; }}
+    th:nth-child(2), td:nth-child(2) {{ width: 126px; }}
+    th:nth-child(3), td:nth-child(3) {{ width: 218px; }}
+    th:nth-child(4), td:nth-child(4) {{ width: 136px; }}
+    th:nth-child(5), td:nth-child(5) {{ width: 110px; }}
+    th:nth-child(6), td:nth-child(6) {{ width: 135px; }}
     th:nth-child(7), td:nth-child(7) {{ width: 150px; }}
     th:nth-child(8), td:nth-child(8) {{ width: 150px; }}
     .address {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; white-space: nowrap; }}
@@ -2022,7 +2209,7 @@ def masternodes_html(
       <div class="topbar">
         <div>
           <h1>Syscoin Masternode Tracker</h1>
-          <div class="subtitle">Masternode-list 100k SYS collateral outputs tied to Binance wallet flows since {html.escape(since_text)}</div>
+          <div class="subtitle">Current network masternodes from RPC, with exchange notes overlaid where known</div>
         </div>
         <nav class="nav" aria-label="Dashboard pages">
           <a href="/">Wallet Flows</a>
@@ -2034,13 +2221,13 @@ def masternodes_html(
   <main>
     <section class="metrics">
       <div class="metric"><span>Masternodes</span><b>{total_count}</b></div>
-      <div class="metric"><span>Active</span><b>{active_count}</b></div>
-      <div class="metric"><span>Taken Down</span><b>{taken_down_count}</b></div>
+      <div class="metric"><span>Enabled</span><b>{enabled_count}</b></div>
+      <div class="metric"><span>Other Status</span><b>{other_status_count}</b></div>
       <div class="metric"><span>Exchange From Notes</span><b>{exchange_exit_count}</b></div>
     </section>
     <section>
       <div class="panel-title">
-        <h2>Masternodes From Node List</h2>
+        <h2>Current Masternode List</h2>
         <p>Updated {html.escape(updated_text)}</p>
       </div>
       <div class="table-wrap">
@@ -2050,11 +2237,11 @@ def masternodes_html(
               <th data-sort="number" data-default-dir="desc" aria-sort="descending"><button class="sort-button" type="button">Date Setup<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Date Taken Down<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Address 100k Moved To<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Taken Down To<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Exchange From Notes?<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="number" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Status<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Setup Tx<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Takedown Tx<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Status<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Node IP<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Collateral Outpoint<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">ProTx<span class="sort-icon" aria-hidden="true"></span></button></th>
             </tr>
           </thead>
           <tbody>{rows_html}</tbody>
@@ -2268,6 +2455,9 @@ def build_parser() -> argparse.ArgumentParser:
     verify_p = sub.add_parser("verify-sentries", help="Verify exact 100k SYS candidates against masternode_list RPC")
     verify_p.add_argument("--since-date", help="Only verify candidates from this date/time; e.g. '2026-04-14 12:30'")
 
+    mn_p = sub.add_parser("sync-masternodes", help="Fetch the full network masternode_list snapshot from RPC")
+    mn_p.add_argument("--csv", type=Path, default=DEFAULT_NETWORK_MASTERNODES_PATH, help="Write masternode snapshot CSV")
+
     watch_p = sub.add_parser("watch", help="Poll repeatedly and emit outbound alerts")
     watch_p.add_argument("--interval", type=int, default=60)
     watch_p.add_argument("--max-pages", type=int, default=2)
@@ -2362,6 +2552,21 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         since_time, _since_label = parse_since_date(args.since_date, args.timezone)
         print(verify_sentry_candidates(store, rpc, since_time=since_time))
+        return 0
+
+    if args.command == "sync-masternodes":
+        rpc = build_rpc_client(args)
+        if rpc is None:
+            print("No RPC URL/host supplied. Use --rpc-host/--rpc-url or SYS_RPC_URL.")
+            return 1
+        rows = network_masternode_rows_from_rpc(rpc)
+        for row in rows:
+            store.save_network_masternode(row)
+        store.conn.commit()
+        if args.csv:
+            write_network_masternodes_csv(rows, args.csv)
+        enabled = sum(1 for row in rows if str(row.get("status", "")).upper() == "ENABLED")
+        print(f"Synced {len(rows)} masternodes ({enabled} enabled)")
         return 0
 
     if args.command == "watch":

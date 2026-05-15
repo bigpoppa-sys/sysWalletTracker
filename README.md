@@ -27,7 +27,7 @@ Then open:
 The dashboard has two pages:
 
 - `/` tracks Binance hot-wallet recipient flows.
-- `/masternodes` tracks masternode-list 100,000 SYS collateral outputs, setup/takedown dates, and whether the destination is in the exchange notes.
+- `/masternodes` tracks the current network masternode list from RPC, setup/takedown dates, and whether the collateral destination is in the exchange notes.
 
 ## Vercel
 
@@ -118,6 +118,7 @@ export SYS_RPC_HOST="127.0.0.1"
 export SYS_RPC_USER="your-user"
 export SYS_RPC_PASSWORD="your-password"
 python3 syscoin_tracker.py rpc-check
+python3 syscoin_tracker.py sync-masternodes --csv network_masternodes.csv
 python3 syscoin_tracker.py verify-sentries --since-date "2026-04-14 12:30"
 ```
 

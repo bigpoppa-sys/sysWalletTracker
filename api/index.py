@@ -25,6 +25,7 @@ from syscoin_tracker import (  # noqa: E402
     Store,
     block_height_at_or_after,
     dashboard_html,
+    load_network_masternodes_csv,
     masternodes_html,
     parse_since_date,
     refresh_node_spends,
@@ -201,6 +202,7 @@ def sync_for_request(force: bool = False) -> tuple[Store, int | None, str | None
         )
         load_node_outputs(store)
         load_verified_sentries(store)
+        load_network_masternodes_csv(store)
         refresh_spent_first_hops(
             store,
             client,
