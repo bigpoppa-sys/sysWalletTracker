@@ -57,7 +57,7 @@ tmp_cron="$(mktemp)"
 crontab -l 2>/dev/null | sed '/# sysWalletTracker masternode watcher start/,/# sysWalletTracker masternode watcher end/d' >"$tmp_cron" || true
 cat >>"$tmp_cron" <<CRON
 # sysWalletTracker masternode watcher start
-* * * * SYS_TRACKER_APP_DIR="$APP_DIR" "$APP_DIR/scripts/masternode_cron_sync.sh"
+* * * * * "$APP_DIR/scripts/masternode_cron_sync.sh"
 # sysWalletTracker masternode watcher end
 CRON
 crontab "$tmp_cron"

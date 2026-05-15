@@ -28,7 +28,24 @@ from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable
-from zoneinfo import ZoneInfo
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - compatibility for Python 3.8 VPS cron
+    class ZoneInfo(dt.tzinfo):
+        def __init__(self, key: str) -> None:
+            self.key = key
+
+        def utcoffset(self, value: dt.datetime | None) -> dt.timedelta:
+            if self.key == "Australia/Sydney":
+                return dt.timedelta(hours=10)
+            return dt.timedelta(0)
+
+        def dst(self, value: dt.datetime | None) -> dt.timedelta:
+            return dt.timedelta(0)
+
+        def tzname(self, value: dt.datetime | None) -> str:
+            return self.key
 
 
 DEFAULT_BLOCKBOOK_URL = "https://explorer-blockbook.syscoin.org"

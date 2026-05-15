@@ -5,6 +5,7 @@ __pycache__/
 *.sqlite-wal
 *.log
 .vercel/
+.ssh/
 destinations*.csv
 
 .vercel
