@@ -2094,11 +2094,12 @@ def dashboard_html(
             f"<td data-sort='{row['last_time'] or 0}' title='{html.escape(last_seen_full)}'>{html.escape(last_seen_short)}</td></tr>"
         )
     top_html = "\n".join(html_rows)
-    since_text = f"{fmt_local_datetime(since_time)} Sydney" if since_time else "all tracked history"
+    since_text = dt.datetime.fromtimestamp(since_time, tz=dt.timezone.utc).astimezone(ZoneInfo(DEFAULT_TIMEZONE)).strftime("%b %-d, %Y") if since_time else "all tracked history"
     updated_text = fmt_iso_local_datetime(last_summary.get("synced_at"))
     total_sent_full = fmt_sys(window_summary["external_sats"])
     wallet_balance_sats = int(last_summary.get("balance_sats") or 0)
     wallet_balance_full = fmt_sys(wallet_balance_sats)
+    hot_wallet_address = last_summary.get("address") or DEFAULT_ADDRESS
 
     return f"""<!doctype html>
 <html lang="en">
@@ -2126,6 +2127,7 @@ def dashboard_html(
     .metric {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; padding: 14px 16px; min-width: 0; }}
     .metric span {{ display: block; color: #687177; font-size: 0.84rem; margin-bottom: 6px; }}
     .metric b {{ display: block; font-size: clamp(1.25rem, 2vw, 1.65rem); line-height: 1.1; overflow-wrap: anywhere; }}
+    .metric .metric-address {{ display: block; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 0.72rem; margin-top: 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
     .panel-title {{ display: flex; align-items: end; justify-content: space-between; gap: 16px; }}
     .panel-title h2 {{ margin: 0; font-size: 1.25rem; }}
     .panel-title p {{ margin: 0; color: #687177; font-size: 0.9rem; }}
@@ -2214,7 +2216,7 @@ def dashboard_html(
   <main>
     <section class="metrics">
       <div class="metric"><span>SYS Sent</span><b title="{html.escape(total_sent_full)} SYS">{fmt_compact_sys(window_summary["external_sats"])}</b></div>
-      <div class="metric"><span>Wallet Balance</span><b title="{html.escape(wallet_balance_full)} SYS">{fmt_compact_sys(wallet_balance_sats)}</b></div>
+      <div class="metric"><span>Binance Hot Wallet</span><b title="{html.escape(wallet_balance_full)} SYS">{fmt_compact_sys(wallet_balance_sats)}</b><a class="metric-address" href="{explorer_addr(hot_wallet_address)}" title="{html.escape(hot_wallet_address)}">{html.escape(short_address(hot_wallet_address))}</a></div>
       <div class="metric"><span>Transfers</span><b>{window_summary["txs"]}</b></div>
       <div class="metric"><span>Recipients</span><b>{destination_count}</b></div>
       <div class="metric"><span>Updated</span><b>{html.escape(updated_text)}</b></div>
