@@ -54,6 +54,7 @@ DEFAULT_TIMEZONE = "Australia/Sydney"
 DEFAULT_EXCHANGE_TAGS_PATH = Path("exchange_tags.csv")
 DEFAULT_EXCHANGE_ROUTES_PATH = Path("exchange_routes.csv")
 DEFAULT_EXCHANGE_HOT_WALLETS_PATH = Path("exchange_hot_wallets.csv")
+DEFAULT_EXCHANGE_COLD_WALLETS_PATH = Path("exchange_cold_wallets.csv")
 DEFAULT_NETWORK_MASTERNODES_PATH = Path("network_masternodes.csv")
 NETWORK_MASTERNODE_HEADERS = [
     "outpoint",
@@ -202,6 +203,26 @@ def load_exchange_routes(path: Path = DEFAULT_EXCHANGE_ROUTES_PATH) -> dict[str,
 
 
 def load_exchange_hot_wallets(path: Path = DEFAULT_EXCHANGE_HOT_WALLETS_PATH) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    wallets = []
+    with path.open(newline="") as f:
+        for row in csv.DictReader(f):
+            label = (row.get("label") or "").strip()
+            address = (row.get("address") or "").strip()
+            if not label or not address:
+                continue
+            wallets.append(
+                {
+                    "label": label,
+                    "address": address,
+                    "note": (row.get("note") or "").strip(),
+                }
+            )
+    return wallets
+
+
+def load_exchange_cold_wallets(path: Path = DEFAULT_EXCHANGE_COLD_WALLETS_PATH) -> list[dict[str, str]]:
     if not path.exists():
         return []
     wallets = []
@@ -1509,7 +1530,7 @@ def refresh_exchange_hot_wallet_balances(
     client: BlockbookClient,
     wallets: list[dict[str, str]] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    wallets = wallets if wallets is not None else load_exchange_hot_wallets()
+    wallets = wallets if wallets is not None else load_exchange_hot_wallets() + load_exchange_cold_wallets()
     known_addresses = {wallet["address"] for wallet in wallets}
     previous = store.get_meta("exchange_hot_wallet_balances", {}) or {}
     updated: dict[str, dict[str, Any]] = {
@@ -1952,6 +1973,7 @@ def dashboard_html(
     exchange_tags = load_exchange_tags()
     exchange_routes = load_exchange_routes()
     exchange_hot_wallets = load_exchange_hot_wallets()
+    exchange_cold_wallets = load_exchange_cold_wallets()
     exchange_hot_wallet_balances = store.get_meta("exchange_hot_wallet_balances", {}) or {}
     later_exchanges_by_address: dict[str, set[str]] = {}
     downstream_sentry_by_address: dict[str, int] = {}
@@ -1988,33 +2010,40 @@ def dashboard_html(
     def explorer_addr(addr: str) -> str:
         return f"https://explorer-blockbook.syscoin.org/address/{urllib.parse.quote(addr)}"
 
-    hot_wallet_rows = []
-    for wallet in exchange_hot_wallets:
-        note = wallet["note"]
-        note_html = f"<span>{html.escape(note)}</span>" if note else ""
-        wallet_balance = exchange_hot_wallet_balances.get(wallet["address"], {})
-        if isinstance(wallet_balance, dict) and "balance_sats" in wallet_balance:
-            balance_sats = int(wallet_balance.get("balance_sats") or 0)
-            if balance_sats < SATOSHI:
-                continue
-            balance_text = fmt_compact_sys(balance_sats)
-            balance_html = (
-                f"<span class='wallet-balance'>Final balance: "
-                f"<b title='{fmt_sys(balance_sats)} SYS'>{html.escape(balance_text)}</b></span>"
+    def wallet_card_rows(wallets: list[dict[str, str]]) -> list[str]:
+        rows = []
+        for wallet in wallets:
+            note = wallet["note"]
+            note_html = f"<span>{html.escape(note)}</span>" if note else ""
+            wallet_balance = exchange_hot_wallet_balances.get(wallet["address"], {})
+            if isinstance(wallet_balance, dict) and "balance_sats" in wallet_balance:
+                balance_sats = int(wallet_balance.get("balance_sats") or 0)
+                if balance_sats < SATOSHI:
+                    continue
+                balance_text = fmt_compact_sys(balance_sats)
+                balance_html = (
+                    f"<span class='wallet-balance'>Final balance: "
+                    f"<b title='{fmt_sys(balance_sats)} SYS'>{html.escape(balance_text)}</b></span>"
+                )
+            else:
+                balance_html = "<span class='wallet-balance muted'>Final balance: -</span>"
+            rows.append(
+                f"<article class='wallet-card'>"
+                f"<strong>{html.escape(wallet['label'])}</strong>"
+                f"{note_html}"
+                f"<a href='{explorer_addr(wallet['address'])}' title='{html.escape(wallet['address'])}'>"
+                f"{html.escape(short_address(wallet['address']))}</a>"
+                f"{balance_html}"
+                f"</article>"
             )
-        else:
-            balance_html = "<span class='wallet-balance muted'>Final balance: -</span>"
-        hot_wallet_rows.append(
-            f"<article class='wallet-card'>"
-            f"<strong>{html.escape(wallet['label'])}</strong>"
-            f"{note_html}"
-            f"<a href='{explorer_addr(wallet['address'])}' title='{html.escape(wallet['address'])}'>"
-            f"{html.escape(short_address(wallet['address']))}</a>"
-            f"{balance_html}"
-            f"</article>"
-        )
+        return rows
+
+    hot_wallet_rows = wallet_card_rows(exchange_hot_wallets)
+    cold_wallet_rows = wallet_card_rows(exchange_cold_wallets)
     hot_wallet_html = "\n".join(hot_wallet_rows)
+    cold_wallet_html = "\n".join(cold_wallet_rows)
     visible_hot_wallet_count = len(hot_wallet_rows)
+    visible_cold_wallet_count = len(cold_wallet_rows)
 
     html_rows = []
     for rank, row in enumerate(top_rows, 1):
@@ -2197,6 +2226,13 @@ def dashboard_html(
       </div>
       <div class="wallet-list">{hot_wallet_html}</div>
     </section>
+    <section class="cold-wallets">
+      <div class="panel-title">
+        <h2>Known Cold Wallets</h2>
+        <p>{visible_cold_wallet_count} Blockbook links</p>
+      </div>
+      <div class="wallet-list">{cold_wallet_html}</div>
+    </section>
     <section>
       <div class="panel-title">
         <h2>Recipients Ranked By SYS</h2>
@@ -2320,7 +2356,7 @@ def masternodes_html(
 ) -> str:
     exchange_tags = load_exchange_tags()
     exchange_routes = load_exchange_routes()
-    for wallet in load_exchange_hot_wallets():
+    for wallet in load_exchange_hot_wallets() + load_exchange_cold_wallets():
         exchange_tags.setdefault(wallet["address"], wallet["label"])
 
     if store.conn.execute("SELECT COUNT(*) AS count FROM network_masternodes").fetchone()["count"] == 0:

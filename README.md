@@ -119,6 +119,13 @@ or intermediate wallets should not be listed here.
 | Ex(Unknown) | [`sys1qe5vdffvlpyvkj3z3fqw8kc639s2dykp7smun9w`](https://explorer-blockbook.syscoin.org/address/sys1qe5vdffvlpyvkj3z3fqw8kc639s2dykp7smun9w) | repeated downstream cluster |
 | Ex(Unknown) | [`sys1qcfz9dne8ffk5at79p3et76fzgvwxlxymsc6lje`](https://explorer-blockbook.syscoin.org/address/sys1qcfz9dne8ffk5at79p3et76fzgvwxlxymsc6lje) | repeated downstream cluster |
 
+Known cold wallets live in `exchange_cold_wallets.csv` and are shown separately
+on the dashboard.
+
+| Exchange | Cold wallet | Note |
+| --- | --- | --- |
+| Binance | [`SUBbe8vb7ng9CxZE9J3hma2CCkBh5VBHrv`](https://explorer-blockbook.syscoin.org/address/SUBbe8vb7ng9CxZE9J3hma2CCkBh5VBHrv) | confirmed cold wallet |
+
 Direct end-wallet labels are mirrored in `exchange_tags.csv`. Proven deposit or
 intermediate routes can live in `exchange_routes.csv`; for example, your
 `sys1qs05...` Bitget deposit address is kept as a route to the Bitget end wallet,

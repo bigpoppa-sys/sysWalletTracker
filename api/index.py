@@ -55,6 +55,7 @@ INSTALL_BUNDLE_FILES = (
     "destinations_since_monitoring.csv",
     "destinations_since_monitoring_all_ranked.csv",
     "exchange_hot_wallets.csv",
+    "exchange_cold_wallets.csv",
     "exchange_routes.csv",
     "exchange_tags.csv",
     "network_masternodes.csv",
