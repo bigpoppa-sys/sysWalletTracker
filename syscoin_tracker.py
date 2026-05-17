@@ -2524,6 +2524,8 @@ def masternodes_html(
 
     rows_html = "\n".join(masternode_row_html(item) for item in current_items)
     change_items = sorted((item for item in prepared_rows if item["change_type"]), key=lambda item: item["change_sort"], reverse=True)
+    new_setup_count = sum(1 for item in change_items if item["change_type"] == "New setup")
+    taken_down_count = sum(1 for item in change_items if item["change_type"] == "Taken down")
     change_rows_html = "\n".join(masternode_row_html(item, include_change=True) for item in change_items)
     if not change_rows_html:
         change_rows_html = "<tr><td class='empty' colspan='7'>No new setups or takedowns since the banked snapshot.</td></tr>"
@@ -2555,7 +2557,7 @@ def masternodes_html(
     .nav a.active {{ background: #f8fafc; color: #142026; }}
     main {{ display: grid; gap: 22px; margin-top: 22px; margin-bottom: 22px; padding: 0; }}
     main > * {{ min-width: 0; }}
-    .metrics {{ display: grid; grid-template-columns: repeat(4, minmax(130px, 1fr)); gap: 12px; }}
+    .metrics {{ display: grid; grid-template-columns: repeat(6, minmax(120px, 1fr)); gap: 12px; }}
     .metric {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; padding: 14px 16px; min-width: 0; }}
     .metric span {{ display: block; color: #687177; font-size: 0.84rem; margin-bottom: 6px; }}
     .metric b {{ display: block; font-size: clamp(1.25rem, 2vw, 1.65rem); line-height: 1.1; overflow-wrap: anywhere; }}
@@ -2632,6 +2634,8 @@ def masternodes_html(
       <div class="metric"><span>Masternodes</span><b>{total_count}</b></div>
       <div class="metric"><span>Enabled</span><b>{enabled_count}</b></div>
       <div class="metric"><span>Other Status</span><b>{other_status_count}</b></div>
+      <div class="metric"><span>New Setups</span><b>{new_setup_count}</b></div>
+      <div class="metric"><span>Taken Down</span><b>{taken_down_count}</b></div>
       <div class="metric"><span>Exchange</span><b>{exchange_exit_count}</b></div>
     </section>
     <section>
