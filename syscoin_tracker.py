@@ -84,6 +84,8 @@ NETWORK_MASTERNODE_HEADERS = [
     "moved_to_address",
 ]
 SENTRY_COLLATERAL_SATS = 100_000 * 100_000_000
+SENIORITY_LEVEL_1_BLOCKS = 210_240
+SENIORITY_LEVEL_2_BLOCKS = 525_600
 SATOSHI = Decimal("100000000")
 DB_WRITE_LOCK = threading.Lock()
 
@@ -102,6 +104,15 @@ def sats(value: Any) -> int:
     if value is None or value == "":
         return 0
     return int(value)
+
+
+def int_or_none(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def fmt_sys(sat: int) -> str:
@@ -1403,6 +1414,17 @@ def sync_network_masternodes(
     client: BlockbookClient | None = None,
 ) -> dict[str, int]:
     rows = network_masternode_rows_from_rpc(rpc)
+    try:
+        chain_height = int(rpc.call("getblockcount"))
+    except Exception:
+        chain_height = max(
+            (
+                int_or_none(row.get(key)) or 0
+                for row in rows
+                for key in ("collateral_height", "registered_height", "last_paid_block")
+            ),
+            default=0,
+        )
     current_outpoints = {row["outpoint"] for row in rows}
     existing_rows = store.conn.execute("SELECT * FROM network_masternodes").fetchall()
     existing_outpoints = {row["outpoint"] for row in existing_rows}
@@ -1436,6 +1458,7 @@ def sync_network_masternodes(
         "removed": removed,
         "traced": traced,
         "enabled": sum(1 for row in rows if str(row.get("status", "")).upper() == "ENABLED"),
+        "chain_height": chain_height,
     }
     store.set_meta("last_masternode_sync", {"synced_at": synced_at, **stats})
     return stats
@@ -2488,7 +2511,7 @@ def dashboard_html(
         </div>
         <nav class="nav" aria-label="Dashboard pages">
           <a class="active" href="/">Wallet Flows</a>
-          <a href="/masternodes">Masternodes</a>
+          <a href="/masternodes">Sentry Nodes</a>
         </nav>
       </div>
     </div>
@@ -2520,7 +2543,7 @@ def dashboard_html(
         <h2>Recipients Ranked By SYS</h2>
         <p>{destination_count} addresses, high to low</p>
       </div>
-      <div class="table-wrap"><table id="destinations-table"><thead><tr><th data-sort="number" data-default-dir="asc" aria-sort="ascending"><button class="sort-button" type="button">Rank<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Address<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">SYS Sent<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Share<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Sends<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="number" data-default-dir="desc" title="Amount already spent by the first recipient address" aria-sort="none"><button class="sort-button" type="button">Sent Again<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Exchange<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="number" data-default-dir="desc" title="Exact 100,000 SYS output seen at this hop or the next traced hop" aria-sort="none"><button class="sort-button" type="button">100k Node<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Last Seen<span class="sort-icon" aria-hidden="true"></span></button></th></tr></thead><tbody>{top_html}</tbody></table></div>
+      <div class="table-wrap"><table id="destinations-table"><thead><tr><th data-sort="number" data-default-dir="asc" aria-sort="ascending"><button class="sort-button" type="button">Rank<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Address<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">SYS Sent<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Share<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Sends<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="number" data-default-dir="desc" title="Amount already spent by the first recipient address" aria-sort="none"><button class="sort-button" type="button">Sent Again<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Exchange<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="number" data-default-dir="desc" title="Exact 100,000 SYS output seen at this hop or the next traced hop" aria-sort="none"><button class="sort-button" type="button">100k Sentry<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Last Seen<span class="sort-icon" aria-hidden="true"></span></button></th></tr></thead><tbody>{top_html}</tbody></table></div>
     </section>
   </main>
   <script>
@@ -2640,6 +2663,8 @@ def masternodes_html(
         load_network_masternodes_csv(store)
 
     prepared_rows = []
+    exchange_tags = load_exchange_tags()
+    exchange_routes = load_exchange_routes()
     network_rows = store.conn.execute(
         """
         SELECT *
@@ -2647,6 +2672,15 @@ def masternodes_html(
         ORDER BY COALESCE(registered_time, collateral_time, 0) DESC, collateral_address
         """
     ).fetchall()
+    masternode_meta = store.get_meta("last_masternode_sync", {})
+    chain_height = int_or_none(masternode_meta.get("chain_height")) or max(
+        (
+            int_or_none(row[key]) or 0
+            for row in network_rows
+            for key in ("collateral_height", "registered_height", "last_paid_block")
+        ),
+        default=0,
+    )
 
     def iso_timestamp(value: str | None) -> int:
         if not value:
@@ -2666,6 +2700,32 @@ def masternodes_html(
     ]
     baseline_ts, baseline_iso = min(baseline_seen, default=(0, ""))
 
+    def seniority_for(row: sqlite3.Row) -> dict[str, Any]:
+        collateral_height = int_or_none(row["collateral_height"])
+        if not collateral_height or not chain_height:
+            return {"label": "-", "sort": -1, "class": "unknown", "title": "Collateral height unavailable"}
+
+        blocks_since_collateral = max(chain_height - collateral_height, 0)
+        if blocks_since_collateral >= SENIORITY_LEVEL_2_BLOCKS:
+            label = "Level 2"
+            sort = 2
+            css_class = "level-2"
+        elif blocks_since_collateral >= SENIORITY_LEVEL_1_BLOCKS:
+            label = "Level 1"
+            sort = 1
+            css_class = "level-1"
+        else:
+            label = "Base"
+            sort = 0
+            css_class = "base"
+
+        return {
+            "label": label,
+            "sort": sort,
+            "class": css_class,
+            "title": f"{blocks_since_collateral:,} blocks since collateral height {collateral_height:,}",
+        }
+
     for row in network_rows:
         setup_time = row["registered_time"] or row["collateral_time"]
         taken_down_sort = row["taken_down_time"] or iso_timestamp(row["removed_at"])
@@ -2676,6 +2736,10 @@ def masternodes_html(
         change_type = "Taken down" if is_removed else "New setup" if is_new else ""
         change_sort = taken_down_sort if is_removed else first_seen_sort
         status = row["status"] or ("Taken down" if row["removed_at"] else "Unknown")
+        seniority = seniority_for(row)
+        moved_to_address = row["moved_to_address"] or ""
+        exchange_labels = exchange_labels_for_address(moved_to_address, exchange_tags, exchange_routes) if moved_to_address else set()
+        exchange_text = ", ".join(sorted(exchange_labels)) if exchange_labels else "-"
         prepared_rows.append(
             {
                 "row": row,
@@ -2686,6 +2750,9 @@ def masternodes_html(
                 "setup_time": setup_time,
                 "taken_down_text": taken_down_text,
                 "taken_down_sort": taken_down_sort,
+                "seniority": seniority,
+                "moved_to_address": moved_to_address,
+                "exchange_text": exchange_text,
             }
         )
 
@@ -2711,14 +2778,42 @@ def masternodes_html(
             if include_change
             else ""
         )
+        moved_to_address = item["moved_to_address"]
+        moved_to_html = (
+            f"<a href='{explorer_address_url(moved_to_address)}' title='{html.escape(moved_to_address)}'>{html.escape(short_address(moved_to_address))}</a>"
+            if moved_to_address
+            else "-"
+        )
+        taken_down_display = item["taken_down_text"] if item["change_type"] == "Taken down" and item["taken_down_text"] else "-"
+        change_detail_cells = (
+            f"<td data-sort='{item['taken_down_sort'] or 0}'>{html.escape(taken_down_display)}</td>"
+            f"<td class='address' data-sort='{html.escape(moved_to_address.lower())}'>{moved_to_html}</td>"
+            f"<td data-sort='{html.escape(item['exchange_text'].lower())}'>{html.escape(item['exchange_text'])}</td>"
+            if include_change
+            else ""
+        )
+        setup_cell = (
+            f"<td data-sort='{item['setup_time'] or 0}' title='{html.escape(fmt_local_datetime(item['setup_time']))}'>"
+            f"{html.escape(fmt_table_datetime(item['setup_time']))}</td>"
+        )
+        status_cell = (
+            f"<td data-sort='{html.escape(item['status_sort'])}'>"
+            f"<span class='status {'active' if item['status'].upper() == 'ENABLED' else 'down'}'>{html.escape(item['status'])}</span>"
+            f"</td>"
+        )
+        if include_change:
+            return f"<tr>{change_cell}{setup_cell}{change_detail_cells}{status_cell}</tr>"
+
+        seniority = item["seniority"]
+        search_terms = html.escape(f"{collateral_address} {service}".lower(), quote=True)
         return (
-            f"<tr>"
-            f"{change_cell}"
-            f"<td data-sort='{item['setup_time'] or 0}' title='{html.escape(fmt_local_datetime(item['setup_time']))}'>{html.escape(fmt_table_datetime(item['setup_time']))}</td>"
+            f"<tr data-search='{search_terms}'>"
+            f"{setup_cell}"
+            f"<td data-sort='{seniority['sort']}'><span class='seniority {html.escape(seniority['class'])}' title='{html.escape(seniority['title'])}'>{html.escape(seniority['label'])}</span></td>"
             f"<td class='address' data-sort='{html.escape(collateral_address.lower())}'><a href='{explorer_address_url(collateral_address)}' title='{html.escape(collateral_address)}'>{html.escape(short_address(collateral_address))}</a></td>"
             f"<td class='address' data-sort='{html.escape(tx_outpoint.lower())}'>{tx_html}</td>"
             f"<td data-sort='{html.escape(str(service).lower())}'>{html.escape(str(service))}</td>"
-            f"<td data-sort='{html.escape(item['status_sort'])}'><span class='status {'active' if item['status'].upper() == 'ENABLED' else 'down'}'>{html.escape(item['status'])}</span></td>"
+            f"{status_cell}"
             f"</tr>"
         )
 
@@ -2728,9 +2823,9 @@ def masternodes_html(
     taken_down_count = sum(1 for item in change_items if item["change_type"] == "Taken down")
     change_rows_html = "\n".join(masternode_row_html(item, include_change=True) for item in change_items)
     if not change_rows_html:
-        change_rows_html = "<tr><td class='empty' colspan='6'>No new setups or takedowns since the banked snapshot.</td></tr>"
+        change_rows_html = "<tr class='mn-empty'><td class='empty' colspan='6'>No new setups or takedowns since the banked snapshot.</td></tr>"
+    current_no_results_html = "<tr class='mn-no-results' hidden><td class='empty' colspan='6'>No matching sentry nodes.</td></tr>"
     since_text = f"{fmt_local_datetime(since_time)} Sydney" if since_time else "all tracked history"
-    masternode_meta = store.get_meta("last_masternode_sync", {})
     updated_text = fmt_iso_local_datetime(masternode_meta.get("synced_at") or store.get_meta("last_summary", {}).get("synced_at"))
     baseline_text = fmt_iso_local_datetime(baseline_iso) if baseline_iso else "not set"
     total_count = len(current_items)
@@ -2741,7 +2836,7 @@ def masternodes_html(
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="refresh" content="{max(refresh_seconds, 1)}">
-  <title>Syscoin Masternode Tracker</title>
+  <title>Syscoin Sentry Node Tracker</title>
   <style>
     :root {{ color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --page-gutter: clamp(24px, 3.8vw, 80px); }}
     *, *::before, *::after {{ box-sizing: border-box; }}
@@ -2764,8 +2859,19 @@ def masternodes_html(
     .panel-title {{ display: flex; align-items: end; justify-content: space-between; gap: 16px; }}
     .panel-title h2 {{ margin: 0; font-size: 1.25rem; }}
     .panel-title p {{ margin: 0; color: #687177; font-size: 0.9rem; }}
+    .table-controls {{ align-items: end; display: flex; flex-wrap: wrap; gap: 10px; justify-content: space-between; margin: 10px 0; }}
+    .table-controls label {{ color: #687177; display: grid; font-size: 0.78rem; font-weight: 700; gap: 4px; }}
+    .table-controls input, .table-controls select {{ background: #fff; border: 1px solid #cfd7d1; border-radius: 6px; color: #1c2227; font: inherit; min-height: 36px; padding: 7px 9px; }}
+    .search-control {{ flex: 1 1 300px; max-width: 520px; }}
+    .page-size-control {{ width: 110px; }}
+    .pager {{ align-items: center; color: #687177; display: flex; gap: 8px; margin-left: auto; }}
+    .pager button {{ background: #fff; border: 1px solid #cfd7d1; border-radius: 6px; color: #1c2227; cursor: pointer; font: inherit; min-height: 36px; padding: 7px 10px; }}
+    .pager button:disabled {{ cursor: default; opacity: 0.45; }}
+    .page-status {{ color: #687177; font-size: 0.86rem; min-width: 96px; text-align: center; }}
     .table-wrap {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; max-width: 100%; min-width: 0; overflow-x: auto; width: 100%; }}
     table {{ width: 100%; min-width: 920px; border-collapse: separate; border-spacing: 0; background: #fff; table-layout: fixed; }}
+    .mn-current {{ min-width: 935px; }}
+    .mn-changes {{ min-width: 850px; }}
     th, td {{ padding: 8px 10px; border-bottom: 1px solid #e4e8e2; text-align: left; font-size: 0.88rem; overflow: hidden; text-overflow: ellipsis; }}
     th {{ background: #eaf0ec; position: sticky; top: 0; z-index: 10; box-shadow: 0 1px 0 #d9ded8; }}
     .sort-button {{ appearance: none; border: 0; background: transparent; color: inherit; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; font: inherit; font-weight: 700; padding: 0; text-align: inherit; white-space: nowrap; }}
@@ -2775,25 +2881,34 @@ def masternodes_html(
     th[aria-sort="descending"] .sort-icon::before {{ content: "v"; }}
     th[aria-sort="none"] .sort-icon::before {{ content: ""; }}
     .mn-current th:nth-child(1), .mn-current td:nth-child(1) {{ width: 125px; }}
-    .mn-current th:nth-child(2), .mn-current td:nth-child(2) {{ width: 230px; }}
-    .mn-current th:nth-child(3), .mn-current td:nth-child(3) {{ width: 230px; }}
-    .mn-current th:nth-child(4), .mn-current td:nth-child(4) {{ width: 155px; }}
-    .mn-current th:nth-child(5), .mn-current td:nth-child(5) {{ width: 120px; }}
+    .mn-current th:nth-child(2), .mn-current td:nth-child(2) {{ width: 100px; }}
+    .mn-current th:nth-child(3), .mn-current td:nth-child(3) {{ width: 220px; }}
+    .mn-current th:nth-child(4), .mn-current td:nth-child(4) {{ width: 220px; }}
+    .mn-current th:nth-child(5), .mn-current td:nth-child(5) {{ width: 155px; }}
+    .mn-current th:nth-child(6), .mn-current td:nth-child(6) {{ width: 115px; }}
     .mn-changes th:nth-child(1), .mn-changes td:nth-child(1) {{ width: 125px; }}
     .mn-changes th:nth-child(2), .mn-changes td:nth-child(2) {{ width: 125px; }}
-    .mn-changes th:nth-child(3), .mn-changes td:nth-child(3) {{ width: 220px; }}
-    .mn-changes th:nth-child(4), .mn-changes td:nth-child(4) {{ width: 230px; }}
-    .mn-changes th:nth-child(5), .mn-changes td:nth-child(5) {{ width: 155px; }}
+    .mn-changes th:nth-child(3), .mn-changes td:nth-child(3) {{ width: 135px; }}
+    .mn-changes th:nth-child(4), .mn-changes td:nth-child(4) {{ width: 220px; }}
+    .mn-changes th:nth-child(5), .mn-changes td:nth-child(5) {{ width: 130px; }}
     .mn-changes th:nth-child(6), .mn-changes td:nth-child(6) {{ width: 115px; }}
     .address {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; white-space: nowrap; }}
     .empty {{ color: #687177; padding: 18px 14px; text-align: center; }}
     .status {{ border-radius: 999px; display: inline-flex; font-size: 0.78rem; font-weight: 700; padding: 4px 8px; white-space: nowrap; }}
     .status.active {{ background: #e7f2ff; color: #095c9f; }}
     .status.down {{ background: #fff0df; color: #8a4c00; }}
+    .seniority {{ border-radius: 999px; display: inline-flex; font-size: 0.78rem; font-weight: 700; padding: 4px 8px; white-space: nowrap; }}
+    .seniority.base {{ background: #edf1ed; color: #405045; }}
+    .seniority.level-1 {{ background: #e7f2ff; color: #095c9f; }}
+    .seniority.level-2 {{ background: #e8f6ed; color: #1f6d3a; }}
+    .seniority.unknown {{ background: #f2f3f3; color: #687177; }}
     a {{ color: #086788; text-decoration: none; }}
     @media(max-width: 920px) {{
       .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .panel-title {{ align-items: start; flex-direction: column; }}
+      .table-controls {{ align-items: stretch; flex-direction: column; }}
+      .search-control, .page-size-control {{ max-width: none; width: 100%; }}
+      .pager {{ margin-left: 0; }}
       .topbar {{ align-items: start; flex-direction: column; }}
       .nav {{ justify-content: flex-start; }}
       .header-inner, main {{ margin-left: 12px; margin-right: 12px; }}
@@ -2801,14 +2916,19 @@ def masternodes_html(
     @media (prefers-color-scheme: dark) {{
       body {{ background: #121619; color: #f3f4f6; }}
       .metric, .table-wrap, table {{ background: #1c2328; border-color: #334047; }}
+      .table-controls input, .table-controls select, .pager button {{ background: #1c2328; border-color: #46555e; color: #f3f4f6; }}
       th {{ background: #263139; }}
       th, td {{ border-color: #334047; }}
       a {{ color: #67d7ff; }}
       .subtitle {{ color: #b6c3c7; }}
-      .metric span, .panel-title p, .sort-icon, .empty {{ color: #a7b0b5; }}
+      .metric span, .panel-title p, .sort-icon, .empty, .table-controls label, .pager, .page-status {{ color: #a7b0b5; }}
       .sort-button:hover, .sort-button:focus-visible {{ color: #67d7ff; }}
       .status.active {{ background: #15304a; color: #b9dcff; }}
       .status.down {{ background: #442d13; color: #ffd9a8; }}
+      .seniority.base {{ background: #273234; color: #d7e1dd; }}
+      .seniority.level-1 {{ background: #15304a; color: #b9dcff; }}
+      .seniority.level-2 {{ background: #173823; color: #b7efc7; }}
+      .seniority.unknown {{ background: #2d3337; color: #a7b0b5; }}
     }}
   </style>
 </head>
@@ -2817,19 +2937,19 @@ def masternodes_html(
     <div class="header-inner">
       <div class="topbar">
         <div>
-          <h1>Syscoin Masternode Tracker</h1>
+          <h1>Syscoin Sentry Node Tracker</h1>
           <div class="subtitle">Experimental view. Useful for spotting patterns, not proof of ownership or intent.</div>
         </div>
         <nav class="nav" aria-label="Dashboard pages">
           <a href="/">Wallet Flows</a>
-          <a class="active" href="/masternodes">Masternodes</a>
+          <a class="active" href="/masternodes">Sentry Nodes</a>
         </nav>
       </div>
     </div>
   </header>
   <main>
     <section class="metrics">
-      <div class="metric"><span>Masternodes</span><b>{total_count}</b></div>
+      <div class="metric"><span>Sentry Nodes</span><b>{total_count}</b></div>
       <div class="metric"><span>Enabled</span><b>{enabled_count}</b></div>
       <div class="metric"><span>Other Status</span><b>{other_status_count}</b></div>
       <div class="metric"><span>New Setups</span><b>{new_setup_count}</b></div>
@@ -2840,15 +2960,30 @@ def masternodes_html(
         <h2>Changes Since Snapshot</h2>
         <p>Snapshot banked {html.escape(baseline_text)}</p>
       </div>
+      <div class="table-controls" aria-label="Changes since snapshot table controls">
+        <label class="page-size-control" for="mn-changes-page-size">
+          <span>Rows</span>
+          <select id="mn-changes-page-size">
+            <option value="20">20</option>
+            <option value="50" selected>50</option>
+            <option value="100">100</option>
+          </select>
+        </label>
+        <div class="pager" aria-label="Changes since snapshot pagination">
+          <button id="mn-changes-prev" type="button">Prev</button>
+          <span class="page-status" id="mn-changes-page-status">0 of 0</span>
+          <button id="mn-changes-next" type="button">Next</button>
+        </div>
+      </div>
       <div class="table-wrap">
         <table class="mn-table mn-changes">
           <thead>
             <tr>
               <th data-sort="number" data-default-dir="desc" aria-sort="descending"><button class="sort-button" type="button">Change<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Date Setup<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Collateral Address<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Collateral Tx<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">IP Address<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Date Taken Down<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">100k Moved To<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Exchange<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Status<span class="sort-icon" aria-hidden="true"></span></button></th>
             </tr>
           </thead>
@@ -2858,27 +2993,123 @@ def masternodes_html(
     </section>
     <section>
       <div class="panel-title">
-        <h2>Current Masternode List</h2>
+        <h2>Current Sentry Node List</h2>
         <p>Updated {html.escape(updated_text)}</p>
+      </div>
+      <div class="table-controls" aria-label="Current sentry node table controls">
+        <label class="search-control" for="mn-current-search">
+          <span>Search</span>
+          <input id="mn-current-search" type="search" placeholder="IP or collateral address" autocomplete="off">
+        </label>
+        <label class="page-size-control" for="mn-current-page-size">
+          <span>Rows</span>
+          <select id="mn-current-page-size">
+            <option value="20">20</option>
+            <option value="50" selected>50</option>
+            <option value="100">100</option>
+          </select>
+        </label>
+        <div class="pager" aria-label="Current sentry node pagination">
+          <button id="mn-current-prev" type="button">Prev</button>
+          <span class="page-status" id="mn-current-page-status">0 of 0</span>
+          <button id="mn-current-next" type="button">Next</button>
+        </div>
       </div>
       <div class="table-wrap">
         <table class="mn-table mn-current">
           <thead>
             <tr>
               <th data-sort="number" data-default-dir="desc" aria-sort="descending"><button class="sort-button" type="button">Date Setup<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Seniority<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Collateral Address<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Collateral Tx<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">IP Address<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Status<span class="sort-icon" aria-hidden="true"></span></button></th>
             </tr>
           </thead>
-          <tbody>{rows_html}</tbody>
+          <tbody>{rows_html}{current_no_results_html}</tbody>
         </table>
       </div>
     </section>
   </main>
   <script>
     (() => {{
+      const setupPaginator = (config) => {{
+        const table = document.querySelector(config.tableSelector);
+        const searchInput = config.searchSelector ? document.querySelector(config.searchSelector) : null;
+        const pageSizeSelect = document.querySelector(config.pageSizeSelector);
+        const pageStatus = document.querySelector(config.statusSelector);
+        const prevButton = document.querySelector(config.prevSelector);
+        const nextButton = document.querySelector(config.nextSelector);
+        if (!table || !pageSizeSelect || !pageStatus || !prevButton || !nextButton) return null;
+        let page = 1;
+
+        const dataRows = () =>
+          Array.from(table.tBodies[0].rows).filter(
+            (row) => !row.classList.contains("mn-no-results") && !row.classList.contains("mn-empty"),
+          );
+
+        const apply = () => {{
+          const query = (searchInput?.value || "").trim().toLowerCase();
+          const pageSize = Number(pageSizeSelect.value) || 50;
+          const rows = dataRows();
+          const matchedRows = rows.filter((row) => !query || (row.dataset.search || "").includes(query));
+          const total = matchedRows.length;
+          const totalPages = Math.max(1, Math.ceil(total / pageSize));
+          page = Math.min(Math.max(page, 1), totalPages);
+          const start = total ? (page - 1) * pageSize : 0;
+          const end = Math.min(start + pageSize, total);
+          rows.forEach((row) => {{ row.hidden = true; }});
+          matchedRows.slice(start, end).forEach((row) => {{ row.hidden = false; }});
+          table.querySelectorAll(".mn-empty").forEach((row) => {{ row.hidden = total !== 0; }});
+          table.querySelectorAll(".mn-no-results").forEach((row) => {{ row.hidden = total !== 0; }});
+          pageStatus.textContent = total ? `${{start + 1}}-${{end}} of ${{total}}` : "0 of 0";
+          prevButton.disabled = page <= 1;
+          nextButton.disabled = page >= totalPages;
+        }};
+
+        searchInput?.addEventListener("input", () => {{
+          page = 1;
+          apply();
+        }});
+        pageSizeSelect.addEventListener("change", () => {{
+          page = 1;
+          apply();
+        }});
+        prevButton.addEventListener("click", () => {{
+          page -= 1;
+          apply();
+        }});
+        nextButton.addEventListener("click", () => {{
+          page += 1;
+          apply();
+        }});
+
+        return {{ table, apply }};
+      }};
+
+      const paginators = [
+        setupPaginator({{
+          tableSelector: ".mn-changes",
+          pageSizeSelector: "#mn-changes-page-size",
+          statusSelector: "#mn-changes-page-status",
+          prevSelector: "#mn-changes-prev",
+          nextSelector: "#mn-changes-next",
+        }}),
+        setupPaginator({{
+          tableSelector: ".mn-current",
+          searchSelector: "#mn-current-search",
+          pageSizeSelector: "#mn-current-page-size",
+          statusSelector: "#mn-current-page-status",
+          prevSelector: "#mn-current-prev",
+          nextSelector: "#mn-current-next",
+        }}),
+      ].filter(Boolean);
+
+      const applyPaginationForTable = (table) => {{
+        paginators.find((paginator) => paginator.table === table)?.apply();
+      }};
+
       document.querySelectorAll("table").forEach((table) => {{
         const headers = Array.from(table.querySelectorAll("th[data-sort]"));
         const tbody = table.tBodies[0];
@@ -2903,7 +3134,10 @@ def masternodes_html(
         const sortRows = (index, direction) => {{
           const type = headers[index].dataset.sort;
           const multiplier = direction === "asc" ? 1 : -1;
-          const rows = Array.from(tbody.rows);
+          const trailingRows = Array.from(tbody.rows).filter(
+            (row) => row.classList.contains("mn-no-results") || row.classList.contains("mn-empty"),
+          );
+          const rows = Array.from(tbody.rows).filter((row) => !trailingRows.includes(row));
           rows.sort((left, right) => {{
             const leftValue = cellValue(left, index, type);
             const rightValue = cellValue(right, index, type);
@@ -2911,9 +3145,11 @@ def masternodes_html(
             return String(leftValue).localeCompare(String(rightValue)) * multiplier;
           }});
           rows.forEach((row) => tbody.appendChild(row));
+          trailingRows.forEach((row) => tbody.appendChild(row));
           activeIndex = index;
           activeDirection = direction;
           updateHeaderState(index, direction);
+          applyPaginationForTable(table);
         }};
 
         headers.forEach((header, index) => {{
@@ -2926,6 +3162,7 @@ def masternodes_html(
           }});
         }});
       }});
+      paginators.forEach((paginator) => paginator.apply());
     }})();
   </script>
 </body>
