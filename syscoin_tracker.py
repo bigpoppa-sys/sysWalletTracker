@@ -2010,11 +2010,32 @@ def dashboard_html(
     def explorer_addr(addr: str) -> str:
         return f"https://explorer-blockbook.syscoin.org/address/{urllib.parse.quote(addr)}"
 
-    def wallet_card_rows(wallets: list[dict[str, str]]) -> list[str]:
+    exchange_sent_sats_by_label: dict[str, int] = {}
+    for row in top_rows:
+        labels = set()
+        if row["address"] in exchange_routes:
+            labels.add(exchange_routes[row["address"]])
+        if row["address"] in exchange_tags:
+            labels.add(exchange_tags[row["address"]])
+        labels.update(later_exchanges_by_address.get(row["address"], set()))
+        for label in labels:
+            exchange_sent_sats_by_label[label] = exchange_sent_sats_by_label.get(label, 0) + int(row["total_sats"] or 0)
+
+    def wallet_card_rows(wallets: list[dict[str, str]], include_sent_total: bool = False) -> list[str]:
         rows = []
         for wallet in wallets:
             note = wallet["note"]
             note_html = f"<span>{html.escape(note)}</span>" if note else ""
+            if include_sent_total:
+                sent_sats = exchange_sent_sats_by_label.get(wallet["label"], 0)
+                sent_html = (
+                    f"<span class='wallet-flow'>From Binance: "
+                    f"<b title='{fmt_sys(sent_sats)} SYS'>{fmt_compact_sys(sent_sats)}</b></span>"
+                    if sent_sats
+                    else "<span class='wallet-flow muted'>From Binance: -</span>"
+                )
+            else:
+                sent_html = ""
             wallet_balance = exchange_hot_wallet_balances.get(wallet["address"], {})
             if isinstance(wallet_balance, dict) and "balance_sats" in wallet_balance:
                 balance_sats = int(wallet_balance.get("balance_sats") or 0)
@@ -2033,12 +2054,13 @@ def dashboard_html(
                 f"{note_html}"
                 f"<a href='{explorer_addr(wallet['address'])}' title='{html.escape(wallet['address'])}'>"
                 f"{html.escape(short_address(wallet['address']))}</a>"
+                f"{sent_html}"
                 f"{balance_html}"
                 f"</article>"
             )
         return rows
 
-    hot_wallet_rows = wallet_card_rows(exchange_hot_wallets)
+    hot_wallet_rows = wallet_card_rows(exchange_hot_wallets, include_sent_total=True)
     cold_wallet_rows = wallet_card_rows(exchange_cold_wallets)
     hot_wallet_html = "\n".join(hot_wallet_rows)
     cold_wallet_html = "\n".join(cold_wallet_rows)
@@ -2136,8 +2158,8 @@ def dashboard_html(
     .wallet-card strong {{ font-size: 0.95rem; }}
     .wallet-card span {{ color: #687177; font-size: 0.82rem; }}
     .wallet-card a {{ display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 0.72rem; }}
-    .wallet-card .wallet-balance {{ color: #1c2227; font-size: 0.82rem; }}
-    .wallet-card .wallet-balance b {{ font-weight: 800; }}
+    .wallet-card .wallet-balance, .wallet-card .wallet-flow {{ color: #1c2227; font-size: 0.82rem; }}
+    .wallet-card .wallet-balance b, .wallet-card .wallet-flow b {{ font-weight: 800; }}
     .wallet-card .muted {{ color: #7b858a; }}
     .table-wrap {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; max-width: 100%; min-width: 0; overflow-x: auto; width: 100%; }}
     table {{ width: 100%; min-width: 1100px; border-collapse: separate; border-spacing: 0; background: #fff; table-layout: fixed; }}
