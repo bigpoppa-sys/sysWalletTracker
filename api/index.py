@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import os
+import ssl
 import sys
 import tarfile
 import threading
@@ -45,6 +46,7 @@ from syscoin_tracker import (  # noqa: E402
 DEFAULT_SINCE_DATE = "2026-04-14 12:30"
 DEFAULT_FROM_HEIGHT = 2221358
 DEFAULT_NETWORK_MASTERNODES_URL = "http://142.93.241.64/syswallettracker/network_masternodes.csv"
+DEFAULT_STATIC_BASE_URL = "https://syscoin.dev/syswallettracker"
 DB_PATH = Path(os.getenv("SYS_TRACKER_DB", "/tmp/syscoin_tracker.sqlite"))
 VERIFIED_SENTRIES_PATH = ROOT / "verified_sentries.csv"
 NODE_OUTPUTS_PATH = ROOT / "node_outputs.csv"
@@ -67,6 +69,7 @@ INSTALL_BUNDLE_FILES = (
     "api/index.py",
     "scripts/install_vps_cron.sh",
     "scripts/masternode_cron_sync.sh",
+    "scripts/static_snapshot_cron.sh",
 )
 
 _lock = threading.Lock()
@@ -75,6 +78,7 @@ _client: BlockbookClient | None = None
 _rpc_client: SyscoinRpcClient | None = None
 _from_height: int | None = None
 _last_sync_at = 0.0
+_static_page_cache: dict[str, tuple[float, bytes]] = {}
 
 
 def env_int(name: str, default: int) -> int:
@@ -221,6 +225,53 @@ def load_remote_network_masternodes(store: Store) -> bool:
         return False
 
 
+def fetch_static_page(path: str, *, force: bool = False) -> bytes | None:
+    base_url = os.getenv("SYS_TRACKER_STATIC_BASE_URL", DEFAULT_STATIC_BASE_URL).strip().rstrip("/")
+    if not base_url or base_url.lower() in {"0", "false", "none", "off"}:
+        return None
+    page_name = "masternodes.html" if path in ("/masternodes", "/masternodes.html") else "index.html"
+    url = f"{base_url}/{page_name}"
+    cache_ttl = env_int("SYS_TRACKER_STATIC_CACHE_SECONDS", 30)
+    cache_key = f"{base_url}/{page_name}"
+    now = time.monotonic()
+    if not force and cache_ttl > 0:
+        cached = _static_page_cache.get(cache_key)
+        if cached and now - cached[0] <= cache_ttl:
+            return cached[1]
+    if force:
+        url += f"?t={int(time.time())}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "sysWalletTracker/1.0"})
+        context = None
+        if url.startswith("https://"):
+            candidates = [
+                os.getenv("SSL_CERT_FILE"),
+                os.getenv("REQUESTS_CA_BUNDLE"),
+                "/etc/ssl/cert.pem",
+                "/opt/homebrew/etc/ca-certificates/cert.pem",
+                "/usr/local/etc/openssl@3/cert.pem",
+            ]
+            try:
+                import certifi  # type: ignore
+
+                candidates.insert(0, certifi.where())
+            except Exception:
+                pass
+            for cafile in candidates:
+                if cafile and Path(cafile).exists():
+                    context = ssl.create_default_context(cafile=cafile)
+                    break
+        with urllib.request.urlopen(req, timeout=10, context=context) as resp:
+            if getattr(resp, "status", 200) != 200:
+                return None
+            body = resp.read()
+            if cache_ttl > 0:
+                _static_page_cache[cache_key] = (now, body)
+            return body
+    except Exception:
+        return None
+
+
 def get_from_height(client: BlockbookClient, since_time: int | None) -> int | None:
     global _from_height
     configured = os.getenv("SYS_TRACKER_FROM_HEIGHT")
@@ -321,6 +372,22 @@ class handler(BaseHTTPRequestHandler):
 
         force = urllib.parse.parse_qs(parsed.query).get("force", ["0"])[0] == "1"
         try:
+            static_body = fetch_static_page(parsed.path, force=force)
+            if static_body is not None:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                cache_header = (
+                    "no-store"
+                    if force
+                    else "public, max-age=15, s-maxage=30, stale-while-revalidate=60"
+                )
+                self.send_header("Cache-Control", cache_header)
+                self.send_header("Content-Length", str(len(static_body)))
+                self.end_headers()
+                if include_body:
+                    self.wfile.write(static_body)
+                return
+
             store, since_time, since_label = sync_for_request(force=force)
             label = f"{since_label} (from {os.getenv('SYS_TRACKER_SINCE_DATE', DEFAULT_SINCE_DATE)} {os.getenv('SYS_TRACKER_TIMEZONE', DEFAULT_TIMEZONE)})"
             if parsed.path in ("/masternodes", "/masternodes.html"):

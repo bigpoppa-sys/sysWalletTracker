@@ -56,6 +56,9 @@ DEFAULT_EXCHANGE_ROUTES_PATH = Path("exchange_routes.csv")
 DEFAULT_EXCHANGE_HOT_WALLETS_PATH = Path("exchange_hot_wallets.csv")
 DEFAULT_EXCHANGE_COLD_WALLETS_PATH = Path("exchange_cold_wallets.csv")
 DEFAULT_NETWORK_MASTERNODES_PATH = Path("network_masternodes.csv")
+DEFAULT_NODE_OUTPUTS_PATH = Path("node_outputs.csv")
+DEFAULT_VERIFIED_SENTRIES_PATH = Path("verified_sentries.csv")
+DEFAULT_MONITORING_FROM_HEIGHT = 2221358
 NETWORK_MASTERNODE_HEADERS = [
     "outpoint",
     "source_txid",
@@ -634,6 +637,100 @@ def load_network_masternodes_csv(store: Store, path: Path = DEFAULT_NETWORK_MAST
 
     with path.open(newline="") as f:
         return load_network_masternodes_csv_rows(store, csv.DictReader(f), source=str(path))
+
+
+def load_verified_sentries_csv(store: Store, path: Path = DEFAULT_VERIFIED_SENTRIES_PATH) -> None:
+    if not path.exists():
+        return
+    with path.open(newline="") as f:
+        for row in csv.DictReader(f):
+            store.conn.execute(
+                """
+                INSERT INTO verified_sentries(
+                    outpoint, source_txid, source_vout, depth, address,
+                    block_height, block_time, path, verified_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(outpoint) DO UPDATE SET
+                    depth=excluded.depth,
+                    address=excluded.address,
+                    block_height=excluded.block_height,
+                    block_time=excluded.block_time,
+                    path=excluded.path,
+                    verified_at=excluded.verified_at
+                """,
+                (
+                    row["outpoint"],
+                    row["source_txid"],
+                    int(row["source_vout"]),
+                    int(row["depth"]),
+                    row["address"],
+                    int(row["block_height"]),
+                    int(row["block_time"]),
+                    row["path"],
+                    row["verified_at"],
+                ),
+            )
+            exists = store.conn.execute(
+                """
+                SELECT 1
+                FROM tracked_outputs
+                WHERE source_txid = ? AND source_vout = ? AND depth = ? AND path = ?
+                """,
+                (row["source_txid"], int(row["source_vout"]), int(row["depth"]), row["path"]),
+            ).fetchone()
+            if not exists:
+                store.save_output(
+                    {
+                        "source_txid": row["source_txid"],
+                        "source_vout": int(row["source_vout"]),
+                        "depth": int(row["depth"]),
+                        "parent_txid": None,
+                        "parent_vout": None,
+                        "address": row["address"],
+                        "value_sats": SENTRY_COLLATERAL_SATS,
+                        "attributed_sats": SENTRY_COLLATERAL_SATS,
+                        "block_height": int(row["block_height"]),
+                        "block_time": int(row["block_time"]),
+                        "spent": None,
+                        "spent_txid": None,
+                        "spent_height": None,
+                        "path": row["path"],
+                    }
+                )
+    store.conn.commit()
+
+
+def load_node_outputs_csv(store: Store, path: Path = DEFAULT_NODE_OUTPUTS_PATH) -> None:
+    if not path.exists():
+        return
+
+    def maybe_int(value: str | None) -> int | None:
+        if value is None or value == "":
+            return None
+        return int(value)
+
+    with path.open(newline="") as f:
+        for row in csv.DictReader(f):
+            store.save_output(
+                {
+                    "source_txid": row["source_txid"],
+                    "source_vout": int(row["source_vout"]),
+                    "depth": int(row["depth"]),
+                    "parent_txid": row["parent_txid"] or None,
+                    "parent_vout": maybe_int(row["parent_vout"]),
+                    "address": row["address"],
+                    "value_sats": int(row["value_sats"]),
+                    "attributed_sats": int(row["attributed_sats"]),
+                    "block_height": maybe_int(row["block_height"]),
+                    "block_time": maybe_int(row["block_time"]),
+                    "spent": maybe_int(row["spent"]),
+                    "spent_txid": row["spent_txid"] or None,
+                    "spent_height": maybe_int(row["spent_height"]),
+                    "path": row["path"],
+                }
+            )
+    store.conn.commit()
 
 
 def verify_sentry_candidates(store: Store, rpc: SyscoinRpcClient, since_time: int | None = None) -> str:
@@ -1926,6 +2023,139 @@ def mark_existing_alerts(store: Store) -> int:
     return len(rows)
 
 
+def atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.tmp")
+    temp_path.write_text(content, encoding="utf-8")
+    temp_path.replace(path)
+
+
+def atomic_write_json(path: Path, payload: Any) -> None:
+    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def sync_static_snapshot(
+    store: Store,
+    client: BlockbookClient,
+    rpc: SyscoinRpcClient | None,
+    *,
+    address: str,
+    page_size: int,
+    max_pages: int | None,
+    from_height: int | None,
+    since_time: int | None,
+    csv_path: Path,
+    next_hop_limit: int,
+    node_spend_limit: int,
+) -> dict[str, Any]:
+    watched = {address}
+    stats = sync_address(
+        store,
+        client,
+        address,
+        page_size=page_size,
+        max_pages=max_pages,
+        from_height=from_height,
+        watched=watched,
+        quiet=True,
+    )
+    load_node_outputs_csv(store)
+    load_verified_sentries_csv(store)
+    follow_stats = refresh_spent_first_hops(
+        store,
+        client,
+        watched,
+        since_time=since_time,
+        limit=next_hop_limit,
+        min_sats=sys_to_sats("100"),
+        page_size=min(page_size, 100),
+        max_pages_per_address=1,
+    )
+    node_stats = refresh_node_spends(
+        store,
+        client,
+        watched,
+        limit=node_spend_limit,
+        page_size=min(page_size, 100),
+        max_pages_per_address=1,
+    )
+    exchange_balances = refresh_exchange_hot_wallet_balances(store, client)
+
+    masternode_stats: dict[str, Any] | None = None
+    if rpc is not None:
+        if store.conn.execute("SELECT COUNT(*) AS count FROM network_masternodes").fetchone()["count"] == 0:
+            load_network_masternodes_csv(store, csv_path)
+        masternode_stats = sync_network_masternodes(store, rpc, client)
+        write_network_masternodes_csv(network_masternode_rows_from_store(store), csv_path)
+    else:
+        load_network_masternodes_csv(store, csv_path)
+
+    return {
+        "synced_at": now_iso(),
+        "wallet": stats,
+        "next_hop": follow_stats,
+        "node_spends": node_stats,
+        "exchange_wallets": len(exchange_balances),
+        "masternodes": masternode_stats,
+    }
+
+
+def publish_static_snapshot(
+    store: Store,
+    client: BlockbookClient,
+    rpc: SyscoinRpcClient | None,
+    *,
+    output_dir: Path,
+    address: str,
+    page_size: int,
+    max_pages: int | None,
+    from_height: int | None,
+    since_time: int | None,
+    since_label: str | None,
+    refresh_seconds: int,
+    csv_path: Path,
+    next_hop_limit: int,
+    node_spend_limit: int,
+) -> dict[str, Any]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = csv_path if csv_path.is_absolute() else Path.cwd() / csv_path
+    sync_stats = sync_static_snapshot(
+        store,
+        client,
+        rpc,
+        address=address,
+        page_size=page_size,
+        max_pages=max_pages,
+        from_height=from_height,
+        since_time=since_time,
+        csv_path=csv_path,
+        next_hop_limit=next_hop_limit,
+        node_spend_limit=node_spend_limit,
+    )
+    index_html = dashboard_html(store, since_time=since_time, since_label=since_label, refresh_seconds=refresh_seconds)
+    masternode_page = masternodes_html(store, since_time=since_time, since_label=since_label, refresh_seconds=refresh_seconds)
+    atomic_write_text(output_dir / "index.html", index_html)
+    atomic_write_text(output_dir / "wallet-flows.html", index_html)
+    atomic_write_text(output_dir / "masternodes.html", masternode_page)
+    if csv_path.exists():
+        network_csv = output_dir / "network_masternodes.csv"
+        temp_csv = network_csv.with_name(f".{network_csv.name}.tmp")
+        temp_csv.write_bytes(csv_path.read_bytes())
+        temp_csv.replace(network_csv)
+    atomic_write_json(
+        output_dir / "status.json",
+        {
+            **sync_stats,
+            "pages": {
+                "wallet_flows": "index.html",
+                "masternodes": "masternodes.html",
+                "network_masternodes": "network_masternodes.csv",
+            },
+        },
+    )
+    return sync_stats
+
+
 def dashboard_html(
     store: Store,
     since_time: int | None = None,
@@ -2922,6 +3152,16 @@ def build_parser() -> argparse.ArgumentParser:
     mn_p = sub.add_parser("sync-masternodes", help="Fetch the full network masternode_list snapshot from RPC")
     mn_p.add_argument("--csv", type=Path, default=DEFAULT_NETWORK_MASTERNODES_PATH, help="Write masternode snapshot CSV")
 
+    static_p = sub.add_parser("publish-static", help="Sync data and write pre-rendered dashboard pages")
+    static_p.add_argument("--output-dir", type=Path, required=True, help="Directory to publish static HTML/data files")
+    static_p.add_argument("--since-date", default="2026-04-14 12:30", help="Only show dashboard movements from this date/time")
+    static_p.add_argument("--from-height", type=int, help="Only fetch address transactions from this height")
+    static_p.add_argument("--refresh-seconds", type=int, default=60, help="HTML meta refresh interval")
+    static_p.add_argument("--sync-max-pages", type=int, help="Limit address pages during dashboard sync")
+    static_p.add_argument("--next-hop-limit", type=int, default=8, help="Number of first-hop spends to trace per publish")
+    static_p.add_argument("--node-spend-limit", type=int, default=12, help="Number of possible node spends to trace per publish")
+    static_p.add_argument("--csv", type=Path, default=DEFAULT_NETWORK_MASTERNODES_PATH, help="Masternode snapshot CSV path")
+
     watch_p = sub.add_parser("watch", help="Poll repeatedly and emit outbound alerts")
     watch_p.add_argument("--interval", type=int, default=60)
     watch_p.add_argument("--max-pages", type=int, default=2)
@@ -3032,6 +3272,41 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"Synced {stats['current']} masternodes ({stats['enabled']} enabled); "
             f"added {stats['added']}, removed {stats['removed']}, traced {stats['traced']}"
+        )
+        return 0
+
+    if args.command == "publish-static":
+        since_time, since_label = parse_since_date(args.since_date, args.timezone)
+        display_label = f"{since_label} (from {args.since_date} {args.timezone})" if since_label else None
+        from_height = args.from_height
+        if from_height is None and args.since_date == "2026-04-14 12:30":
+            from_height = DEFAULT_MONITORING_FROM_HEIGHT
+        elif from_height is None and since_time:
+            from_height = block_height_at_or_after(client, since_time)
+        rpc = build_rpc_client(args)
+        stats = publish_static_snapshot(
+            store,
+            client,
+            rpc,
+            output_dir=args.output_dir,
+            address=args.address,
+            page_size=args.page_size,
+            max_pages=args.sync_max_pages,
+            from_height=from_height,
+            since_time=since_time,
+            since_label=display_label,
+            refresh_seconds=args.refresh_seconds,
+            csv_path=args.csv,
+            next_hop_limit=args.next_hop_limit,
+            node_spend_limit=args.node_spend_limit,
+        )
+        masternode_stats = stats.get("masternodes") or {}
+        print(
+            f"Published static snapshot to {args.output_dir}; "
+            f"wallet_seen={stats['wallet']['seen']} wallet_new={stats['wallet']['inserted']} "
+            f"next_hop_found={stats['next_hop']['found_spends']} "
+            f"node_spends={stats['node_spends']['found_spends']} "
+            f"masternodes={masternode_stats.get('current', '-')}"
         )
         return 0
 

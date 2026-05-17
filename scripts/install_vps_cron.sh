@@ -49,15 +49,15 @@ mkdir -p "$APP_DIR/logs"
 } >"$APP_DIR/.env"
 chmod 600 "$APP_DIR/.env"
 
-chmod +x "$APP_DIR/scripts/masternode_cron_sync.sh"
+chmod +x "$APP_DIR/scripts/masternode_cron_sync.sh" "$APP_DIR/scripts/static_snapshot_cron.sh"
 
-"$APP_DIR/scripts/masternode_cron_sync.sh"
+"$APP_DIR/scripts/static_snapshot_cron.sh"
 
 tmp_cron="$(mktemp)"
 crontab -l 2>/dev/null | sed '/# sysWalletTracker masternode watcher start/,/# sysWalletTracker masternode watcher end/d' >"$tmp_cron" || true
 cat >>"$tmp_cron" <<CRON
 # sysWalletTracker masternode watcher start
-* * * * * "$APP_DIR/scripts/masternode_cron_sync.sh"
+* * * * * "$APP_DIR/scripts/static_snapshot_cron.sh"
 # sysWalletTracker masternode watcher end
 CRON
 crontab "$tmp_cron"
@@ -65,6 +65,6 @@ rm -f "$tmp_cron"
 
 echo "Installed sysWalletTracker masternode cron."
 echo "App dir: $APP_DIR"
-echo "Log: $APP_DIR/logs/masternode_cron.log"
+echo "Log: $APP_DIR/logs/static_snapshot_cron.log"
 echo "Current cron entry:"
 crontab -l | sed -n '/# sysWalletTracker masternode watcher start/,/# sysWalletTracker masternode watcher end/p'
