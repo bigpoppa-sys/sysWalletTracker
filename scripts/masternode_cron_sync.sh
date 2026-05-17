@@ -6,6 +6,7 @@ ENV_FILE="$APP_DIR/.env"
 LOG_DIR="$APP_DIR/logs"
 LOG_FILE="$LOG_DIR/masternode_cron.log"
 LOCK_FILE="$APP_DIR/.masternode-cron.lock"
+PUBLIC_DIR="${SYS_TRACKER_PUBLIC_DIR:-/var/www/html/syswallettracker}"
 
 mkdir -p "$LOG_DIR"
 
@@ -41,4 +42,10 @@ fi
     --blockbook-url "$SYS_BLOCKBOOK_URL" \
     sync-masternodes \
     --csv network_masternodes.csv
+
+  mkdir -p "$PUBLIC_DIR"
+  cp network_masternodes.csv "$PUBLIC_DIR/network_masternodes.csv.tmp"
+  chmod 644 "$PUBLIC_DIR/network_masternodes.csv.tmp"
+  mv "$PUBLIC_DIR/network_masternodes.csv.tmp" "$PUBLIC_DIR/network_masternodes.csv"
+  printf 'Published %s/network_masternodes.csv\n' "$PUBLIC_DIR"
 } >>"$LOG_FILE" 2>&1

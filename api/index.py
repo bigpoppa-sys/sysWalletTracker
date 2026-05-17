@@ -8,6 +8,7 @@ import tarfile
 import threading
 import time
 import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ from syscoin_tracker import (  # noqa: E402
     block_height_at_or_after,
     dashboard_html,
     load_network_masternodes_csv,
+    load_network_masternodes_csv_rows,
     masternodes_html,
     parse_since_date,
     refresh_exchange_hot_wallet_balances,
@@ -42,6 +44,7 @@ from syscoin_tracker import (  # noqa: E402
 
 DEFAULT_SINCE_DATE = "2026-04-14 12:30"
 DEFAULT_FROM_HEIGHT = 2221358
+DEFAULT_NETWORK_MASTERNODES_URL = "http://142.93.241.64/syswallettracker/network_masternodes.csv"
 DB_PATH = Path(os.getenv("SYS_TRACKER_DB", "/tmp/syscoin_tracker.sqlite"))
 VERIFIED_SENTRIES_PATH = ROOT / "verified_sentries.csv"
 NODE_OUTPUTS_PATH = ROOT / "node_outputs.csv"
@@ -204,6 +207,20 @@ def load_node_outputs(store: Store) -> None:
     store.conn.commit()
 
 
+def load_remote_network_masternodes(store: Store) -> bool:
+    url = os.getenv("SYS_NETWORK_MASTERNODES_URL", DEFAULT_NETWORK_MASTERNODES_URL).strip()
+    if not url or url.lower() in {"0", "false", "none", "off"}:
+        return False
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "sysWalletTracker/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            text = resp.read().decode("utf-8")
+        load_network_masternodes_csv_rows(store, csv.DictReader(io.StringIO(text)), source=url)
+        return True
+    except Exception:
+        return False
+
+
 def get_from_height(client: BlockbookClient, since_time: int | None) -> int | None:
     global _from_height
     configured = os.getenv("SYS_TRACKER_FROM_HEIGHT")
@@ -242,7 +259,8 @@ def sync_for_request(force: bool = False) -> tuple[Store, int | None, str | None
         )
         load_node_outputs(store)
         load_verified_sentries(store)
-        load_network_masternodes_csv(store)
+        if not load_remote_network_masternodes(store):
+            load_network_masternodes_csv(store)
         refresh_exchange_hot_wallet_balances(store, client)
         rpc = get_rpc_client()
         if rpc is not None:

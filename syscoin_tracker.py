@@ -568,44 +568,72 @@ def network_masternode_rows_from_store(store: Store) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-def load_network_masternodes_csv(store: Store, path: Path = DEFAULT_NETWORK_MASTERNODES_PATH) -> None:
-    if not path.exists():
-        return
-
+def load_network_masternodes_csv_rows(
+    store: Store,
+    rows: Iterable[dict[str, str]],
+    *,
+    source: str = "csv",
+) -> dict[str, Any]:
     def maybe_int(value: str | None) -> int | None:
         if value is None or value == "":
             return None
         return int(value)
 
-    with path.open(newline="") as f:
-        for row in csv.DictReader(f):
-            store.save_network_masternode(
-                {
-                    "outpoint": row["outpoint"],
-                    "source_txid": row["source_txid"],
-                    "source_vout": int(row["source_vout"]),
-                    "pro_tx_hash": row.get("pro_tx_hash") or "",
-                    "service": row.get("service") or "",
-                    "payee": row.get("payee") or "",
-                    "status": row.get("status") or "",
-                    "collateral_address": row.get("collateral_address") or "",
-                    "owner_address": row.get("owner_address") or "",
-                    "voting_address": row.get("voting_address") or "",
-                    "collateral_height": maybe_int(row.get("collateral_height")),
-                    "collateral_time": maybe_int(row.get("collateral_time")),
-                    "registered_height": maybe_int(row.get("registered_height")),
-                    "registered_time": maybe_int(row.get("registered_time")),
-                    "last_paid_time": maybe_int(row.get("last_paid_time")),
-                    "last_paid_block": maybe_int(row.get("last_paid_block")),
-                    "first_seen_at": row.get("first_seen_at") or now_iso(),
-                    "last_seen_at": row.get("last_seen_at") or now_iso(),
-                    "removed_at": row.get("removed_at") or "",
-                    "taken_down_txid": row.get("taken_down_txid") or "",
-                    "taken_down_time": maybe_int(row.get("taken_down_time")),
-                    "moved_to_address": row.get("moved_to_address") or "",
-                }
-            )
+    count = 0
+    enabled = 0
+    latest_seen_at = ""
+    for row in rows:
+        status = row.get("status") or ""
+        last_seen_at = row.get("last_seen_at") or now_iso()
+        latest_seen_at = max(latest_seen_at, last_seen_at)
+        if status.upper() == "ENABLED":
+            enabled += 1
+        count += 1
+        store.save_network_masternode(
+            {
+                "outpoint": row["outpoint"],
+                "source_txid": row["source_txid"],
+                "source_vout": int(row["source_vout"]),
+                "pro_tx_hash": row.get("pro_tx_hash") or "",
+                "service": row.get("service") or "",
+                "payee": row.get("payee") or "",
+                "status": status,
+                "collateral_address": row.get("collateral_address") or "",
+                "owner_address": row.get("owner_address") or "",
+                "voting_address": row.get("voting_address") or "",
+                "collateral_height": maybe_int(row.get("collateral_height")),
+                "collateral_time": maybe_int(row.get("collateral_time")),
+                "registered_height": maybe_int(row.get("registered_height")),
+                "registered_time": maybe_int(row.get("registered_time")),
+                "last_paid_time": maybe_int(row.get("last_paid_time")),
+                "last_paid_block": maybe_int(row.get("last_paid_block")),
+                "first_seen_at": row.get("first_seen_at") or now_iso(),
+                "last_seen_at": last_seen_at,
+                "removed_at": row.get("removed_at") or "",
+                "taken_down_txid": row.get("taken_down_txid") or "",
+                "taken_down_time": maybe_int(row.get("taken_down_time")),
+                "moved_to_address": row.get("moved_to_address") or "",
+            }
+        )
     store.conn.commit()
+    if count:
+        stats = {
+            "synced_at": latest_seen_at or now_iso(),
+            "current": count,
+            "enabled": enabled,
+            "source": source,
+        }
+        store.set_meta("last_masternode_sync", stats)
+        return stats
+    return {"synced_at": None, "current": 0, "enabled": 0, "source": source}
+
+
+def load_network_masternodes_csv(store: Store, path: Path = DEFAULT_NETWORK_MASTERNODES_PATH) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+
+    with path.open(newline="") as f:
+        return load_network_masternodes_csv_rows(store, csv.DictReader(f), source=str(path))
 
 
 def verify_sentry_candidates(store: Store, rpc: SyscoinRpcClient, since_time: int | None = None) -> str:
@@ -2463,9 +2491,10 @@ def masternodes_html(
             }
         )
 
-    enabled_count = sum(1 for item in prepared_rows if item["status"].upper() == "ENABLED")
-    other_status_count = len(prepared_rows) - enabled_count
-    exchange_exit_count = sum(1 for item in prepared_rows if item["exchange"] != "-")
+    current_items = [item for item in prepared_rows if not item["row"]["removed_at"]]
+    enabled_count = sum(1 for item in current_items if item["status"].upper() == "ENABLED")
+    other_status_count = len(current_items) - enabled_count
+    exchange_exit_count = sum(1 for item in current_items if item["exchange"] != "-")
 
     def masternode_row_html(item: dict[str, Any], include_change: bool = False) -> str:
         row = item["row"]
@@ -2493,7 +2522,7 @@ def masternodes_html(
             f"</tr>"
         )
 
-    rows_html = "\n".join(masternode_row_html(item) for item in prepared_rows)
+    rows_html = "\n".join(masternode_row_html(item) for item in current_items)
     change_items = sorted((item for item in prepared_rows if item["change_type"]), key=lambda item: item["change_sort"], reverse=True)
     change_rows_html = "\n".join(masternode_row_html(item, include_change=True) for item in change_items)
     if not change_rows_html:
@@ -2502,7 +2531,7 @@ def masternodes_html(
     masternode_meta = store.get_meta("last_masternode_sync", {})
     updated_text = fmt_iso_local_datetime(masternode_meta.get("synced_at") or store.get_meta("last_summary", {}).get("synced_at"))
     baseline_text = fmt_iso_local_datetime(baseline_iso) if baseline_iso else "not set"
-    total_count = len(prepared_rows)
+    total_count = len(current_items)
 
     return f"""<!doctype html>
 <html lang="en">
