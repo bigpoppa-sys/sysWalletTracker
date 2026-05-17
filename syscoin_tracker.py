@@ -2484,7 +2484,7 @@ def dashboard_html(
       <div class="topbar">
         <div>
           <h1>Syscoin Hot Wallet Tracker</h1>
-          <div class="subtitle">Binance hot wallet movements since {html.escape(since_text)}</div>
+          <div class="subtitle">Experimental view. Useful for spotting patterns, not proof of ownership or intent.</div>
         </div>
         <nav class="nav" aria-label="Dashboard pages">
           <a class="active" href="/">Wallet Flows</a>
@@ -2636,11 +2636,6 @@ def masternodes_html(
     since_label: str | None = None,
     refresh_seconds: int = 60,
 ) -> str:
-    exchange_tags = load_exchange_tags()
-    exchange_routes = load_exchange_routes()
-    for wallet in load_exchange_hot_wallets() + load_exchange_cold_wallets():
-        exchange_tags.setdefault(wallet["address"], wallet["label"])
-
     if store.conn.execute("SELECT COUNT(*) AS count FROM network_masternodes").fetchone()["count"] == 0:
         load_network_masternodes_csv(store)
 
@@ -2664,26 +2659,6 @@ def masternodes_html(
             parsed = parsed.replace(tzinfo=dt.timezone.utc)
         return int(parsed.timestamp())
 
-    def moved_to_address_for(row: sqlite3.Row) -> str:
-        if row["moved_to_address"]:
-            return str(row["moved_to_address"])
-        children = store.conn.execute(
-            """
-            SELECT address, value_sats
-            FROM tracked_outputs
-            WHERE parent_txid = ?
-              AND parent_vout = ?
-              AND address != ?
-            ORDER BY value_sats DESC
-            LIMIT 1
-            """,
-            (row["source_txid"], row["source_vout"], row["collateral_address"]),
-        ).fetchall()
-        for child in children:
-            if int(child["value_sats"]) >= int(SENTRY_COLLATERAL_SATS * Decimal("0.95")):
-                return child["address"]
-        return ""
-
     baseline_seen = [
         (iso_timestamp(row["first_seen_at"]), row["first_seen_at"])
         for row in network_rows
@@ -2692,10 +2667,6 @@ def masternodes_html(
     baseline_ts, baseline_iso = min(baseline_seen, default=(0, ""))
 
     for row in network_rows:
-        collateral_address = row["collateral_address"]
-        moved_to_address = moved_to_address_for(row)
-        exchange_labels = exchange_labels_for_address(moved_to_address, exchange_tags, exchange_routes) if moved_to_address else set()
-        exchange_text = ", ".join(sorted(exchange_labels)) if exchange_labels else "-"
         setup_time = row["registered_time"] or row["collateral_time"]
         taken_down_sort = row["taken_down_time"] or iso_timestamp(row["removed_at"])
         taken_down_text = fmt_table_datetime(row["taken_down_time"]) if row["taken_down_time"] else fmt_iso_local_datetime(row["removed_at"])
@@ -2712,9 +2683,6 @@ def masternodes_html(
                 "change_sort": change_sort,
                 "status": status,
                 "status_sort": status.lower(),
-                "moved_to_address": moved_to_address,
-                "exchange": exchange_text,
-                "exchange_sort": exchange_text.lower() if exchange_text != "-" else "",
                 "setup_time": setup_time,
                 "taken_down_text": taken_down_text,
                 "taken_down_sort": taken_down_sort,
@@ -2724,17 +2692,20 @@ def masternodes_html(
     current_items = [item for item in prepared_rows if not item["row"]["removed_at"]]
     enabled_count = sum(1 for item in current_items if item["status"].upper() == "ENABLED")
     other_status_count = len(current_items) - enabled_count
-    exchange_exit_count = sum(1 for item in current_items if item["exchange"] != "-")
 
     def masternode_row_html(item: dict[str, Any], include_change: bool = False) -> str:
         row = item["row"]
         collateral_address = row["collateral_address"]
-        moved_to_address = item["moved_to_address"]
-        moved_to_html = (
-            f"<a href='{explorer_address_url(moved_to_address)}' title='{html.escape(moved_to_address)}'>{html.escape(short_address(moved_to_address))}</a>"
-            if moved_to_address
+        source_txid = row["source_txid"]
+        source_vout = int(row["source_vout"])
+        tx_outpoint = f"{source_txid}:{source_vout}"
+        tx_label = f"{short_txid(source_txid)}:{source_vout}" if source_txid else "-"
+        tx_html = (
+            f"<a href='{explorer_tx_url(source_txid)}' title='{html.escape(tx_outpoint)}'>{html.escape(tx_label)}</a>"
+            if source_txid
             else "-"
         )
+        service = row["service"] or "-"
         change_cell = (
             f"<td data-sort='{item['change_sort']}'><span class='status {'down' if item['change_type'] == 'Taken down' else 'active'}'>{html.escape(item['change_type'])}</span></td>"
             if include_change
@@ -2744,10 +2715,9 @@ def masternodes_html(
             f"<tr>"
             f"{change_cell}"
             f"<td data-sort='{item['setup_time'] or 0}' title='{html.escape(fmt_local_datetime(item['setup_time']))}'>{html.escape(fmt_table_datetime(item['setup_time']))}</td>"
-            f"<td data-sort='{item['taken_down_sort']}'>{html.escape(item['taken_down_text']) if item['taken_down_text'] else '-'}</td>"
             f"<td class='address' data-sort='{html.escape(collateral_address.lower())}'><a href='{explorer_address_url(collateral_address)}' title='{html.escape(collateral_address)}'>{html.escape(short_address(collateral_address))}</a></td>"
-            f"<td class='address' data-sort='{html.escape(moved_to_address.lower())}'>{moved_to_html}</td>"
-            f"<td data-sort='{html.escape(item['exchange_sort'])}'>{html.escape(item['exchange'])}</td>"
+            f"<td class='address' data-sort='{html.escape(tx_outpoint.lower())}'>{tx_html}</td>"
+            f"<td data-sort='{html.escape(str(service).lower())}'>{html.escape(str(service))}</td>"
             f"<td data-sort='{html.escape(item['status_sort'])}'><span class='status {'active' if item['status'].upper() == 'ENABLED' else 'down'}'>{html.escape(item['status'])}</span></td>"
             f"</tr>"
         )
@@ -2758,7 +2728,7 @@ def masternodes_html(
     taken_down_count = sum(1 for item in change_items if item["change_type"] == "Taken down")
     change_rows_html = "\n".join(masternode_row_html(item, include_change=True) for item in change_items)
     if not change_rows_html:
-        change_rows_html = "<tr><td class='empty' colspan='7'>No new setups or takedowns since the banked snapshot.</td></tr>"
+        change_rows_html = "<tr><td class='empty' colspan='6'>No new setups or takedowns since the banked snapshot.</td></tr>"
     since_text = f"{fmt_local_datetime(since_time)} Sydney" if since_time else "all tracked history"
     masternode_meta = store.get_meta("last_masternode_sync", {})
     updated_text = fmt_iso_local_datetime(masternode_meta.get("synced_at") or store.get_meta("last_summary", {}).get("synced_at"))
@@ -2787,7 +2757,7 @@ def masternodes_html(
     .nav a.active {{ background: #f8fafc; color: #142026; }}
     main {{ display: grid; gap: 22px; margin-top: 22px; margin-bottom: 22px; padding: 0; }}
     main > * {{ min-width: 0; }}
-    .metrics {{ display: grid; grid-template-columns: repeat(6, minmax(120px, 1fr)); gap: 12px; }}
+    .metrics {{ display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 12px; }}
     .metric {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; padding: 14px 16px; min-width: 0; }}
     .metric span {{ display: block; color: #687177; font-size: 0.84rem; margin-bottom: 6px; }}
     .metric b {{ display: block; font-size: clamp(1.25rem, 2vw, 1.65rem); line-height: 1.1; overflow-wrap: anywhere; }}
@@ -2805,18 +2775,16 @@ def masternodes_html(
     th[aria-sort="descending"] .sort-icon::before {{ content: "v"; }}
     th[aria-sort="none"] .sort-icon::before {{ content: ""; }}
     .mn-current th:nth-child(1), .mn-current td:nth-child(1) {{ width: 125px; }}
-    .mn-current th:nth-child(2), .mn-current td:nth-child(2) {{ width: 135px; }}
-    .mn-current th:nth-child(3), .mn-current td:nth-child(3) {{ width: 220px; }}
-    .mn-current th:nth-child(4), .mn-current td:nth-child(4) {{ width: 220px; }}
-    .mn-current th:nth-child(5), .mn-current td:nth-child(5) {{ width: 125px; }}
-    .mn-current th:nth-child(6), .mn-current td:nth-child(6) {{ width: 120px; }}
+    .mn-current th:nth-child(2), .mn-current td:nth-child(2) {{ width: 230px; }}
+    .mn-current th:nth-child(3), .mn-current td:nth-child(3) {{ width: 230px; }}
+    .mn-current th:nth-child(4), .mn-current td:nth-child(4) {{ width: 155px; }}
+    .mn-current th:nth-child(5), .mn-current td:nth-child(5) {{ width: 120px; }}
     .mn-changes th:nth-child(1), .mn-changes td:nth-child(1) {{ width: 125px; }}
     .mn-changes th:nth-child(2), .mn-changes td:nth-child(2) {{ width: 125px; }}
-    .mn-changes th:nth-child(3), .mn-changes td:nth-child(3) {{ width: 135px; }}
-    .mn-changes th:nth-child(4), .mn-changes td:nth-child(4) {{ width: 205px; }}
-    .mn-changes th:nth-child(5), .mn-changes td:nth-child(5) {{ width: 205px; }}
-    .mn-changes th:nth-child(6), .mn-changes td:nth-child(6) {{ width: 120px; }}
-    .mn-changes th:nth-child(7), .mn-changes td:nth-child(7) {{ width: 115px; }}
+    .mn-changes th:nth-child(3), .mn-changes td:nth-child(3) {{ width: 220px; }}
+    .mn-changes th:nth-child(4), .mn-changes td:nth-child(4) {{ width: 230px; }}
+    .mn-changes th:nth-child(5), .mn-changes td:nth-child(5) {{ width: 155px; }}
+    .mn-changes th:nth-child(6), .mn-changes td:nth-child(6) {{ width: 115px; }}
     .address {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; white-space: nowrap; }}
     .empty {{ color: #687177; padding: 18px 14px; text-align: center; }}
     .status {{ border-radius: 999px; display: inline-flex; font-size: 0.78rem; font-weight: 700; padding: 4px 8px; white-space: nowrap; }}
@@ -2850,7 +2818,7 @@ def masternodes_html(
       <div class="topbar">
         <div>
           <h1>Syscoin Masternode Tracker</h1>
-          <div class="subtitle">Current network masternodes from RPC, with exchange notes overlaid where known</div>
+          <div class="subtitle">Experimental view. Useful for spotting patterns, not proof of ownership or intent.</div>
         </div>
         <nav class="nav" aria-label="Dashboard pages">
           <a href="/">Wallet Flows</a>
@@ -2866,7 +2834,6 @@ def masternodes_html(
       <div class="metric"><span>Other Status</span><b>{other_status_count}</b></div>
       <div class="metric"><span>New Setups</span><b>{new_setup_count}</b></div>
       <div class="metric"><span>Taken Down</span><b>{taken_down_count}</b></div>
-      <div class="metric"><span>Exchange</span><b>{exchange_exit_count}</b></div>
     </section>
     <section>
       <div class="panel-title">
@@ -2879,10 +2846,9 @@ def masternodes_html(
             <tr>
               <th data-sort="number" data-default-dir="desc" aria-sort="descending"><button class="sort-button" type="button">Change<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Date Setup<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Date Taken Down<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Collateral Address<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Address 100k Moved To<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Exchange<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Collateral Tx<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">IP Address<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Status<span class="sort-icon" aria-hidden="true"></span></button></th>
             </tr>
           </thead>
@@ -2900,10 +2866,9 @@ def masternodes_html(
           <thead>
             <tr>
               <th data-sort="number" data-default-dir="desc" aria-sort="descending"><button class="sort-button" type="button">Date Setup<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Date Taken Down<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Collateral Address<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Address 100k Moved To<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Exchange<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Collateral Tx<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">IP Address<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Status<span class="sort-icon" aria-hidden="true"></span></button></th>
             </tr>
           </thead>
