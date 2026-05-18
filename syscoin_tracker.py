@@ -184,6 +184,15 @@ def short_txid(txid: str) -> str:
     return f"{txid[:10]}...{txid[-8:]}"
 
 
+def sentry_status_label(status: str) -> str:
+    normalized = status.upper()
+    if normalized == "POSE_BANNED":
+        return "Banned"
+    if normalized == "ENABLED":
+        return "Enabled"
+    return status or "Unknown"
+
+
 def explorer_address_url(address: str) -> str:
     return f"https://explorer-blockbook.syscoin.org/address/{urllib.parse.quote(address)}"
 
@@ -3396,6 +3405,7 @@ def masternodes_html(
                 "change_type": change_type,
                 "change_sort": change_sort,
                 "status": status,
+                "status_label": sentry_status_label(status),
                 "status_sort": status.lower(),
                 "setup_time": setup_time,
                 "taken_down_text": taken_down_text,
@@ -3408,7 +3418,7 @@ def masternodes_html(
 
     current_items = [item for item in prepared_rows if not item["row"]["removed_at"]]
     enabled_count = sum(1 for item in current_items if item["status"].upper() == "ENABLED")
-    other_status_count = len(current_items) - enabled_count
+    banned_count = sum(1 for item in current_items if item["status"].upper() == "POSE_BANNED")
 
     def masternode_row_html(item: dict[str, Any], include_change: bool = False) -> str:
         row = item["row"]
@@ -3448,7 +3458,7 @@ def masternodes_html(
         )
         status_cell = (
             f"<td data-sort='{html.escape(item['status_sort'])}'>"
-            f"<span class='status {'active' if item['status'].upper() == 'ENABLED' else 'down'}'>{html.escape(item['status'])}</span>"
+            f"<span class='status {'active' if item['status'].upper() == 'ENABLED' else 'down'}'>{html.escape(item['status_label'])}</span>"
             f"</td>"
         )
         if include_change:
@@ -3604,7 +3614,7 @@ def masternodes_html(
     <section class="metrics">
       <div class="metric"><span>Sentry Nodes</span><b>{total_count}</b></div>
       <div class="metric"><span>Enabled</span><b>{enabled_count}</b></div>
-      <div class="metric"><span>Other Status</span><b>{other_status_count}</b></div>
+      <div class="metric"><span>Banned</span><b>{banned_count}</b></div>
       <div class="metric"><span>New Setups</span><b>{new_setup_count}</b></div>
       <div class="metric"><span>Taken Down</span><b>{taken_down_count}</b></div>
     </section>
