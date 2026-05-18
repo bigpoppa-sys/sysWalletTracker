@@ -24,7 +24,9 @@ from syscoin_tracker import (  # noqa: E402
     DEFAULT_ADDRESS,
     DEFAULT_BLOCKBOOK_URL,
     DEFAULT_TIMEZONE,
+    LEGACY_MASTERNODE_PATHS,
     SENTRY_COLLATERAL_SATS,
+    SENTRY_NODE_PATHS,
     BlockbookClient,
     Store,
     SyscoinRpcClient,
@@ -229,7 +231,7 @@ def fetch_static_page(path: str, *, force: bool = False) -> bytes | None:
     base_url = os.getenv("SYS_TRACKER_STATIC_BASE_URL", DEFAULT_STATIC_BASE_URL).strip().rstrip("/")
     if not base_url or base_url.lower() in {"0", "false", "none", "off"}:
         return None
-    page_name = "masternodes.html" if path in ("/masternodes", "/masternodes.html") else "index.html"
+    page_name = "sentrynode.html" if path in (*SENTRY_NODE_PATHS, *LEGACY_MASTERNODE_PATHS) else "index.html"
     url = f"{base_url}/{page_name}"
     cache_ttl = env_int("SYS_TRACKER_STATIC_CACHE_SECONDS", 30)
     cache_key = f"{base_url}/{page_name}"
@@ -342,6 +344,15 @@ def sync_for_request(force: bool = False) -> tuple[Store, int | None, str | None
 
 
 class handler(BaseHTTPRequestHandler):
+    def redirect_to_sentry_node(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        query = f"?{parsed.query}" if parsed.query else ""
+        self.send_response(308)
+        self.send_header("Location", f"/sentrynode{query}")
+        self.send_header("Cache-Control", "public, max-age=300")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def send_install_bundle(self, include_body: bool = True) -> None:
         buffer = io.BytesIO()
         with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
@@ -366,7 +377,11 @@ class handler(BaseHTTPRequestHandler):
             self.send_install_bundle(include_body=include_body)
             return
 
-        if parsed.path not in ("/", "/index.html", "/api/index.py", "/masternodes", "/masternodes.html"):
+        if parsed.path in LEGACY_MASTERNODE_PATHS:
+            self.redirect_to_sentry_node()
+            return
+
+        if parsed.path not in ("/", "/index.html", "/api/index.py", *SENTRY_NODE_PATHS):
             self.send_error(404)
             return
 
@@ -390,7 +405,7 @@ class handler(BaseHTTPRequestHandler):
 
             store, since_time, since_label = sync_for_request(force=force)
             label = f"{since_label} (from {os.getenv('SYS_TRACKER_SINCE_DATE', DEFAULT_SINCE_DATE)} {os.getenv('SYS_TRACKER_TIMEZONE', DEFAULT_TIMEZONE)})"
-            if parsed.path in ("/masternodes", "/masternodes.html"):
+            if parsed.path in SENTRY_NODE_PATHS:
                 html_body = masternodes_html(
                     store,
                     since_time=since_time,

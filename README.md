@@ -27,7 +27,7 @@ Then open:
 The dashboard has two pages:
 
 - `/` tracks Binance hot-wallet recipient flows.
-- `/masternodes` tracks the current network masternode list from RPC, setup/takedown dates, moved collateral destination, and exchange label when the moved-to address is known.
+- `/sentrynode` tracks the current network sentry node list from RPC, setup/takedown dates, moved collateral destination, and exchange label when the moved-to address is known.
 
 ## Vercel
 
@@ -142,7 +142,7 @@ python3 syscoin_tracker.py sync-masternodes --csv network_masternodes.csv
 python3 syscoin_tracker.py verify-sentries --since-date "2026-04-14 12:30"
 ```
 
-For always-on masternode monitoring, run the watcher from the VPS that has
+For always-on sentry node monitoring, run the watcher from the VPS that has
 local RPC access. The installer clones or updates the repo at
 `$HOME/sysWalletTracker`, writes a private `.env`, runs one sync, then installs a
 once-per-minute cron job:
@@ -180,11 +180,11 @@ SYS_RPC_URL="http://127.0.0.1:8370/" \
 ./scripts/install_vps_cron.sh
 ```
 
-Cron logs go to `$HOME/sysWalletTracker/logs/masternode_cron.log`. The cron job
+Cron logs go to `$HOME/sysWalletTracker/logs/static_snapshot_cron.log`. The cron job
 uses a lock so a slow RPC check cannot overlap the next minute's run.
 
 `verify-sentries` compares exact 100,000 SYS candidates against
-`masternode_list` outpoints. If RPC is only bound locally on a remote node, use an
+Syscoin Core `masternode_list` outpoints. If RPC is only bound locally on a remote node, use an
 SSH tunnel or adjust `rpcbind` / `rpcallowip` carefully.
 
 Ignore small outputs:

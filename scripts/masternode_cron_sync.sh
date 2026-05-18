@@ -34,7 +34,7 @@ fi
 : "${SYS_BLOCKBOOK_URL:=https://explorer-blockbook.syscoin.org}"
 
 {
-  printf '\n[%s] masternode cron sync\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  printf '\n[%s] sentry node cron sync\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   python3 syscoin_tracker.py \
     --rpc-url "$SYS_RPC_URL" \
     --rpc-user "$SYS_RPC_USER" \

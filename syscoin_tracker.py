@@ -59,6 +59,8 @@ DEFAULT_NETWORK_MASTERNODES_PATH = Path("network_masternodes.csv")
 DEFAULT_NODE_OUTPUTS_PATH = Path("node_outputs.csv")
 DEFAULT_VERIFIED_SENTRIES_PATH = Path("verified_sentries.csv")
 DEFAULT_MONITORING_FROM_HEIGHT = 2221358
+SENTRY_NODE_PATHS = ("/sentrynode", "/sentrynode.html")
+LEGACY_MASTERNODE_PATHS = ("/masternodes", "/masternodes.html")
 NETWORK_MASTERNODE_HEADERS = [
     "outpoint",
     "source_txid",
@@ -768,7 +770,7 @@ def verify_sentry_candidates(store: Store, rpc: SyscoinRpcClient, since_time: in
             matches.append([outpoint, row["depth"], row["address"], fmt_height(row["block_height"]), utc(row["block_time"])])
     lines = [
         f"100k SYS candidates checked: {len(rows)}",
-        f"Masternode outpoints from RPC: {len(outpoints)}",
+        f"Sentry node outpoints from RPC: {len(outpoints)}",
         f"Verified matches: {len(matches)}",
     ]
     if matches:
@@ -2159,6 +2161,7 @@ def publish_static_snapshot(
     masternode_page = masternodes_html(store, since_time=since_time, since_label=since_label, refresh_seconds=refresh_seconds)
     atomic_write_text(output_dir / "index.html", index_html)
     atomic_write_text(output_dir / "wallet-flows.html", index_html)
+    atomic_write_text(output_dir / "sentrynode.html", masternode_page)
     atomic_write_text(output_dir / "masternodes.html", masternode_page)
     if csv_path.exists():
         network_csv = output_dir / "network_masternodes.csv"
@@ -2171,7 +2174,8 @@ def publish_static_snapshot(
             **sync_stats,
             "pages": {
                 "wallet_flows": "index.html",
-                "masternodes": "masternodes.html",
+                "sentry_node": "sentrynode.html",
+                "legacy_masternodes": "masternodes.html",
                 "network_masternodes": "network_masternodes.csv",
             },
         },
@@ -2511,7 +2515,7 @@ def dashboard_html(
         </div>
         <nav class="nav" aria-label="Dashboard pages">
           <a class="active" href="/">Wallet Flows</a>
-          <a href="/masternodes">Sentry Nodes</a>
+          <a href="/sentrynode">Sentry Nodes</a>
         </nav>
       </div>
     </div>
@@ -2944,7 +2948,7 @@ def masternodes_html(
         </div>
         <nav class="nav" aria-label="Dashboard pages">
           <a href="/">Wallet Flows</a>
-          <a class="active" href="/masternodes">Sentry Nodes</a>
+          <a class="active" href="/sentrynode">Sentry Nodes</a>
         </nav>
       </div>
     </div>
@@ -3253,13 +3257,13 @@ def masternode_sync_loop(
             with DB_WRITE_LOCK:
                 stats = sync_network_masternodes(sync_store, rpc, sync_client)
             print(
-                f"{now_iso()} masternode sync current={stats['current']} enabled={stats['enabled']} "
+                f"{now_iso()} sentry node sync current={stats['current']} enabled={stats['enabled']} "
                 f"added={stats['added']} removed={stats['removed']} traced={stats['traced']}",
                 file=sys.stderr,
             )
         except Exception as exc:
             sync_store.conn.rollback()
-            print(f"{now_iso()} masternode sync failed: {exc}", file=sys.stderr)
+            print(f"{now_iso()} sentry node sync failed: {exc}", file=sys.stderr)
         elapsed = time.monotonic() - started
         time.sleep(max(1, interval - int(elapsed)))
 
@@ -3273,8 +3277,19 @@ def serve(
     refresh_seconds: int = 60,
 ) -> None:
     class Handler(http.server.BaseHTTPRequestHandler):
+        def redirect_to_sentry_node(self) -> None:
+            parsed = urllib.parse.urlparse(self.path)
+            query = f"?{parsed.query}" if parsed.query else ""
+            self.send_response(308)
+            self.send_header("Location", f"/sentrynode{query}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def send_page(self, include_body: bool = True) -> None:
             parsed = urllib.parse.urlparse(self.path)
+            if parsed.path in LEGACY_MASTERNODE_PATHS:
+                self.redirect_to_sentry_node()
+                return
             with DB_WRITE_LOCK:
                 if parsed.path in ("/", "/index.html"):
                     html_body = dashboard_html(
@@ -3283,7 +3298,7 @@ def serve(
                         since_label=since_label,
                         refresh_seconds=refresh_seconds,
                     )
-                elif parsed.path in ("/masternodes", "/masternodes.html"):
+                elif parsed.path in SENTRY_NODE_PATHS:
                     html_body = masternodes_html(
                         store,
                         since_time=since_time,
@@ -3354,11 +3369,11 @@ def build_parser() -> argparse.ArgumentParser:
     rpc_p = sub.add_parser("rpc-check", help="Check Syscoin Core RPC connectivity")
     rpc_p.set_defaults(rpc_command=True)
 
-    verify_p = sub.add_parser("verify-sentries", help="Verify exact 100k SYS candidates against masternode_list RPC")
+    verify_p = sub.add_parser("verify-sentries", help="Verify exact 100k SYS candidates against Syscoin Core masternode_list RPC")
     verify_p.add_argument("--since-date", help="Only verify candidates from this date/time; e.g. '2026-04-14 12:30'")
 
-    mn_p = sub.add_parser("sync-masternodes", help="Fetch the full network masternode_list snapshot from RPC")
-    mn_p.add_argument("--csv", type=Path, default=DEFAULT_NETWORK_MASTERNODES_PATH, help="Write masternode snapshot CSV")
+    mn_p = sub.add_parser("sync-masternodes", help="Fetch the full network sentry node snapshot from RPC")
+    mn_p.add_argument("--csv", type=Path, default=DEFAULT_NETWORK_MASTERNODES_PATH, help="Write sentry node snapshot CSV")
 
     static_p = sub.add_parser("publish-static", help="Sync data and write pre-rendered dashboard pages")
     static_p.add_argument("--output-dir", type=Path, required=True, help="Directory to publish static HTML/data files")
@@ -3368,7 +3383,7 @@ def build_parser() -> argparse.ArgumentParser:
     static_p.add_argument("--sync-max-pages", type=int, help="Limit address pages during dashboard sync")
     static_p.add_argument("--next-hop-limit", type=int, default=8, help="Number of first-hop spends to trace per publish")
     static_p.add_argument("--node-spend-limit", type=int, default=12, help="Number of possible node spends to trace per publish")
-    static_p.add_argument("--csv", type=Path, default=DEFAULT_NETWORK_MASTERNODES_PATH, help="Masternode snapshot CSV path")
+    static_p.add_argument("--csv", type=Path, default=DEFAULT_NETWORK_MASTERNODES_PATH, help="Sentry node snapshot CSV path")
 
     watch_p = sub.add_parser("watch", help="Poll repeatedly and emit outbound alerts")
     watch_p.add_argument("--interval", type=int, default=60)
@@ -3381,7 +3396,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p.add_argument("--port", type=int, default=8787)
     serve_p.add_argument("--since-date", help="Only show dashboard movements from this date/time; e.g. '2026-04-14 12:30'")
     serve_p.add_argument("--sync-interval", type=int, default=60, help="Seconds between Blockbook syncs and page refreshes; use 0 to disable auto-sync")
-    serve_p.add_argument("--masternode-sync-interval", type=int, default=60, help="Seconds between masternode RPC checks; use 0 to disable")
+    serve_p.add_argument("--masternode-sync-interval", type=int, default=60, help="Seconds between sentry node RPC checks; use 0 to disable")
     serve_p.add_argument("--sync-max-pages", type=int, help="Limit address pages per dashboard sync")
 
     return parser
@@ -3478,7 +3493,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.csv:
             write_network_masternodes_csv(network_masternode_rows_from_store(store), args.csv)
         print(
-            f"Synced {stats['current']} masternodes ({stats['enabled']} enabled); "
+            f"Synced {stats['current']} sentry nodes ({stats['enabled']} enabled); "
             f"added {stats['added']}, removed {stats['removed']}, traced {stats['traced']}"
         )
         return 0
@@ -3514,7 +3529,7 @@ def main(argv: list[str] | None = None) -> int:
             f"wallet_seen={stats['wallet']['seen']} wallet_new={stats['wallet']['inserted']} "
             f"next_hop_found={stats['next_hop']['found_spends']} "
             f"node_spends={stats['node_spends']['found_spends']} "
-            f"masternodes={masternode_stats.get('current', '-')}"
+            f"sentry_nodes={masternode_stats.get('current', '-')}"
         )
         return 0
 
@@ -3587,7 +3602,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             masternode_thread.start()
         elif args.masternode_sync_interval > 0:
-            print("Masternode live sync disabled: no RPC URL/host supplied.", file=sys.stderr)
+            print("Sentry node live sync disabled: no RPC URL/host supplied.", file=sys.stderr)
         refresh_candidates = [value for value in (args.sync_interval, args.masternode_sync_interval) if value > 0]
         serve(
             store,

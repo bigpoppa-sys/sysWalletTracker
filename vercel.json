@@ -15,6 +15,14 @@
       "destination": "/api/index.py"
     },
     {
+      "source": "/sentrynode",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/sentrynode.html",
+      "destination": "/api/index.py"
+    },
+    {
       "source": "/masternodes",
       "destination": "/api/index.py"
     },
