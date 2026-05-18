@@ -281,6 +281,10 @@ def fetch_static_page(path: str, *, force: bool = False) -> bytes | None:
             if getattr(resp, "status", 200) != 200:
                 return None
             body = resp.read()
+            if path in TOP_WALLETS_PATHS and b"Syscoin Top Wallets" not in body:
+                return None
+            if path == TOP_WALLETS_JSON_PATH and not body.lstrip().startswith(b"{"):
+                return None
             if cache_ttl > 0:
                 _static_page_cache[cache_key] = (now, body)
             return body
