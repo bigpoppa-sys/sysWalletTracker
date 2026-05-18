@@ -1723,7 +1723,10 @@ def sync_top_wallet_index(
         block_hashes = rpc.batch_call([("getblockhash", [item]) for item in heights])
         blocks = rpc.batch_call([("getblock", [block_hash, 2]) for block_hash in block_hashes])
 
-        for block_height, block_hash, block in zip(heights, block_hashes, blocks, strict=True):
+        if len(block_hashes) != len(heights) or len(blocks) != len(heights):
+            raise RuntimeError("top wallet RPC batch returned an unexpected number of results")
+
+        for block_height, block_hash, block in zip(heights, block_hashes, blocks):
             previous_hash = progress.get("last_hash")
             if block_height > 0 and previous_hash and block.get("previousblockhash") != previous_hash:
                 raise RuntimeError(
