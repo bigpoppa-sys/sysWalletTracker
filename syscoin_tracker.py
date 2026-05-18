@@ -3743,68 +3743,152 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
         </div>
       </div>"""
 
-    operator_preview_rows = [
-        {
-            "rank": 1,
-            "name": "SamnSALCka...RHinc8Ef",
-            "label": "Major Sentry Operator",
-            "nodes": 544,
-            "locked_sats": sys_to_sats("54400000"),
-            "net_sats": sys_to_sats("56541715.45024569"),
-            "seniority": "544 L2",
-            "status": "544 enabled",
-        },
-        {
-            "rank": 2,
-            "name": "ShourVYL2S...sCkupUuW",
-            "label": "Major Sentry Operator",
-            "nodes": 386,
-            "locked_sats": sys_to_sats("38600000"),
-            "net_sats": sys_to_sats("38671288.09785247"),
-            "seniority": "233 Base, 27 L1, 126 L2",
-            "status": "386 enabled",
-        },
-        {
-            "rank": 3,
-            "name": "SVCvb8izm7...7iis515P",
-            "label": "Large Sentry Operator",
-            "nodes": 73,
-            "locked_sats": sys_to_sats("7300000"),
-            "net_sats": sys_to_sats("8780080.80433447"),
-            "seniority": "73 L2",
-            "status": "73 enabled",
-        },
-        {
-            "rank": 4,
-            "name": "STJheotaSd...DiTmW4w4",
-            "label": "Large Sentry Operator",
-            "nodes": 50,
-            "locked_sats": sys_to_sats("5000000"),
-            "net_sats": sys_to_sats("5000000.0009"),
-            "seniority": "50 L2",
-            "status": "50 enabled",
-        },
-        {
-            "rank": 5,
-            "name": "Example small cluster",
-            "label": "Sentry Operator",
-            "nodes": 8,
-            "locked_sats": sys_to_sats("800000"),
-            "net_sats": sys_to_sats("934250.12"),
-            "seniority": "3 Base, 5 L2",
-            "status": "8 enabled",
-        },
-        {
-            "rank": 6,
-            "name": "Example solo node",
-            "label": "Solo Sentry Operator",
-            "nodes": 1,
-            "locked_sats": sys_to_sats("100000"),
-            "net_sats": sys_to_sats("100124.88"),
-            "seniority": "1 Base",
-            "status": "1 enabled",
-        },
-    ]
+    def operator_label_for_count(node_count: int) -> str:
+        if node_count >= 100:
+            return "Major Sentry Operator"
+        if node_count >= 10:
+            return "Large Sentry Operator"
+        if node_count == 1:
+            return "Solo Sentry Operator"
+        return "Sentry Operator"
+
+    def build_operator_rows() -> list[dict[str, Any]]:
+        edge_count = store.conn.execute("SELECT COUNT(*) AS count FROM top_wallet_cluster_edges").fetchone()["count"]
+        balance_count = store.conn.execute("SELECT COUNT(*) AS count FROM top_wallet_balances WHERE balance_sats > 0").fetchone()["count"]
+        if not edge_count or not balance_count:
+            return []
+
+        union = UnionFind()
+        for edge in store.conn.execute("SELECT address_a, address_b FROM top_wallet_cluster_edges"):
+            union.union(edge["address_a"], edge["address_b"])
+
+        wallet_labels = load_wallet_labels()
+        exchange_tags = load_exchange_tags()
+        clusters: dict[str, dict[str, Any]] = {}
+        for balance_row in store.conn.execute(
+            """
+            SELECT address, balance_sats
+            FROM top_wallet_balances
+            WHERE balance_sats > 0
+            """
+        ):
+            address = str(balance_row["address"] or "")
+            balance_sats = int(balance_row["balance_sats"] or 0)
+            root = union.find(address)
+            cluster = clusters.setdefault(
+                root,
+                {
+                    "address": address,
+                    "balance_sats": 0,
+                    "representative_balance_sats": -1,
+                    "name": short_address(address),
+                    "label": "Unknown",
+                    "label_priority": 0,
+                },
+            )
+            cluster["balance_sats"] += balance_sats
+            if balance_sats > int(cluster["representative_balance_sats"]):
+                cluster["address"] = address
+                cluster["representative_balance_sats"] = balance_sats
+            identity = wallet_identity_for_address(address, wallet_labels, exchange_tags)
+            label = identity["label"]
+            priority = 2 if label == "Exchange" else 1 if label != "Unknown" else 0
+            if priority > int(cluster["label_priority"]):
+                cluster["name"] = identity["name"]
+                cluster["label"] = label
+                cluster["label_priority"] = priority
+
+        if store.conn.execute("SELECT COUNT(*) AS count FROM network_masternodes").fetchone()["count"] == 0:
+            load_network_masternodes_csv(store)
+
+        operators: dict[str, dict[str, Any]] = {}
+        for node_row in store.conn.execute(
+            """
+            SELECT collateral_address, status, collateral_height
+            FROM network_masternodes
+            WHERE collateral_address != '' AND COALESCE(removed_at, '') = ''
+            """
+        ):
+            collateral_address = str(node_row["collateral_address"] or "")
+            if not collateral_address:
+                continue
+            root = union.find(collateral_address)
+            cluster = clusters.get(root)
+            if not cluster:
+                continue
+            operator = operators.setdefault(
+                root,
+                {
+                    "name": cluster["name"],
+                    "address": cluster["address"],
+                    "nodes": 0,
+                    "locked_sats": 0,
+                    "net_sats": int(cluster["balance_sats"]),
+                    "seniority_counts": {"Base": 0, "Level 1": 0, "Level 2": 0},
+                    "status_counts": {},
+                },
+            )
+            operator["nodes"] += 1
+            operator["locked_sats"] += SENTRY_COLLATERAL_SATS
+            operator["net_sats"] = int(cluster["balance_sats"])
+
+            collateral_height = int_or_none(node_row["collateral_height"])
+            if collateral_height is not None and isinstance(cluster_chain_height, int):
+                blocks_since_collateral = max(cluster_chain_height - collateral_height, 0)
+                if blocks_since_collateral >= SENIORITY_LEVEL_2_BLOCKS:
+                    seniority_label = "Level 2"
+                elif blocks_since_collateral >= SENIORITY_LEVEL_1_BLOCKS:
+                    seniority_label = "Level 1"
+                else:
+                    seniority_label = "Base"
+                operator["seniority_counts"][seniority_label] += 1
+
+            status = str(node_row["status"] or "").upper()
+            status_key = "Banned" if "BANNED" in status else "Enabled" if status == "ENABLED" else status.title() or "Unknown"
+            operator["status_counts"][status_key] = operator["status_counts"].get(status_key, 0) + 1
+
+        def mix_text(counts: dict[str, int]) -> str:
+            parts = []
+            for label in ("Base", "Level 1", "Level 2"):
+                count = int(counts.get(label) or 0)
+                if count:
+                    short_label = "L1" if label == "Level 1" else "L2" if label == "Level 2" else "Base"
+                    parts.append(f"{count:,} {short_label}")
+            return ", ".join(parts) if parts else "-"
+
+        def status_text(counts: dict[str, int]) -> str:
+            parts = []
+            for label in ("Enabled", "Banned", "Unknown"):
+                count = int(counts.get(label) or 0)
+                if count:
+                    parts.append(f"{count:,} {label.lower()}")
+            for label, count in sorted(counts.items()):
+                if label not in {"Enabled", "Banned", "Unknown"} and count:
+                    parts.append(f"{count:,} {label.lower()}")
+            return ", ".join(parts) if parts else "-"
+
+        rows = []
+        ordered = sorted(
+            operators.values(),
+            key=lambda item: (-int(item["nodes"]), -int(item["net_sats"]), str(item["name"]).lower()),
+        )
+        for rank, item in enumerate(ordered, 1):
+            node_count = int(item["nodes"])
+            rows.append(
+                {
+                    "rank": rank,
+                    "name": item["name"],
+                    "label": operator_label_for_count(node_count),
+                    "nodes": node_count,
+                    "locked_sats": int(item["locked_sats"]),
+                    "net_sats": int(item["net_sats"]),
+                    "seniority": mix_text(item["seniority_counts"]),
+                    "status": status_text(item["status_counts"]),
+                }
+            )
+        return rows
+
+    operator_rows = build_operator_rows()
 
     def operator_label_class(label: str) -> str:
         label_lower = label.lower()
@@ -3816,7 +3900,7 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
             return "solo"
         return "operator"
 
-    operator_preview_html = "\n".join(
+    operator_rows_html = "\n".join(
         (
             "<tr>"
             f"<td class='rank' data-sort='{row['rank']}'>{row['rank']}</td>"
@@ -3829,8 +3913,10 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
             f"<td data-sort='{html.escape(row['status'].lower())}'>{html.escape(row['status'])}</td>"
             "</tr>"
         )
-        for row in operator_preview_rows
+        for row in operator_rows
     )
+    if not operator_rows_html:
+        operator_rows_html = "<tr><td class='empty' colspan='8'>No sentry operator clusters found yet. Run the forensic cluster index to build this table.</td></tr>"
 
     return f"""<!doctype html>
 <html lang="en">
@@ -4010,9 +4096,9 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     <section>
       <div class="panel-title">
         <h2>Sentry Operator View</h2>
-        <p>Mock preview</p>
+        <p>Derived from indexed clusters</p>
       </div>
-      <p class="phase-note">Preview of derived operator labels from estimated wallet clusters that contain active 100,000 SYS sentry collateral. Labels are thresholds, not identity proof.</p>
+      <p class="phase-note">Derived operator labels from estimated wallet clusters that contain active 100,000 SYS sentry collateral. Labels are thresholds, not identity proof.</p>
       {wallet_table_controls("sentry-operators", "Sentry operator view")}
       <div class="table-wrap">
         <table class="sortable-wallet-table operator-table" id="sentry-operators-table">
@@ -4028,7 +4114,7 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
               <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Status<span class="sort-icon" aria-hidden="true"></span></button></th>
             </tr>
           </thead>
-          <tbody>{operator_preview_html}</tbody>
+          <tbody>{operator_rows_html}</tbody>
         </table>
       </div>
     </section>
