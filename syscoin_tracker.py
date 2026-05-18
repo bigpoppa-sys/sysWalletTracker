@@ -1635,6 +1635,40 @@ def reset_top_wallet_cluster_index(store: Store, start_height: int = 0) -> None:
     store.conn.commit()
 
 
+def top_wallet_sentry_collateral_outpoints(store: Store) -> dict[tuple[str, int], str]:
+    if store.conn.execute("SELECT COUNT(*) AS count FROM network_masternodes").fetchone()["count"] == 0:
+        load_network_masternodes_csv(store)
+
+    outpoints: dict[tuple[str, int], str] = {}
+    for row in store.conn.execute(
+        """
+        SELECT source_txid, source_vout, collateral_address
+        FROM network_masternodes
+        WHERE source_txid != '' AND collateral_address != ''
+        """
+    ):
+        txid = str(row["source_txid"] or "")
+        vout = int_or_none(row["source_vout"])
+        address = str(row["collateral_address"] or "")
+        if txid and vout is not None and address:
+            outpoints[(txid, vout)] = address
+
+    for row in store.conn.execute(
+        """
+        SELECT source_txid, source_vout, address
+        FROM verified_sentries
+        WHERE source_txid != '' AND address != ''
+        """
+    ):
+        txid = str(row["source_txid"] or "")
+        vout = int_or_none(row["source_vout"])
+        address = str(row["address"] or "")
+        if txid and vout is not None and address:
+            outpoints[(txid, vout)] = address
+
+    return outpoints
+
+
 def adjust_top_wallet_balance(
     store: Store,
     address: str,
@@ -1775,16 +1809,23 @@ def save_top_wallet_cluster_edge(
     )
 
 
-def process_top_wallet_cluster_block(store: Store, block: dict[str, Any]) -> dict[str, int]:
+def process_top_wallet_cluster_block(
+    store: Store,
+    block: dict[str, Any],
+    sentry_collateral_outpoints: dict[tuple[str, int], str] | None = None,
+) -> dict[str, int]:
     block_height = int(block.get("height") or 0)
     block_time = int_or_none(block.get("time"))
+    sentry_collateral_outpoints = sentry_collateral_outpoints or {}
     stats = {
         "txs": 0,
         "outputs": 0,
         "spends": 0,
         "missing_spends": 0,
         "groups": 0,
+        "sentry_groups": 0,
         "edges": 0,
+        "sentry_edges": 0,
     }
 
     for tx in block.get("tx") or []:
@@ -1835,6 +1876,22 @@ def process_top_wallet_cluster_block(store: Store, block: dict[str, Any]) -> dic
             if value_sats <= 0:
                 continue
             output_index = int(vout.get("n", 0) or 0)
+            collateral_address = sentry_collateral_outpoints.get((txid, output_index))
+            if (
+                collateral_address
+                and value_sats == SENTRY_COLLATERAL_SATS
+                and unique_input_addresses
+            ):
+                sentry_edges = 0
+                for input_address in unique_input_addresses:
+                    if input_address == collateral_address:
+                        continue
+                    save_top_wallet_cluster_edge(store, input_address, collateral_address, block_height, block_time)
+                    stats["edges"] += 1
+                    stats["sentry_edges"] += 1
+                    sentry_edges += 1
+                if sentry_edges:
+                    stats["sentry_groups"] += 1
             cursor = store.conn.execute(
                 """
                 INSERT OR IGNORE INTO top_wallet_cluster_utxos(
@@ -1871,6 +1928,7 @@ def sync_top_wallet_index(
     target_height = min(chain_height, to_height if to_height is not None else chain_height)
     if max_blocks is not None:
         target_height = min(target_height, last_height + max_blocks)
+    sentry_collateral_outpoints = top_wallet_sentry_collateral_outpoints(store)
 
     totals = {
         "blocks": 0,
@@ -1955,7 +2013,10 @@ def sync_top_wallet_cluster_index(
         "spends": 0,
         "missing_spends": 0,
         "groups": 0,
+        "sentry_groups": 0,
         "edges": 0,
+        "sentry_edges": 0,
+        "sentry_collateral_outpoints": len(sentry_collateral_outpoints),
         "start_height": last_height + 1,
         "last_height": last_height,
         "target_height": target_height,
@@ -1984,7 +2045,7 @@ def sync_top_wallet_cluster_index(
                 )
 
             store.conn.execute("BEGIN")
-            block_stats = process_top_wallet_cluster_block(store, block)
+            block_stats = process_top_wallet_cluster_block(store, block, sentry_collateral_outpoints)
             progress = {
                 "last_height": block_height,
                 "last_hash": block_hash,
@@ -1996,7 +2057,7 @@ def sync_top_wallet_cluster_index(
 
             totals["blocks"] += 1
             totals["last_height"] = block_height
-            for key in ("txs", "outputs", "spends", "missing_spends", "groups", "edges"):
+            for key in ("txs", "outputs", "spends", "missing_spends", "groups", "sentry_groups", "edges", "sentry_edges"):
                 totals[key] += block_stats[key]
 
         height = heights[-1] + 1
@@ -2049,7 +2110,7 @@ def top_wallet_cluster_snapshot(store: Store, limit: int = 100) -> dict[str, Any
         return {
             "generated_at": now_iso(),
             "type": "estimated_wallet_clusters",
-            "stage": "common-input",
+            "stage": "forensic-clusters",
             "limit": limit,
             "index": {
                 "last_height": last_height,
@@ -2153,7 +2214,7 @@ def top_wallet_cluster_snapshot(store: Store, limit: int = 100) -> dict[str, Any
     return {
         "generated_at": now_iso(),
         "type": "estimated_wallet_clusters",
-        "stage": "common-input",
+        "stage": "forensic-clusters",
         "limit": limit,
         "index": {
             "last_height": last_height,
@@ -3519,15 +3580,15 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
         else "not started"
     )
     cluster_status = (
-        "Common-input index complete"
+        "Forensic cluster index complete"
         if cluster_index.get("complete")
-        else f"Building common-input index: {cluster_progress_text}"
+        else f"Building forensic cluster index: {cluster_progress_text}"
         if cluster_last_height is not None and int(cluster_last_height) >= 0
-        else "Common-input index not started"
+        else "Forensic cluster index not started"
     )
     cluster_rows_html = "\n".join(render_wallet_row(row) for row in cluster_wallets)
     if not cluster_rows_html:
-        cluster_rows_html = "<tr><td class='empty' colspan='7'>No estimated holder clusters yet. Run the common-input cluster index to build this table.</td></tr>"
+        cluster_rows_html = "<tr><td class='empty' colspan='7'>No estimated holder clusters yet. Run the forensic cluster index to build this table.</td></tr>"
 
     return f"""<!doctype html>
 <html lang="en">
@@ -3640,7 +3701,7 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
         <h2>Phase 2 Holder Estimate</h2>
         <p>{html.escape(cluster_status)}</p>
       </div>
-      <p class="phase-note">Common-input clustering estimate. Address balances are exact; holder grouping is a forensic estimate, not proof of ownership.</p>
+      <p class="phase-note">Common-input plus sentry-collateral clustering estimate. Address balances are exact; holder grouping is a forensic estimate, not proof of ownership.</p>
       <div class="metrics">
         <div class="metric"><span>Estimated Holders</span><b>{int(cluster_totals['clusters']):,}</b></div>
         <div class="metric"><span>Known Exchange Clusters</span><b>{int(cluster_totals['known_exchange_clusters']):,}</b></div>
@@ -3652,7 +3713,7 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     <section>
       <div class="panel-title">
         <h2>Estimated Holder Clusters</h2>
-        <p>{int(cluster_totals['edges']):,} common-input links</p>
+        <p>{int(cluster_totals['edges']):,} forensic links</p>
       </div>
       <div class="table-wrap">
         <table class="sortable-wallet-table">
@@ -4471,7 +4532,7 @@ def build_parser() -> argparse.ArgumentParser:
     top_wallet_p.add_argument("--json", type=Path, default=Path(TOP_WALLETS_JSON), help="Write top-wallet snapshot JSON")
     top_wallet_p.add_argument("--batch-size", type=int, default=50, help="RPC blocks to fetch per batch")
 
-    cluster_p = sub.add_parser("sync-top-wallet-clusters", help="Build estimated holder clusters from common-input history")
+    cluster_p = sub.add_parser("sync-top-wallet-clusters", help="Build estimated holder clusters from common-input and sentry-collateral history")
     cluster_p.add_argument("--start-height", type=int, default=0, help="Height to start from when the cluster index is empty or reset")
     cluster_p.add_argument("--to-height", type=int, help="Stop at this block height")
     cluster_p.add_argument("--max-blocks", type=int, default=1000, help="Maximum blocks to index in this run")
@@ -4650,7 +4711,10 @@ def main(argv: list[str] | None = None) -> int:
             f"Indexed top wallet clusters blocks={stats['blocks']} txs={stats['txs']} "
             f"outputs={stats['outputs']} spends={stats['spends']} "
             f"missing_spends={stats['missing_spends']} groups={stats['groups']} "
-            f"edges={stats['edges']} height={stats['last_height']}/{stats['chain_height']} "
+            f"sentry_groups={stats['sentry_groups']} edges={stats['edges']} "
+            f"sentry_edges={stats['sentry_edges']} "
+            f"sentry_outpoints={stats['sentry_collateral_outpoints']} "
+            f"height={stats['last_height']}/{stats['chain_height']} "
             f"clusters={snapshot['totals']['clusters']}"
         )
         return 0
