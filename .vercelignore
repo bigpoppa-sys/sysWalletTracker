@@ -1,5 +1,8 @@
 __pycache__/
 .vercel/
+.ssh/
+.env
+.env.*
 *.py[cod]
 *.sqlite
 *.sqlite-shm
