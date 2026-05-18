@@ -35,6 +35,10 @@
       "destination": "/api/index.py"
     },
     {
+      "source": "/assets/chart.umd.js",
+      "destination": "/api/index.py"
+    },
+    {
       "source": "/masternodes",
       "destination": "/api/index.py"
     },

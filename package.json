@@ -1,0 +1,26 @@
+{
+  "name": "syswallettracker",
+  "version": "1.0.0",
+  "description": "Syscoin forensic dashboard for wallet flows, sentry nodes, and top wallet estimates.",
+  "private": true,
+  "scripts": {
+    "vendor:charts": "cp node_modules/chart.js/dist/chart.umd.js static/assets/chart.umd.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bigpoppa-sys/sysWalletTracker.git"
+  },
+  "keywords": [
+    "syscoin",
+    "forensics",
+    "dashboard"
+  ],
+  "license": "UNLICENSED",
+  "bugs": {
+    "url": "https://github.com/bigpoppa-sys/sysWalletTracker/issues"
+  },
+  "homepage": "https://github.com/bigpoppa-sys/sysWalletTracker#readme",
+  "dependencies": {
+    "chart.js": "^4.5.1"
+  }
+}

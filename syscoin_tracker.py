@@ -66,6 +66,8 @@ TOP_WALLETS_PATHS = ("/top-wallets", "/top-wallets.html")
 TOP_WALLETS_JSON = "top-wallets.json"
 TOP_WALLETS_HTML = "top-wallets.html"
 TOP_WALLETS_JSON_PATH = f"/{TOP_WALLETS_JSON}"
+CHART_ASSET_ROUTE = "/assets/chart.umd.js"
+CHART_ASSET_PATH = Path("static/assets/chart.umd.js")
 NETWORK_MASTERNODE_HEADERS = [
     "outpoint",
     "source_txid",
@@ -105,6 +107,12 @@ def utc(ts: int | None) -> str:
 
 def now_iso() -> str:
     return dt.datetime.now(tz=dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def chart_asset_bytes() -> bytes | None:
+    if not CHART_ASSET_PATH.exists():
+        return None
+    return CHART_ASSET_PATH.read_bytes()
 
 
 def sats(value: Any) -> int:
@@ -150,6 +158,13 @@ def fmt_local_datetime(ts: int | None, timezone_name: str = DEFAULT_TIMEZONE) ->
         return ""
     local = dt.datetime.fromtimestamp(int(ts), tz=dt.timezone.utc).astimezone(ZoneInfo(timezone_name))
     return local.strftime("%b %-d, %Y %-I:%M %p")
+
+
+def fmt_local_date(ts: int | None, timezone_name: str = DEFAULT_TIMEZONE) -> str:
+    if not ts:
+        return "-"
+    local = dt.datetime.fromtimestamp(int(ts), tz=dt.timezone.utc).astimezone(ZoneInfo(timezone_name))
+    return local.strftime("%b %-d, %Y")
 
 
 def fmt_table_datetime(ts: int | None, timezone_name: str = DEFAULT_TIMEZONE) -> str:
@@ -2142,6 +2157,21 @@ def top_wallet_cluster_snapshot(store: Store, limit: int = 100) -> dict[str, Any
     for address in list(union.parent):
         root = union.find(address)
         member_counts[root] = member_counts.get(root, 0) + 1
+    node_counts: dict[str, int] = {}
+    if store.conn.execute("SELECT COUNT(*) AS count FROM network_masternodes").fetchone()["count"] == 0:
+        load_network_masternodes_csv(store)
+    for row in store.conn.execute(
+        """
+        SELECT collateral_address
+        FROM network_masternodes
+        WHERE collateral_address != '' AND COALESCE(removed_at, '') = ''
+        """
+    ):
+        collateral_address = str(row["collateral_address"] or "")
+        if not collateral_address:
+            continue
+        root = union.find(collateral_address)
+        node_counts[root] = node_counts.get(root, 0) + 1
 
     exchange_tags = load_exchange_tags()
     wallet_labels = load_wallet_labels()
@@ -2164,6 +2194,7 @@ def top_wallet_cluster_snapshot(store: Store, limit: int = 100) -> dict[str, Any
                 "name": short_address(address),
                 "label": "Unknown",
                 "label_priority": 0,
+                "node_count": node_counts.get(root, 0),
             },
         )
         cluster["funded_address_count"] += 1
@@ -2187,6 +2218,15 @@ def top_wallet_cluster_snapshot(store: Store, limit: int = 100) -> dict[str, Any
             cluster["label"] = label
             cluster["label_priority"] = priority
 
+    for root, node_count in node_counts.items():
+        cluster = clusters.get(root)
+        if not cluster:
+            continue
+        cluster["node_count"] = node_count
+        if cluster["label"] == "Unknown":
+            cluster["label"] = "Node Operator"
+            cluster["label_priority"] = 1
+
     ordered = sorted(clusters.values(), key=lambda item: (-int(item["balance_sats"]), str(item["address"])))
     wallets = []
     for rank, cluster in enumerate(ordered[:limit], 1):
@@ -2202,6 +2242,7 @@ def top_wallet_cluster_snapshot(store: Store, limit: int = 100) -> dict[str, Any
                 "balance_sats": balance_sats,
                 "balance_sys": sats_to_sys_string(balance_sats),
                 "utxo_count": int(cluster["utxo_count"]),
+                "node_count": int(cluster.get("node_count") or 0),
                 "last_seen_height": cluster["last_seen_height"],
                 "last_seen_time": cluster["last_seen_time"],
                 "percent_text": fmt_percent(balance_sats, balance_total),
@@ -3010,6 +3051,12 @@ def publish_static_snapshot(
     atomic_write_text(output_dir / "masternodes.html", masternode_page)
     atomic_write_text(output_dir / TOP_WALLETS_HTML, top_wallets_page)
     atomic_write_json(output_dir / TOP_WALLETS_JSON, top_wallets)
+    if CHART_ASSET_PATH.exists():
+        asset_target = output_dir / CHART_ASSET_ROUTE.lstrip("/")
+        asset_target.parent.mkdir(parents=True, exist_ok=True)
+        temp_asset = asset_target.with_name(f".{asset_target.name}.tmp")
+        temp_asset.write_bytes(CHART_ASSET_PATH.read_bytes())
+        temp_asset.replace(asset_target)
     if csv_path.exists():
         network_csv = output_dir / "network_masternodes.csv"
         temp_csv = network_csv.with_name(f".{network_csv.name}.tmp")
@@ -3287,6 +3334,14 @@ def dashboard_html(
     .panel-title {{ display: flex; align-items: end; justify-content: space-between; gap: 16px; }}
     .panel-title h2 {{ margin: 0; font-size: 1.25rem; }}
     .panel-title p {{ margin: 0; color: #687177; font-size: 0.9rem; }}
+    .table-controls {{ align-items: end; display: flex; justify-content: flex-end; margin: 10px 0; }}
+    .pagination-controls {{ align-items: end; display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; margin-left: auto; }}
+    .page-size-control {{ color: #687177; display: grid; font-size: 0.78rem; font-weight: 700; gap: 4px; width: 110px; }}
+    .page-size-control select {{ background: #fff; border: 1px solid #cfd7d1; border-radius: 6px; color: #1c2227; font: inherit; min-height: 36px; padding: 7px 9px; }}
+    .pager {{ align-items: center; color: #687177; display: flex; gap: 8px; justify-content: flex-end; }}
+    .pager button {{ background: #fff; border: 1px solid #cfd7d1; border-radius: 6px; color: #1c2227; cursor: pointer; font: inherit; min-height: 36px; padding: 7px 10px; }}
+    .pager button:disabled {{ cursor: default; opacity: 0.45; }}
+    .page-status {{ color: #687177; font-size: 0.86rem; min-width: 96px; text-align: center; }}
     .wallet-list {{ display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }}
     .wallet-card {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; padding: 12px 12px; min-width: 0; display: grid; gap: 5px; }}
     .wallet-card strong {{ font-size: 0.95rem; }}
@@ -3334,6 +3389,10 @@ def dashboard_html(
       .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .wallet-list {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .panel-title {{ align-items: start; flex-direction: column; }}
+      .table-controls {{ align-items: stretch; flex-direction: column; }}
+      .pagination-controls {{ align-items: stretch; flex-direction: column; margin-left: 0; width: 100%; }}
+      .page-size-control {{ width: 100%; }}
+      .pager {{ justify-content: space-between; }}
       .topbar {{ align-items: start; flex-direction: column; }}
       .nav {{ justify-content: flex-start; }}
       .header-inner, main {{ margin-left: 12px; margin-right: 12px; }}
@@ -3347,9 +3406,10 @@ def dashboard_html(
       .metric, .wallet-card, .table-wrap, table, .floating-table-header {{ background: #1c2328; border-color: #334047; }}
       th {{ background: #263139; }}
       th, td {{ border-color: #334047; }}
+      .page-size-control select, .pager button {{ background: #1c2328; border-color: #46555e; color: #f3f4f6; }}
       a {{ color: #67d7ff; }}
       .subtitle {{ color: #b6c3c7; }}
-      .metric span, .wallet-card span, .panel-title p, th:nth-child(1), td:nth-child(1), .subtle, .sort-icon {{ color: #a7b0b5; }}
+      .metric span, .wallet-card span, .panel-title p, th:nth-child(1), td:nth-child(1), .subtle, .sort-icon, .page-size-control, .pager, .page-status {{ color: #a7b0b5; }}
       .sort-button:hover, .sort-button:focus-visible {{ color: #67d7ff; }}
     }}
   </style>
@@ -3397,6 +3457,25 @@ def dashboard_html(
         <h2>Recipients Ranked By SYS</h2>
         <p>{destination_count} addresses, high to low</p>
       </div>
+      <div class="table-controls" aria-label="Recipients table controls">
+        <div class="pagination-controls">
+          <label class="page-size-control" for="destinations-page-size">
+            <span>Rows</span>
+            <select id="destinations-page-size">
+              <option value="20" selected>20</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+          </label>
+          <div class="pager" aria-label="Recipients pagination">
+            <button id="destinations-first" type="button">First</button>
+            <button id="destinations-prev" type="button">Prev</button>
+            <span class="page-status" id="destinations-page-status">0 of 0</span>
+            <button id="destinations-next" type="button">Next</button>
+            <button id="destinations-last" type="button">Last</button>
+          </div>
+        </div>
+      </div>
       <div class="table-wrap"><table id="destinations-table"><thead><tr><th data-sort="number" data-default-dir="asc" aria-sort="ascending"><button class="sort-button" type="button">Rank<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Address<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">SYS Sent<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Share<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Sends<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="number" data-default-dir="desc" title="Amount already spent by the first recipient address" aria-sort="none"><button class="sort-button" type="button">Sent Again<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Exchange<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="number" data-default-dir="desc" title="Exact 100,000 SYS output seen at this hop or the next traced hop" aria-sort="none"><button class="sort-button" type="button">100k Sentry<span class="sort-icon" aria-hidden="true"></span></button></th><th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Last Seen<span class="sort-icon" aria-hidden="true"></span></button></th></tr></thead><tbody>{top_html}</tbody></table></div>
     </section>
   </main>
@@ -3406,7 +3485,16 @@ def dashboard_html(
       if (!table) return;
       const headers = Array.from(table.querySelectorAll("th[data-sort]"));
       const tbody = table.tBodies[0];
+      const pageSizeSelect = document.getElementById("destinations-page-size");
+      const firstButton = document.getElementById("destinations-first");
+      const prevButton = document.getElementById("destinations-prev");
+      const nextButton = document.getElementById("destinations-next");
+      const lastButton = document.getElementById("destinations-last");
+      const pageStatus = document.getElementById("destinations-page-status");
       const storageKey = "syscoin-destinations-sort";
+      let rows = Array.from(tbody.rows);
+      let page = 1;
+      let pageSize = Number(pageSizeSelect?.value || 20);
       let activeIndex = 0;
       let activeDirection = "asc";
       const floatingWrap = document.createElement("div");
@@ -3452,7 +3540,6 @@ def dashboard_html(
       const sortRows = (index, direction, persist = true) => {{
         const type = headers[index].dataset.sort;
         const multiplier = direction === "asc" ? 1 : -1;
-        const rows = Array.from(tbody.rows);
         rows.sort((left, right) => {{
           const leftValue = cellValue(left, index, type);
           const rightValue = cellValue(right, index, type);
@@ -3462,11 +3549,32 @@ def dashboard_html(
         rows.forEach((row) => tbody.appendChild(row));
         activeIndex = index;
         activeDirection = direction;
+        page = 1;
         updateHeaderState(index, direction);
+        renderPage();
         syncFloatingHeader();
         if (persist) {{
           localStorage.setItem(storageKey, JSON.stringify({{ index, direction }}));
         }}
+      }};
+
+      const renderPage = () => {{
+        const total = rows.length;
+        const totalPages = Math.max(1, Math.ceil(total / pageSize));
+        page = Math.min(Math.max(page, 1), totalPages);
+        const start = (page - 1) * pageSize;
+        const end = Math.min(start + pageSize, total);
+        rows.forEach((row, index) => {{
+          row.hidden = index < start || index >= end;
+        }});
+        if (pageStatus) {{
+          pageStatus.textContent = total ? `${{start + 1}}-${{end}} of ${{total}}` : "0 of 0";
+        }}
+        if (firstButton) firstButton.disabled = page <= 1 || total === 0;
+        if (prevButton) prevButton.disabled = page <= 1 || total === 0;
+        if (nextButton) nextButton.disabled = page >= totalPages || total === 0;
+        if (lastButton) lastButton.disabled = page >= totalPages || total === 0;
+        syncFloatingHeader();
       }};
 
       const bindSortButtons = (headerGroup) => {{
@@ -3484,9 +3592,30 @@ def dashboard_html(
 
       bindSortButtons(headers);
       bindSortButtons(floatingHeaders);
+      pageSizeSelect?.addEventListener("change", () => {{
+        pageSize = Number(pageSizeSelect.value || 20);
+        page = 1;
+        renderPage();
+      }});
+      firstButton?.addEventListener("click", () => {{
+        page = 1;
+        renderPage();
+      }});
+      prevButton?.addEventListener("click", () => {{
+        page -= 1;
+        renderPage();
+      }});
+      nextButton?.addEventListener("click", () => {{
+        page += 1;
+        renderPage();
+      }});
+      lastButton?.addEventListener("click", () => {{
+        page = Math.max(1, Math.ceil(rows.length / pageSize));
+        renderPage();
+      }});
       window.addEventListener("scroll", syncFloatingHeader, {{ passive: true }});
       window.addEventListener("resize", syncFloatingHeader);
-      syncFloatingHeader();
+      renderPage();
 
       try {{
         const saved = JSON.parse(localStorage.getItem(storageKey) || "null");
@@ -3545,6 +3674,8 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
         label_class = (
             "exchange"
             if label_lower.startswith("exchange")
+            else "operator"
+            if "operator" in label_lower
             else "private"
             if "private" in label_lower or "holder" in label_lower or "user" in label_lower or "person" in label_lower
             else "unknown"
@@ -3588,7 +3719,118 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     )
     cluster_rows_html = "\n".join(render_wallet_row(row) for row in cluster_wallets)
     if not cluster_rows_html:
-        cluster_rows_html = "<tr><td class='empty' colspan='7'>No estimated holder clusters yet. Run the forensic cluster index to build this table.</td></tr>"
+        cluster_rows_html = "<tr><td class='empty' colspan='7'>No estimated address clusters yet. Run the forensic cluster index to build this table.</td></tr>"
+
+    def wallet_table_controls(control_id: str, label: str) -> str:
+        return f"""
+      <div class="table-controls" aria-label="{html.escape(label)} table controls">
+        <div class="pagination-controls">
+          <label class="page-size-control" for="{control_id}-page-size">
+            <span>Rows</span>
+            <select id="{control_id}-page-size">
+              <option value="20" selected>20</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+          </label>
+          <div class="pager" aria-label="{html.escape(label)} pagination">
+            <button id="{control_id}-first" type="button">First</button>
+            <button id="{control_id}-prev" type="button">Prev</button>
+            <span class="page-status" id="{control_id}-page-status">0 of 0</span>
+            <button id="{control_id}-next" type="button">Next</button>
+            <button id="{control_id}-last" type="button">Last</button>
+          </div>
+        </div>
+      </div>"""
+
+    operator_preview_rows = [
+        {
+            "rank": 1,
+            "name": "SamnSALCka...RHinc8Ef",
+            "label": "Major Sentry Operator",
+            "nodes": 544,
+            "locked_sats": sys_to_sats("54400000"),
+            "net_sats": sys_to_sats("56541715.45024569"),
+            "seniority": "544 L2",
+            "status": "544 enabled",
+        },
+        {
+            "rank": 2,
+            "name": "ShourVYL2S...sCkupUuW",
+            "label": "Major Sentry Operator",
+            "nodes": 386,
+            "locked_sats": sys_to_sats("38600000"),
+            "net_sats": sys_to_sats("38671288.09785247"),
+            "seniority": "233 Base, 27 L1, 126 L2",
+            "status": "386 enabled",
+        },
+        {
+            "rank": 3,
+            "name": "SVCvb8izm7...7iis515P",
+            "label": "Large Sentry Operator",
+            "nodes": 73,
+            "locked_sats": sys_to_sats("7300000"),
+            "net_sats": sys_to_sats("8780080.80433447"),
+            "seniority": "73 L2",
+            "status": "73 enabled",
+        },
+        {
+            "rank": 4,
+            "name": "STJheotaSd...DiTmW4w4",
+            "label": "Large Sentry Operator",
+            "nodes": 50,
+            "locked_sats": sys_to_sats("5000000"),
+            "net_sats": sys_to_sats("5000000.0009"),
+            "seniority": "50 L2",
+            "status": "50 enabled",
+        },
+        {
+            "rank": 5,
+            "name": "Example small cluster",
+            "label": "Sentry Operator",
+            "nodes": 8,
+            "locked_sats": sys_to_sats("800000"),
+            "net_sats": sys_to_sats("934250.12"),
+            "seniority": "3 Base, 5 L2",
+            "status": "8 enabled",
+        },
+        {
+            "rank": 6,
+            "name": "Example solo node",
+            "label": "Solo Sentry Operator",
+            "nodes": 1,
+            "locked_sats": sys_to_sats("100000"),
+            "net_sats": sys_to_sats("100124.88"),
+            "seniority": "1 Base",
+            "status": "1 enabled",
+        },
+    ]
+
+    def operator_label_class(label: str) -> str:
+        label_lower = label.lower()
+        if label_lower.startswith("major"):
+            return "major"
+        if label_lower.startswith("large"):
+            return "large"
+        if label_lower.startswith("solo"):
+            return "solo"
+        return "operator"
+
+    operator_preview_html = "\n".join(
+        (
+            "<tr>"
+            f"<td class='rank' data-sort='{row['rank']}'>{row['rank']}</td>"
+            f"<td class='wallet-name' data-sort='{html.escape(row['name'].lower())}'>{html.escape(row['name'])}</td>"
+            f"<td data-sort='{html.escape(row['label'].lower())}'><span class='label-pill operator-label {operator_label_class(row['label'])}'>{html.escape(row['label'])}</span></td>"
+            f"<td class='amount' data-sort='{row['nodes']}'>{row['nodes']:,}</td>"
+            f"<td class='amount' data-sort='{row['locked_sats']}'>{fmt_compact_sys(row['locked_sats'])}</td>"
+            f"<td class='amount' data-sort='{row['net_sats']}'>{fmt_compact_sys(row['net_sats'])}</td>"
+            f"<td data-sort='{html.escape(row['seniority'].lower())}'>{html.escape(row['seniority'])}</td>"
+            f"<td data-sort='{html.escape(row['status'].lower())}'>{html.escape(row['status'])}</td>"
+            "</tr>"
+        )
+        for row in operator_preview_rows
+    )
 
     return f"""<!doctype html>
 <html lang="en">
@@ -3619,6 +3861,14 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     .panel-title h2 {{ margin: 0; font-size: 1.25rem; }}
     .panel-title p {{ margin: 0; color: #687177; font-size: 0.9rem; }}
     .phase-note {{ color: #687177; font-size: 0.9rem; line-height: 1.45; margin: 8px 0 10px; max-width: 880px; }}
+    .table-controls {{ align-items: end; display: flex; justify-content: flex-end; margin: 10px 0; }}
+    .pagination-controls {{ align-items: end; display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; margin-left: auto; }}
+    .page-size-control {{ color: #687177; display: grid; font-size: 0.78rem; font-weight: 700; gap: 4px; width: 110px; }}
+    .page-size-control select {{ background: #fff; border: 1px solid #cfd7d1; border-radius: 6px; color: #1c2227; font: inherit; min-height: 36px; padding: 7px 9px; }}
+    .pager {{ align-items: center; color: #687177; display: flex; gap: 8px; justify-content: flex-end; }}
+    .pager button {{ background: #fff; border: 1px solid #cfd7d1; border-radius: 6px; color: #1c2227; cursor: pointer; font: inherit; min-height: 36px; padding: 7px 10px; }}
+    .pager button:disabled {{ cursor: default; opacity: 0.45; }}
+    .page-status {{ color: #687177; font-size: 0.86rem; min-width: 96px; text-align: center; }}
     .table-wrap {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; max-width: 100%; min-width: 0; overflow-x: auto; width: 100%; }}
     table {{ width: 100%; min-width: 980px; border-collapse: separate; border-spacing: 0; background: #fff; table-layout: fixed; }}
     th, td {{ padding: 8px 10px; border-bottom: 1px solid #e4e8e2; text-align: left; font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; }}
@@ -3642,14 +3892,32 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     .address-list span {{ color: #687177; display: block; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 0.78rem; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; }}
     .label-pill {{ border-radius: 999px; display: inline-flex; font-size: 0.78rem; font-weight: 800; line-height: 1; padding: 5px 9px; white-space: nowrap; }}
     .label-pill.exchange {{ background: #e8f3ff; color: #14589c; }}
+    .label-pill.operator {{ background: #fff4dd; color: #805313; }}
     .label-pill.private {{ background: #f4edff; color: #6840a3; }}
     .label-pill.unknown {{ background: #eef1ef; color: #596268; }}
+    .label-pill.operator-label.major {{ background: #e9f8ef; color: #126237; }}
+    .label-pill.operator-label.large {{ background: #eef5ff; color: #1c5f96; }}
+    .label-pill.operator-label.operator {{ background: #fff4dd; color: #805313; }}
+    .label-pill.operator-label.solo {{ background: #f2efff; color: #5f45a6; }}
     .amount {{ font-weight: 800; white-space: nowrap; }}
+    .operator-table {{ min-width: 1120px; }}
+    .operator-table th:nth-child(1), .operator-table td:nth-child(1) {{ width: 70px; text-align: right; }}
+    .operator-table th:nth-child(2), .operator-table td:nth-child(2) {{ width: 210px; }}
+    .operator-table th:nth-child(3), .operator-table td:nth-child(3) {{ width: 210px; }}
+    .operator-table th:nth-child(4), .operator-table td:nth-child(4) {{ width: 125px; text-align: right; }}
+    .operator-table th:nth-child(5), .operator-table td:nth-child(5) {{ width: 145px; text-align: right; }}
+    .operator-table th:nth-child(6), .operator-table td:nth-child(6) {{ width: 145px; text-align: right; }}
+    .operator-table th:nth-child(7), .operator-table td:nth-child(7) {{ width: 210px; }}
+    .operator-table th:nth-child(8), .operator-table td:nth-child(8) {{ width: 160px; }}
     .empty {{ color: #687177; padding: 18px 14px; text-align: center; }}
     a {{ color: #086788; text-decoration: none; }}
     @media(max-width: 820px) {{
       .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .panel-title {{ align-items: start; flex-direction: column; }}
+      .table-controls {{ align-items: stretch; flex-direction: column; }}
+      .pagination-controls {{ align-items: stretch; flex-direction: column; margin-left: 0; width: 100%; }}
+      .page-size-control {{ width: 100%; }}
+      .pager {{ justify-content: space-between; }}
       .topbar {{ align-items: start; flex-direction: column; }}
       .nav {{ justify-content: flex-start; }}
       .header-inner, main {{ margin-left: 12px; margin-right: 12px; }}
@@ -3660,14 +3928,20 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     @media (prefers-color-scheme: dark) {{
       body {{ background: #121619; color: #f3f4f6; }}
       .metric, .table-wrap, table {{ background: #1c2328; border-color: #334047; }}
+      .page-size-control select, .pager button {{ background: #1c2328; border-color: #46555e; color: #f3f4f6; }}
       th {{ background: #263139; }}
       th, td {{ border-color: #334047; }}
       a {{ color: #67d7ff; }}
       .subtitle {{ color: #b6c3c7; }}
-      .metric span, .panel-title p, .phase-note, th:nth-child(1), td:nth-child(1), .address-list span, .sort-icon, .empty {{ color: #a7b0b5; }}
+      .metric span, .panel-title p, .phase-note, th:nth-child(1), td:nth-child(1), .address-list span, .sort-icon, .empty, .page-size-control, .pager, .page-status {{ color: #a7b0b5; }}
       .label-pill.exchange {{ background: #173754; color: #9ed2ff; }}
+      .label-pill.operator {{ background: #443111; color: #ffd98a; }}
       .label-pill.private {{ background: #352451; color: #d6bcff; }}
       .label-pill.unknown {{ background: #30383d; color: #c0c9ce; }}
+      .label-pill.operator-label.major {{ background: #143e28; color: #aef0c6; }}
+      .label-pill.operator-label.large {{ background: #173754; color: #9ed2ff; }}
+      .label-pill.operator-label.operator {{ background: #443111; color: #ffd98a; }}
+      .label-pill.operator-label.solo {{ background: #332652; color: #d8c7ff; }}
       .sort-button:hover, .sort-button:focus-visible {{ color: #67d7ff; }}
     }}
   </style>
@@ -3698,7 +3972,7 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     </section>
     <section>
       <div class="panel-title">
-        <h2>Phase 2 Holder Estimate</h2>
+        <h2>Phase 2 Address Cluster Estimate</h2>
         <p>{html.escape(cluster_status)}</p>
       </div>
       <p class="phase-note">Common-input plus sentry-collateral clustering estimate. Address balances are exact; holder grouping is a forensic estimate, not proof of ownership.</p>
@@ -3712,11 +3986,12 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     </section>
     <section>
       <div class="panel-title">
-        <h2>Estimated Holder Clusters</h2>
+        <h2>Estimated Address Clusters</h2>
         <p>{int(cluster_totals['edges']):,} forensic links</p>
       </div>
+      {wallet_table_controls("estimated-clusters", "Estimated address clusters")}
       <div class="table-wrap">
-        <table class="sortable-wallet-table">
+        <table class="sortable-wallet-table" id="estimated-clusters-table">
           <thead>
             <tr>
               <th data-sort="number" data-default-dir="asc" aria-sort="ascending"><button class="sort-button" type="button">Rank<span class="sort-icon" aria-hidden="true"></span></button></th>
@@ -3734,9 +4009,35 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     </section>
     <section>
       <div class="panel-title">
+        <h2>Sentry Operator View</h2>
+        <p>Mock preview</p>
+      </div>
+      <p class="phase-note">Preview of derived operator labels from estimated wallet clusters that contain active 100,000 SYS sentry collateral. Labels are thresholds, not identity proof.</p>
+      {wallet_table_controls("sentry-operators", "Sentry operator view")}
+      <div class="table-wrap">
+        <table class="sortable-wallet-table operator-table" id="sentry-operators-table">
+          <thead>
+            <tr>
+              <th data-sort="number" data-default-dir="asc" aria-sort="ascending"><button class="sort-button" type="button">Rank<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Name<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Label<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Sentry Nodes<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Locked SYS<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Net Worth<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Seniority Mix<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Status<span class="sort-icon" aria-hidden="true"></span></button></th>
+            </tr>
+          </thead>
+          <tbody>{operator_preview_html}</tbody>
+        </table>
+      </div>
+    </section>
+    <section>
+      <div class="panel-title">
         <h2>Largest Addresses</h2>
         <p>{panel_status}</p>
       </div>
+      {wallet_table_controls("top-wallets", "Largest addresses")}
       <div class="table-wrap">
         <table class="sortable-wallet-table" id="top-wallets-table">
           <thead>
@@ -3760,12 +4061,43 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
       document.querySelectorAll(".sortable-wallet-table").forEach((table) => {{
         const headers = Array.from(table.querySelectorAll("th[data-sort]"));
         const tbody = table.tBodies[0];
+        const controlId = table.id ? table.id.replace(/-table$/, "") : "";
+        const pageSizeSelect = controlId ? document.getElementById(`${{controlId}}-page-size`) : null;
+        const firstButton = controlId ? document.getElementById(`${{controlId}}-first`) : null;
+        const prevButton = controlId ? document.getElementById(`${{controlId}}-prev`) : null;
+        const nextButton = controlId ? document.getElementById(`${{controlId}}-next`) : null;
+        const lastButton = controlId ? document.getElementById(`${{controlId}}-last`) : null;
+        const pageStatus = controlId ? document.getElementById(`${{controlId}}-page-status`) : null;
+        const emptyRows = Array.from(tbody.rows).filter((row) => row.querySelector(".empty"));
+        let dataRows = Array.from(tbody.rows).filter((row) => !emptyRows.includes(row));
+        let page = 1;
+        let pageSize = Number(pageSizeSelect?.value || 20);
         let activeIndex = 0;
         let activeDirection = "asc";
         const cellValue = (row, index, type) => {{
           const raw = row.cells[index]?.dataset.sort ?? row.cells[index]?.textContent ?? "";
           if (type === "number") return Number(raw) || 0;
           return raw.toLowerCase();
+        }};
+        const renderPage = () => {{
+          const total = dataRows.length;
+          const totalPages = Math.max(1, Math.ceil(total / pageSize));
+          page = Math.min(Math.max(page, 1), totalPages);
+          const start = (page - 1) * pageSize;
+          const end = Math.min(start + pageSize, total);
+          dataRows.forEach((row, index) => {{
+            row.hidden = index < start || index >= end;
+          }});
+          emptyRows.forEach((row) => {{
+            row.hidden = total > 0;
+          }});
+          if (pageStatus) {{
+            pageStatus.textContent = total ? `${{start + 1}}-${{end}} of ${{total}}` : "0 of 0";
+          }}
+          if (firstButton) firstButton.disabled = page <= 1 || total === 0;
+          if (prevButton) prevButton.disabled = page <= 1 || total === 0;
+          if (nextButton) nextButton.disabled = page >= totalPages || total === 0;
+          if (lastButton) lastButton.disabled = page >= totalPages || total === 0;
         }};
         const updateHeaderState = (index, direction) => {{
           headers.forEach((header, headerIndex) => {{
@@ -3777,19 +4109,43 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
             const direction = activeIndex === index ? (activeDirection === "asc" ? "desc" : "asc") : (header.dataset.defaultDir || "asc");
             const type = header.dataset.sort;
             const multiplier = direction === "asc" ? 1 : -1;
-            Array.from(tbody.rows)
-              .sort((left, right) => {{
-                const leftValue = cellValue(left, index, type);
-                const rightValue = cellValue(right, index, type);
-                if (type === "number") return (leftValue - rightValue) * multiplier;
-                return String(leftValue).localeCompare(String(rightValue)) * multiplier;
-              }})
-              .forEach((row) => tbody.appendChild(row));
+            dataRows.sort((left, right) => {{
+              const leftValue = cellValue(left, index, type);
+              const rightValue = cellValue(right, index, type);
+              if (type === "number") return (leftValue - rightValue) * multiplier;
+              return String(leftValue).localeCompare(String(rightValue)) * multiplier;
+            }});
+            dataRows.forEach((row) => tbody.appendChild(row));
+            emptyRows.forEach((row) => tbody.appendChild(row));
             activeIndex = index;
             activeDirection = direction;
+            page = 1;
             updateHeaderState(index, direction);
+            renderPage();
           }});
         }});
+        pageSizeSelect?.addEventListener("change", () => {{
+          pageSize = Number(pageSizeSelect.value || 20);
+          page = 1;
+          renderPage();
+        }});
+        firstButton?.addEventListener("click", () => {{
+          page = 1;
+          renderPage();
+        }});
+        prevButton?.addEventListener("click", () => {{
+          page -= 1;
+          renderPage();
+        }});
+        nextButton?.addEventListener("click", () => {{
+          page += 1;
+          renderPage();
+        }});
+        lastButton?.addEventListener("click", () => {{
+          page = Math.max(1, Math.ceil(dataRows.length / pageSize));
+          renderPage();
+        }});
+        renderPage();
       }});
     }})();
   </script>
@@ -3904,6 +4260,11 @@ def masternodes_html(
     current_items = [item for item in prepared_rows if not item["row"]["removed_at"]]
     enabled_count = sum(1 for item in current_items if item["status"].upper() == "ENABLED")
     banned_count = sum(1 for item in current_items if item["status"].upper() == "POSE_BANNED")
+    seniority_counts = {"Base": 0, "Level 1": 0, "Level 2": 0}
+    for item in current_items:
+        label = item["seniority"]["label"]
+        if label in seniority_counts:
+            seniority_counts[label] += 1
 
     def masternode_row_html(item: dict[str, Any], include_change: bool = False) -> str:
         row = item["row"]
@@ -3966,6 +4327,16 @@ def masternodes_html(
     change_items = sorted((item for item in prepared_rows if item["change_type"]), key=lambda item: item["change_sort"], reverse=True)
     new_setup_count = sum(1 for item in change_items if item["change_type"] == "New setup")
     taken_down_count = sum(1 for item in change_items if item["change_type"] == "Taken down")
+    last_setup_time = max(
+        (int(item["setup_time"] or item["change_sort"] or 0) for item in change_items if item["change_type"] == "New setup"),
+        default=0,
+    )
+    last_taken_down_time = max(
+        (int(item["taken_down_sort"] or item["change_sort"] or 0) for item in change_items if item["change_type"] == "Taken down"),
+        default=0,
+    )
+    last_setup_date = fmt_local_date(last_setup_time)
+    last_taken_down_date = fmt_local_date(last_taken_down_time)
     change_rows_html = "\n".join(masternode_row_html(item, include_change=True) for item in change_items)
     if not change_rows_html:
         change_rows_html = "<tr class='mn-empty'><td class='empty' colspan='6'>No new setups or takedowns since the banked snapshot.</td></tr>"
@@ -3974,6 +4345,47 @@ def masternodes_html(
     updated_text = fmt_iso_local_datetime(masternode_meta.get("synced_at") or store.get_meta("last_summary", {}).get("synced_at"))
     baseline_text = fmt_iso_local_datetime(baseline_iso) if baseline_iso else "not set"
     total_count = len(current_items)
+
+    def chart_legend(parts: list[tuple[str, int, str]], total: int) -> str:
+        rows = []
+        for label, count, color in parts:
+            percent = fmt_percent(count, total) if total else "0%"
+            rows.append(
+                "<li>"
+                f"<span class='legend-swatch' style='background:{html.escape(color)}'></span>"
+                f"<span>{html.escape(label)}</span>"
+                f"<strong>{count:,}</strong>"
+                f"<em>{html.escape(percent)}</em>"
+                "</li>"
+            )
+        return "".join(rows)
+
+    status_chart_parts = [
+        ("Enabled", enabled_count, "#2f7fb8"),
+        ("Banned", banned_count, "#c66a2e"),
+    ]
+    seniority_chart_parts = [
+        ("Base", seniority_counts["Base"], "#6f7d84"),
+        ("Level 1", seniority_counts["Level 1"], "#2b78b8"),
+        ("Level 2", seniority_counts["Level 2"], "#2b8a57"),
+    ]
+    status_legend = chart_legend(status_chart_parts, total_count)
+    seniority_legend = chart_legend(seniority_chart_parts, sum(seniority_counts.values()))
+    chart_data_json = json.dumps(
+        {
+            "status": {
+                "labels": [label for label, _, _ in status_chart_parts],
+                "values": [count for _, count, _ in status_chart_parts],
+                "colors": [color for _, _, color in status_chart_parts],
+            },
+            "seniority": {
+                "labels": [label for label, _, _ in seniority_chart_parts],
+                "values": [count for _, count, _ in seniority_chart_parts],
+                "colors": [color for _, _, color in seniority_chart_parts],
+            },
+        }
+    )
+    chart_data_json = chart_data_json.replace("</", "<\\/")
 
     return f"""<!doctype html>
 <html lang="en">
@@ -4001,6 +4413,19 @@ def masternodes_html(
     .metric {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; padding: 14px 16px; min-width: 0; }}
     .metric span {{ display: block; color: #687177; font-size: 0.84rem; margin-bottom: 6px; }}
     .metric b {{ display: block; font-size: clamp(1.25rem, 2vw, 1.65rem); line-height: 1.1; overflow-wrap: anywhere; }}
+    .metric small {{ color: #687177; display: block; font-size: 0.78rem; font-weight: 700; margin-top: 8px; }}
+    .metric small strong {{ color: #1c2227; font-weight: 800; }}
+    .chart-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }}
+    .chart-card {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; display: grid; gap: 12px; min-width: 0; padding: 18px; }}
+    .chart-card h2 {{ font-size: 1rem; margin: 0; }}
+    .chart-body {{ align-items: center; display: grid; gap: 20px; grid-template-columns: minmax(220px, 280px) minmax(0, 1fr); min-width: 0; }}
+    .chart-canvas-wrap {{ align-items: center; display: flex; height: 280px; justify-content: center; min-width: 0; overflow: visible; }}
+    .chart-canvas-wrap canvas {{ height: 280px !important; width: 280px !important; }}
+    .chart-legend {{ display: grid; flex: 1 1 auto; gap: 8px; list-style: none; margin: 0; min-width: 0; padding: 0; }}
+    .chart-legend li {{ align-items: center; display: grid; gap: 8px; grid-template-columns: 12px minmax(80px, 1fr) auto auto; }}
+    .legend-swatch {{ border-radius: 999px; display: inline-block; height: 12px; width: 12px; }}
+    .chart-legend span, .chart-legend em {{ color: #687177; font-size: 0.84rem; font-style: normal; }}
+    .chart-legend strong {{ font-size: 0.92rem; }}
     .panel-title {{ display: flex; align-items: end; justify-content: space-between; gap: 16px; }}
     .panel-title h2 {{ margin: 0; font-size: 1.25rem; }}
     .panel-title p {{ margin: 0; color: #687177; font-size: 0.9rem; }}
@@ -4051,6 +4476,10 @@ def masternodes_html(
     a {{ color: #086788; text-decoration: none; }}
     @media(max-width: 920px) {{
       .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .chart-grid {{ grid-template-columns: 1fr; }}
+      .chart-body {{ grid-template-columns: 1fr; }}
+      .chart-canvas-wrap {{ height: 250px; }}
+      .chart-canvas-wrap canvas {{ height: 250px !important; width: 250px !important; }}
       .panel-title {{ align-items: start; flex-direction: column; }}
       .table-controls {{ align-items: stretch; flex-direction: column; }}
       .search-control, .page-size-control {{ max-width: none; width: 100%; }}
@@ -4063,12 +4492,14 @@ def masternodes_html(
     @media (prefers-color-scheme: dark) {{
       body {{ background: #121619; color: #f3f4f6; }}
       .metric, .table-wrap, table {{ background: #1c2328; border-color: #334047; }}
+      .chart-card {{ background: #1c2328; border-color: #334047; }}
       .table-controls input, .table-controls select, .pager button {{ background: #1c2328; border-color: #46555e; color: #f3f4f6; }}
       th {{ background: #263139; }}
       th, td {{ border-color: #334047; }}
       a {{ color: #67d7ff; }}
       .subtitle {{ color: #b6c3c7; }}
-      .metric span, .panel-title p, .sort-icon, .empty, .table-controls label, .pager, .page-status {{ color: #a7b0b5; }}
+      .metric span, .metric small, .panel-title p, .sort-icon, .empty, .table-controls label, .pager, .page-status, .chart-legend span, .chart-legend em {{ color: #a7b0b5; }}
+      .metric small strong {{ color: #f3f4f6; }}
       .sort-button:hover, .sort-button:focus-visible {{ color: #67d7ff; }}
       .status.active {{ background: #15304a; color: #b9dcff; }}
       .status.down {{ background: #442d13; color: #ffd9a8; }}
@@ -4100,8 +4531,24 @@ def masternodes_html(
       <div class="metric"><span>Sentry Nodes</span><b>{total_count}</b></div>
       <div class="metric"><span>Enabled</span><b>{enabled_count}</b></div>
       <div class="metric"><span>Banned</span><b>{banned_count}</b></div>
-      <div class="metric"><span>New Setups</span><b>{new_setup_count}</b></div>
-      <div class="metric"><span>Taken Down</span><b>{taken_down_count}</b></div>
+      <div class="metric"><span>New Setups</span><b>{new_setup_count}</b><small>Last Setup: <strong>{html.escape(last_setup_date)}</strong></small></div>
+      <div class="metric"><span>Taken Down</span><b>{taken_down_count}</b><small>Last Taken Down: <strong>{html.escape(last_taken_down_date)}</strong></small></div>
+    </section>
+    <section class="chart-grid" aria-label="Sentry node charts">
+      <article class="chart-card">
+        <h2>Enabled vs Banned</h2>
+        <div class="chart-body">
+          <div class="chart-canvas-wrap"><canvas id="status-chart" aria-label="Enabled {enabled_count}, Banned {banned_count}" role="img"></canvas></div>
+          <ul class="chart-legend">{status_legend}</ul>
+        </div>
+      </article>
+      <article class="chart-card">
+        <h2>Seniority Amounts</h2>
+        <div class="chart-body">
+          <div class="chart-canvas-wrap"><canvas id="seniority-chart" aria-label="Base {seniority_counts['Base']}, Level 1 {seniority_counts['Level 1']}, Level 2 {seniority_counts['Level 2']}" role="img"></canvas></div>
+          <ul class="chart-legend">{seniority_legend}</ul>
+        </div>
+      </article>
     </section>
     <section>
       <div class="panel-title">
@@ -4119,9 +4566,11 @@ def masternodes_html(
             </select>
           </label>
           <div class="pager" aria-label="Changes since snapshot pagination">
+            <button id="mn-changes-first" type="button">First</button>
             <button id="mn-changes-prev" type="button">Prev</button>
             <span class="page-status" id="mn-changes-page-status">0 of 0</span>
             <button id="mn-changes-next" type="button">Next</button>
+            <button id="mn-changes-last" type="button">Last</button>
           </div>
         </div>
       </div>
@@ -4161,9 +4610,11 @@ def masternodes_html(
             </select>
           </label>
           <div class="pager" aria-label="Current sentry node pagination">
+            <button id="mn-current-first" type="button">First</button>
             <button id="mn-current-prev" type="button">Prev</button>
             <span class="page-status" id="mn-current-page-status">0 of 0</span>
             <button id="mn-current-next" type="button">Next</button>
+            <button id="mn-current-last" type="button">Last</button>
           </div>
         </div>
       </div>
@@ -4184,16 +4635,65 @@ def masternodes_html(
       </div>
     </section>
   </main>
+  <script src="{CHART_ASSET_ROUTE.lstrip('/')}"></script>
+  <script type="application/json" id="sentry-chart-data">{chart_data_json}</script>
   <script>
     (() => {{
+      const makeSentryChart = (id, data) => {{
+        const canvas = document.getElementById(id);
+        if (!canvas || !window.Chart || !data) return;
+        const total = data.values.reduce((sum, value) => sum + Number(value || 0), 0);
+        new Chart(canvas, {{
+          type: "pie",
+          data: {{
+            labels: data.labels,
+            datasets: [{{
+              data: data.values,
+              backgroundColor: data.colors,
+              borderColor: getComputedStyle(document.body).backgroundColor,
+              borderWidth: 2,
+              hoverOffset: 18,
+            }}],
+          }},
+          options: {{
+            animation: {{ duration: 450 }},
+            layout: {{ padding: 24 }},
+            maintainAspectRatio: false,
+            plugins: {{
+              legend: {{ display: false }},
+              tooltip: {{
+                backgroundColor: "rgba(20, 32, 38, 0.94)",
+                boxPadding: 5,
+                callbacks: {{
+                  label: (context) => {{
+                    const value = Number(context.parsed || 0);
+                    const percent = total ? ((value * 100) / total).toFixed(2) : "0.00";
+                    return ` ${{context.label}}: ${{value.toLocaleString()}} (${{percent}}%)`;
+                  }},
+                }},
+                padding: 10,
+              }},
+            }},
+          }},
+        }});
+      }};
+
+      try {{
+        const chartData = JSON.parse(document.getElementById("sentry-chart-data")?.textContent || "{{}}");
+        makeSentryChart("status-chart", chartData.status);
+        makeSentryChart("seniority-chart", chartData.seniority);
+      }} catch (_error) {{}}
+
       const setupPaginator = (config) => {{
         const table = document.querySelector(config.tableSelector);
         const searchInput = config.searchSelector ? document.querySelector(config.searchSelector) : null;
         const pageSizeSelect = document.querySelector(config.pageSizeSelector);
         const pageStatus = document.querySelector(config.statusSelector);
+        const firstButton = document.querySelector(config.firstSelector);
         const prevButton = document.querySelector(config.prevSelector);
         const nextButton = document.querySelector(config.nextSelector);
-        if (!table || !pageSizeSelect || !pageStatus || !prevButton || !nextButton) return null;
+        const lastButton = document.querySelector(config.lastSelector);
+        if (!table || !pageSizeSelect || !pageStatus || !firstButton || !prevButton || !nextButton || !lastButton) return null;
         let page = 1;
 
         const dataRows = () =>
@@ -4216,8 +4716,10 @@ def masternodes_html(
           table.querySelectorAll(".mn-empty").forEach((row) => {{ row.hidden = total !== 0; }});
           table.querySelectorAll(".mn-no-results").forEach((row) => {{ row.hidden = total !== 0; }});
           pageStatus.textContent = total ? `${{start + 1}}-${{end}} of ${{total}}` : "0 of 0";
+          firstButton.disabled = page <= 1 || total === 0;
           prevButton.disabled = page <= 1;
           nextButton.disabled = page >= totalPages;
+          lastButton.disabled = page >= totalPages || total === 0;
         }};
 
         searchInput?.addEventListener("input", () => {{
@@ -4225,6 +4727,10 @@ def masternodes_html(
           apply();
         }});
         pageSizeSelect.addEventListener("change", () => {{
+          page = 1;
+          apply();
+        }});
+        firstButton.addEventListener("click", () => {{
           page = 1;
           apply();
         }});
@@ -4236,6 +4742,13 @@ def masternodes_html(
           page += 1;
           apply();
         }});
+        lastButton.addEventListener("click", () => {{
+          const query = (searchInput?.value || "").trim().toLowerCase();
+          const pageSize = Number(pageSizeSelect.value) || 20;
+          const total = dataRows().filter((row) => !query || (row.dataset.search || "").includes(query)).length;
+          page = Math.max(1, Math.ceil(total / pageSize));
+          apply();
+        }});
 
         return {{ table, apply }};
       }};
@@ -4245,16 +4758,20 @@ def masternodes_html(
           tableSelector: ".mn-changes",
           pageSizeSelector: "#mn-changes-page-size",
           statusSelector: "#mn-changes-page-status",
+          firstSelector: "#mn-changes-first",
           prevSelector: "#mn-changes-prev",
           nextSelector: "#mn-changes-next",
+          lastSelector: "#mn-changes-last",
         }}),
         setupPaginator({{
           tableSelector: ".mn-current",
           searchSelector: "#mn-current-search",
           pageSizeSelector: "#mn-current-page-size",
           statusSelector: "#mn-current-page-status",
+          firstSelector: "#mn-current-first",
           prevSelector: "#mn-current-prev",
           nextSelector: "#mn-current-next",
+          lastSelector: "#mn-current-last",
         }}),
       ].filter(Boolean);
 
@@ -4429,6 +4946,19 @@ def serve(
 
         def send_page(self, include_body: bool = True) -> None:
             parsed = urllib.parse.urlparse(self.path)
+            if parsed.path == CHART_ASSET_ROUTE:
+                body = chart_asset_bytes()
+                if body is None:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/javascript; charset=utf-8")
+                self.send_header("Cache-Control", "public, max-age=86400")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if include_body:
+                    self.wfile.write(body)
+                return
             if parsed.path in LEGACY_MASTERNODE_PATHS:
                 self.redirect_to_sentry_node()
                 return

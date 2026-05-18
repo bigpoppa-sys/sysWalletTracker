@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
 os.chdir(ROOT)
 
 from syscoin_tracker import (  # noqa: E402
+    CHART_ASSET_ROUTE,
     DEFAULT_ADDRESS,
     DEFAULT_BLOCKBOOK_URL,
     DEFAULT_TIMEZONE,
@@ -35,6 +36,7 @@ from syscoin_tracker import (  # noqa: E402
     Store,
     SyscoinRpcClient,
     block_height_at_or_after,
+    chart_asset_bytes,
     dashboard_html,
     load_network_masternodes_csv,
     load_network_masternodes_csv_rows,
@@ -61,6 +63,8 @@ NODE_OUTPUTS_PATH = ROOT / "node_outputs.csv"
 INSTALL_BUNDLE_FILES = (
     "syscoin_tracker.py",
     "README.md",
+    "package.json",
+    "package-lock.json",
     "vercel.json",
     ".gitignore",
     ".vercelignore",
@@ -76,6 +80,7 @@ INSTALL_BUNDLE_FILES = (
     "node_outputs.csv",
     "verified_sentries.csv",
     "api/index.py",
+    "static/assets/chart.umd.js",
     "scripts/install_vps_cron.sh",
     "scripts/masternode_cron_sync.sh",
     "scripts/static_snapshot_cron.sh",
@@ -391,6 +396,20 @@ class handler(BaseHTTPRequestHandler):
 
     def send_dashboard(self, include_body: bool = True) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == CHART_ASSET_ROUTE:
+            body = chart_asset_bytes()
+            if body is None:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript; charset=utf-8")
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if include_body:
+                self.wfile.write(body)
+            return
+
         if parsed.path == "/sysWalletTracker-vps.tgz":
             self.send_install_bundle(include_body=include_body)
             return
