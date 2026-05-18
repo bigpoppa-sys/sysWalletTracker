@@ -970,6 +970,27 @@ class Store:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS top_wallet_cluster_utxos (
+                txid TEXT NOT NULL,
+                vout INTEGER NOT NULL,
+                address TEXT NOT NULL,
+                value_sats INTEGER NOT NULL,
+                block_height INTEGER NOT NULL,
+                block_time INTEGER,
+                PRIMARY KEY (txid, vout)
+            );
+
+            CREATE TABLE IF NOT EXISTS top_wallet_cluster_edges (
+                address_a TEXT NOT NULL,
+                address_b TEXT NOT NULL,
+                tx_count INTEGER NOT NULL DEFAULT 0,
+                first_seen_height INTEGER,
+                last_seen_height INTEGER,
+                last_seen_time INTEGER,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (address_a, address_b)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_movements_block
                 ON movements(block_height, block_time);
             CREATE INDEX IF NOT EXISTS idx_tracked_outputs_address
@@ -982,6 +1003,10 @@ class Store:
                 ON top_wallet_balances(balance_sats DESC);
             CREATE INDEX IF NOT EXISTS idx_top_wallet_utxos_address
                 ON top_wallet_utxos(address);
+            CREATE INDEX IF NOT EXISTS idx_top_wallet_cluster_utxos_address
+                ON top_wallet_cluster_utxos(address);
+            CREATE INDEX IF NOT EXISTS idx_top_wallet_cluster_edges_b
+                ON top_wallet_cluster_edges(address_b);
             """
         )
         self.ensure_network_masternode_columns()
@@ -1569,11 +1594,35 @@ def top_wallet_progress(store: Store) -> dict[str, Any]:
     return progress
 
 
+def top_wallet_cluster_progress(store: Store) -> dict[str, Any]:
+    progress = store.get_meta("top_wallet_cluster_index", {}) or {}
+    if "last_height" not in progress:
+        progress["last_height"] = -1
+    return progress
+
+
 def reset_top_wallet_index(store: Store, start_height: int = 0) -> None:
     store.conn.execute("DELETE FROM top_wallet_utxos")
     store.conn.execute("DELETE FROM top_wallet_balances")
     store.set_meta(
         "top_wallet_index",
+        {
+            "last_height": start_height - 1,
+            "last_hash": "",
+            "chain_height": None,
+            "synced_at": now_iso(),
+            "reset_at": now_iso(),
+        },
+        commit=False,
+    )
+    store.conn.commit()
+
+
+def reset_top_wallet_cluster_index(store: Store, start_height: int = 0) -> None:
+    store.conn.execute("DELETE FROM top_wallet_cluster_utxos")
+    store.conn.execute("DELETE FROM top_wallet_cluster_edges")
+    store.set_meta(
+        "top_wallet_cluster_index",
         {
             "last_height": start_height - 1,
             "last_hash": "",
@@ -1687,6 +1736,120 @@ def process_top_wallet_block(store: Store, block: dict[str, Any]) -> dict[str, i
     return stats
 
 
+def save_top_wallet_cluster_edge(
+    store: Store,
+    address_a: str,
+    address_b: str,
+    block_height: int,
+    block_time: int | None,
+) -> None:
+    if address_a == address_b:
+        return
+    left, right = sorted((address_a, address_b))
+    stamp = now_iso()
+    store.conn.execute(
+        """
+        INSERT INTO top_wallet_cluster_edges(
+            address_a, address_b, tx_count, first_seen_height, last_seen_height, last_seen_time, updated_at
+        )
+        VALUES(?, ?, 1, ?, ?, ?, ?)
+        ON CONFLICT(address_a, address_b) DO UPDATE SET
+            tx_count = top_wallet_cluster_edges.tx_count + 1,
+            first_seen_height = MIN(
+                COALESCE(top_wallet_cluster_edges.first_seen_height, excluded.first_seen_height),
+                excluded.first_seen_height
+            ),
+            last_seen_height = CASE
+                WHEN excluded.last_seen_height >= COALESCE(top_wallet_cluster_edges.last_seen_height, -1)
+                THEN excluded.last_seen_height
+                ELSE top_wallet_cluster_edges.last_seen_height
+            END,
+            last_seen_time = CASE
+                WHEN excluded.last_seen_height >= COALESCE(top_wallet_cluster_edges.last_seen_height, -1)
+                THEN excluded.last_seen_time
+                ELSE top_wallet_cluster_edges.last_seen_time
+            END,
+            updated_at = excluded.updated_at
+        """,
+        (left, right, block_height, block_height, block_time, stamp),
+    )
+
+
+def process_top_wallet_cluster_block(store: Store, block: dict[str, Any]) -> dict[str, int]:
+    block_height = int(block.get("height") or 0)
+    block_time = int_or_none(block.get("time"))
+    stats = {
+        "txs": 0,
+        "outputs": 0,
+        "spends": 0,
+        "missing_spends": 0,
+        "groups": 0,
+        "edges": 0,
+    }
+
+    for tx in block.get("tx") or []:
+        txid = tx.get("txid")
+        if not txid:
+            continue
+        stats["txs"] += 1
+        input_addresses: list[str] = []
+
+        for vin in tx.get("vin") or []:
+            if vin.get("coinbase"):
+                continue
+            prev_txid = vin.get("txid")
+            if not prev_txid:
+                continue
+            prev_vout = input_prev_vout(vin)
+            previous = store.conn.execute(
+                """
+                SELECT address
+                FROM top_wallet_cluster_utxos
+                WHERE txid = ? AND vout = ?
+                """,
+                (prev_txid, prev_vout),
+            ).fetchone()
+            if not previous:
+                stats["missing_spends"] += 1
+                continue
+            store.conn.execute(
+                "DELETE FROM top_wallet_cluster_utxos WHERE txid = ? AND vout = ?",
+                (prev_txid, prev_vout),
+            )
+            input_addresses.append(previous["address"])
+            stats["spends"] += 1
+
+        unique_input_addresses = sorted(set(input_addresses))
+        if len(unique_input_addresses) > 1:
+            anchor = unique_input_addresses[0]
+            for address in unique_input_addresses[1:]:
+                save_top_wallet_cluster_edge(store, anchor, address, block_height, block_time)
+                stats["edges"] += 1
+            stats["groups"] += 1
+
+        for vout in tx.get("vout") or []:
+            address = rpc_output_address(vout)
+            if not address:
+                continue
+            value_sats = rpc_output_sats(vout)
+            if value_sats <= 0:
+                continue
+            output_index = int(vout.get("n", 0) or 0)
+            cursor = store.conn.execute(
+                """
+                INSERT OR IGNORE INTO top_wallet_cluster_utxos(
+                    txid, vout, address, value_sats, block_height, block_time
+                )
+                VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (txid, output_index, address, value_sats, block_height, block_time),
+            )
+            if cursor.rowcount:
+                stats["outputs"] += 1
+
+    return stats
+
+
 def sync_top_wallet_index(
     store: Store,
     rpc: SyscoinRpcClient,
@@ -1763,6 +1926,259 @@ def sync_top_wallet_index(
     return totals
 
 
+def sync_top_wallet_cluster_index(
+    store: Store,
+    rpc: SyscoinRpcClient,
+    *,
+    start_height: int = 0,
+    max_blocks: int | None = None,
+    to_height: int | None = None,
+    reset: bool = False,
+    batch_size: int = 50,
+) -> dict[str, Any]:
+    if reset:
+        reset_top_wallet_cluster_index(store, start_height=start_height)
+
+    progress = top_wallet_cluster_progress(store)
+    last_height = int_or_none(progress.get("last_height"))
+    if last_height is None or last_height < start_height - 1:
+        last_height = start_height - 1
+    chain_height = int(rpc.call("getblockcount"))
+    target_height = min(chain_height, to_height if to_height is not None else chain_height)
+    if max_blocks is not None:
+        target_height = min(target_height, last_height + max_blocks)
+
+    totals = {
+        "blocks": 0,
+        "txs": 0,
+        "outputs": 0,
+        "spends": 0,
+        "missing_spends": 0,
+        "groups": 0,
+        "edges": 0,
+        "start_height": last_height + 1,
+        "last_height": last_height,
+        "target_height": target_height,
+        "chain_height": chain_height,
+    }
+    if target_height <= last_height:
+        progress.update({"chain_height": chain_height, "synced_at": now_iso()})
+        store.set_meta("top_wallet_cluster_index", progress)
+        return totals
+
+    batch_size = max(1, batch_size)
+    height = last_height + 1
+    while height <= target_height:
+        heights = list(range(height, min(target_height, height + batch_size - 1) + 1))
+        block_hashes = rpc.batch_call([("getblockhash", [item]) for item in heights])
+        blocks = rpc.batch_call([("getblock", [block_hash, 2]) for block_hash in block_hashes])
+
+        if len(block_hashes) != len(heights) or len(blocks) != len(heights):
+            raise RuntimeError("top wallet cluster RPC batch returned an unexpected number of results")
+
+        for block_height, block_hash, block in zip(heights, block_hashes, blocks):
+            previous_hash = progress.get("last_hash")
+            if block_height > 0 and previous_hash and block.get("previousblockhash") != previous_hash:
+                raise RuntimeError(
+                    "top wallet cluster index hit a chain reorg; rerun sync-top-wallet-clusters with --reset to rebuild"
+                )
+
+            store.conn.execute("BEGIN")
+            block_stats = process_top_wallet_cluster_block(store, block)
+            progress = {
+                "last_height": block_height,
+                "last_hash": block_hash,
+                "chain_height": chain_height,
+                "synced_at": now_iso(),
+            }
+            store.set_meta("top_wallet_cluster_index", progress, commit=False)
+            store.conn.commit()
+
+            totals["blocks"] += 1
+            totals["last_height"] = block_height
+            for key in ("txs", "outputs", "spends", "missing_spends", "groups", "edges"):
+                totals[key] += block_stats[key]
+
+        height = heights[-1] + 1
+
+    return totals
+
+
+class UnionFind:
+    def __init__(self) -> None:
+        self.parent: dict[str, str] = {}
+
+    def find(self, item: str) -> str:
+        parent = self.parent.setdefault(item, item)
+        if parent != item:
+            self.parent[item] = self.find(parent)
+        return self.parent[item]
+
+    def union(self, left: str, right: str) -> None:
+        left_root = self.find(left)
+        right_root = self.find(right)
+        if left_root == right_root:
+            return
+        if right_root < left_root:
+            left_root, right_root = right_root, left_root
+        self.parent[right_root] = left_root
+
+
+def top_wallet_cluster_snapshot(store: Store, limit: int = 100) -> dict[str, Any]:
+    progress = top_wallet_cluster_progress(store)
+    last_height = int_or_none(progress.get("last_height"))
+    chain_height = int_or_none(progress.get("chain_height"))
+    complete = bool(chain_height is not None and last_height is not None and last_height >= chain_height)
+    edge_totals = store.conn.execute(
+        """
+        SELECT COUNT(*) AS edges,
+               COALESCE(SUM(tx_count), 0) AS edge_observations
+        FROM top_wallet_cluster_edges
+        """
+    ).fetchone()
+    balance_rows = store.conn.execute(
+        """
+        SELECT address, balance_sats, utxo_count, last_seen_height, last_seen_time
+        FROM top_wallet_balances
+        WHERE balance_sats > 0
+        """
+    ).fetchall()
+    balance_total = sum(int(row["balance_sats"] or 0) for row in balance_rows)
+
+    if not edge_totals["edges"]:
+        return {
+            "generated_at": now_iso(),
+            "type": "estimated_wallet_clusters",
+            "stage": "common-input",
+            "limit": limit,
+            "index": {
+                "last_height": last_height,
+                "chain_height": chain_height,
+                "complete": complete,
+                "synced_at": progress.get("synced_at"),
+            },
+            "totals": {
+                "clusters": 0,
+                "funded_addresses": len(balance_rows),
+                "known_exchange_clusters": 0,
+                "estimated_private_holders": 0,
+                "balance_sats": balance_total,
+                "balance_sys": sats_to_sys_string(balance_total),
+                "known_exchange_sats": 0,
+                "known_exchange_sys": "0",
+                "private_unknown_sats": balance_total,
+                "private_unknown_sys": sats_to_sys_string(balance_total),
+                "edges": 0,
+                "edge_observations": 0,
+            },
+            "wallets": [],
+        }
+
+    union = UnionFind()
+    for row in store.conn.execute("SELECT address_a, address_b FROM top_wallet_cluster_edges"):
+        union.union(row["address_a"], row["address_b"])
+    member_counts: dict[str, int] = {}
+    for address in list(union.parent):
+        root = union.find(address)
+        member_counts[root] = member_counts.get(root, 0) + 1
+
+    exchange_tags = load_exchange_tags()
+    wallet_labels = load_wallet_labels()
+    clusters: dict[str, dict[str, Any]] = {}
+    for row in balance_rows:
+        address = row["address"]
+        root = union.find(address)
+        balance_sats = int(row["balance_sats"] or 0)
+        cluster = clusters.setdefault(
+            root,
+            {
+                "address": address,
+                "address_count": member_counts.get(root, 0),
+                "funded_address_count": 0,
+                "balance_sats": 0,
+                "utxo_count": 0,
+                "last_seen_height": None,
+                "last_seen_time": None,
+                "representative_balance_sats": -1,
+                "name": short_address(address),
+                "label": "Unknown",
+                "label_priority": 0,
+            },
+        )
+        cluster["funded_address_count"] += 1
+        if int(cluster["address_count"]) < int(cluster["funded_address_count"]):
+            cluster["address_count"] = int(cluster["funded_address_count"])
+        cluster["balance_sats"] += balance_sats
+        cluster["utxo_count"] += int(row["utxo_count"] or 0)
+        if balance_sats > int(cluster["representative_balance_sats"]):
+            cluster["address"] = address
+            cluster["representative_balance_sats"] = balance_sats
+        row_height = int_or_none(row["last_seen_height"])
+        if row_height is not None and row_height >= (int_or_none(cluster["last_seen_height"]) or -1):
+            cluster["last_seen_height"] = row_height
+            cluster["last_seen_time"] = row["last_seen_time"]
+
+        identity = wallet_identity_for_address(address, wallet_labels, exchange_tags)
+        label = identity["label"]
+        priority = 2 if label == "Exchange" else 1 if label != "Unknown" else 0
+        if priority > int(cluster["label_priority"]):
+            cluster["name"] = identity["name"]
+            cluster["label"] = label
+            cluster["label_priority"] = priority
+
+    ordered = sorted(clusters.values(), key=lambda item: (-int(item["balance_sats"]), str(item["address"])))
+    wallets = []
+    for rank, cluster in enumerate(ordered[:limit], 1):
+        balance_sats = int(cluster["balance_sats"])
+        wallets.append(
+            {
+                "rank": rank,
+                "name": cluster["name"],
+                "label": cluster["label"],
+                "address": cluster["address"],
+                "addresses": [cluster["address"]],
+                "address_count": int(cluster["address_count"]),
+                "balance_sats": balance_sats,
+                "balance_sys": sats_to_sys_string(balance_sats),
+                "utxo_count": int(cluster["utxo_count"]),
+                "last_seen_height": cluster["last_seen_height"],
+                "last_seen_time": cluster["last_seen_time"],
+                "percent_text": fmt_percent(balance_sats, balance_total),
+            }
+        )
+
+    known_exchange_clusters = sum(1 for item in clusters.values() if item["label"] == "Exchange")
+    known_exchange_sats = sum(int(item["balance_sats"]) for item in clusters.values() if item["label"] == "Exchange")
+    private_unknown_sats = balance_total - known_exchange_sats
+    return {
+        "generated_at": now_iso(),
+        "type": "estimated_wallet_clusters",
+        "stage": "common-input",
+        "limit": limit,
+        "index": {
+            "last_height": last_height,
+            "chain_height": chain_height,
+            "complete": complete,
+            "synced_at": progress.get("synced_at"),
+        },
+        "totals": {
+            "clusters": len(clusters),
+            "funded_addresses": len(balance_rows),
+            "known_exchange_clusters": known_exchange_clusters,
+            "estimated_private_holders": len(clusters) - known_exchange_clusters,
+            "balance_sats": balance_total,
+            "balance_sys": sats_to_sys_string(balance_total),
+            "known_exchange_sats": known_exchange_sats,
+            "known_exchange_sys": sats_to_sys_string(known_exchange_sats),
+            "private_unknown_sats": private_unknown_sats,
+            "private_unknown_sys": sats_to_sys_string(private_unknown_sats),
+            "edges": int(edge_totals["edges"] or 0),
+            "edge_observations": int(edge_totals["edge_observations"] or 0),
+        },
+        "wallets": wallets,
+    }
+
+
 def top_wallets_snapshot(store: Store, limit: int = 100) -> dict[str, Any]:
     progress = top_wallet_progress(store)
     exchange_tags = load_exchange_tags()
@@ -1828,6 +2244,7 @@ def top_wallets_snapshot(store: Store, limit: int = 100) -> dict[str, Any]:
             "utxos": int(totals["utxos"] or 0),
         },
         "wallets": wallets,
+        "estimated_clusters": top_wallet_cluster_snapshot(store, limit=limit),
     }
 
 
@@ -3056,7 +3473,7 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     def explorer_addr(addr: str) -> str:
         return f"https://explorer-blockbook.syscoin.org/address/{urllib.parse.quote(addr)}"
 
-    def render_wallet_row(row: dict[str, Any], *, mock: bool = False) -> str:
+    def render_wallet_row(row: dict[str, Any]) -> str:
         last_seen = fmt_table_datetime(row["last_seen_time"]) if row.get("last_seen_time") else "-"
         last_seen_full = fmt_local_datetime(row["last_seen_time"]) if row.get("last_seen_time") else ""
         address = row["address"]
@@ -3073,11 +3490,10 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
         )
         address_count = int(row.get("address_count") or 1)
         address_word = "address" if address_count == 1 else "addresses"
-        mock_badge = " <span class='mock-badge'>Mock</span>" if mock else ""
         return (
-            f"<tr class='{'mock-row' if mock else ''}'>"
+            "<tr>"
             f"<td class='rank' data-sort='{row['rank']}'>{row['rank']}</td>"
-            f"<td class='wallet-name' data-sort='{html.escape(name.lower())}'>{html.escape(name)}{mock_badge}</td>"
+            f"<td class='wallet-name' data-sort='{html.escape(name.lower())}'>{html.escape(name)}</td>"
             f"<td data-sort='{html.escape(label.lower())}'><span class='label-pill {label_class}'>{html.escape(label)}</span></td>"
             f"<td class='address-list' data-sort='{address_count}'><a href='{explorer_addr(address)}' title='{html.escape(address)}'>{address_count:,} {address_word}</a><span>{html.escape(short_address(address))}</span></td>"
             f"<td class='amount' data-sort='{balance_sats}' title='{html.escape(row['balance_sys'])} SYS'>{fmt_compact_sys(balance_sats)}</td>"
@@ -3087,127 +3503,31 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
         )
 
     rows = [render_wallet_row(row) for row in wallets]
-    showing_mock = False
     if not rows:
-        showing_mock = True
-        mock_wallets = [
-            {
-                "rank": 1,
-                "name": "Binance",
-                "label": "Exchange",
-                "address": DEFAULT_ADDRESS,
-                "address_count": 2,
-                "balance_sats": sys_to_sats("195580000"),
-                "balance_sys": "195580000",
-                "percent_text": "64.20%",
-                "last_seen_time": int(time.time()) - 300,
-            },
-            {
-                "rank": 2,
-                "name": "Bitget",
-                "label": "Exchange",
-                "address": "sys1qwhd5dz4mxkfwylg9jz4x56ggnc4z2d22u4l78w",
-                "address_count": 1,
-                "balance_sats": sys_to_sats("32600000"),
-                "balance_sys": "32600000",
-                "percent_text": "10.70%",
-                "last_seen_time": int(time.time()) - 1800,
-            },
-            {
-                "rank": 3,
-                "name": "Example Holder",
-                "label": "Private Wallet",
-                "address": "sys1qexampleholder0000000000000000000000000",
-                "address_count": 3,
-                "balance_sats": sys_to_sats("4200000"),
-                "balance_sys": "4200000",
-                "percent_text": "1.38%",
-                "last_seen_time": int(time.time()) - 7200,
-            },
-            {
-                "rank": 4,
-                "name": "Unknown Wallet",
-                "label": "Unknown",
-                "address": "sys1qunknownwallet00000000000000000000000",
-                "address_count": 1,
-                "balance_sats": sys_to_sats("820000"),
-                "balance_sys": "820000",
-                "percent_text": "0.27%",
-                "last_seen_time": int(time.time()) - 14400,
-            },
-        ]
-        rows = [render_wallet_row(row, mock=True) for row in mock_wallets]
+        rows = ["<tr><td class='empty' colspan='7'>No top wallet index data yet.</td></tr>"]
     rows_html = "\n".join(rows)
-    panel_status = "Mock preview until index starts" if showing_mock else f"Updated {html.escape(updated_text or '-')}"
-    mock_cluster_wallets = [
-        {
-            "rank": 1,
-            "name": "Binance",
-            "label": "Exchange",
-            "address": DEFAULT_ADDRESS,
-            "address_count": 5,
-            "balance_sats": sys_to_sats("248100000"),
-            "balance_sys": "248100000",
-            "percent_text": "44.70%",
-            "last_seen_time": int(time.time()) - 600,
-        },
-        {
-            "rank": 2,
-            "name": "Binance Cold Wallet",
-            "label": "Exchange",
-            "address": "SUBbe8vb7ng9CxZE9J3hma2CCkBh5VBHrv",
-            "address_count": 1,
-            "balance_sats": sys_to_sats("52520000"),
-            "balance_sys": "52520000",
-            "percent_text": "9.46%",
-            "last_seen_time": int(time.time()) - 86400,
-        },
-        {
-            "rank": 3,
-            "name": "Bitget",
-            "label": "Exchange",
-            "address": "sys1qwhd5dz4mxkfwylg9jz4x56ggnc4z2d22u4l78w",
-            "address_count": 3,
-            "balance_sats": sys_to_sats("32600000"),
-            "balance_sys": "32600000",
-            "percent_text": "5.87%",
-            "last_seen_time": int(time.time()) - 1800,
-        },
-        {
-            "rank": 4,
-            "name": "Gate",
-            "label": "Exchange",
-            "address": "ScM7oHdCXXZistSxPr7YjxyZ8tUf3HG8c2",
-            "address_count": 2,
-            "balance_sats": sys_to_sats("24040000"),
-            "balance_sys": "24040000",
-            "percent_text": "4.33%",
-            "last_seen_time": int(time.time()) - 2400,
-        },
-        {
-            "rank": 5,
-            "name": "Large Private Cluster",
-            "label": "Private Wallet",
-            "address": "sys1qexampleholder0000000000000000000000000",
-            "address_count": 12,
-            "balance_sats": sys_to_sats("11800000"),
-            "balance_sys": "11800000",
-            "percent_text": "2.13%",
-            "last_seen_time": int(time.time()) - 5400,
-        },
-        {
-            "rank": 6,
-            "name": "Unknown Cluster",
-            "label": "Unknown",
-            "address": "sys1qunknownwallet00000000000000000000000",
-            "address_count": 6,
-            "balance_sats": sys_to_sats("6300000"),
-            "balance_sys": "6300000",
-            "percent_text": "1.13%",
-            "last_seen_time": int(time.time()) - 7200,
-        },
-    ]
-    mock_cluster_rows_html = "\n".join(render_wallet_row(row, mock=True) for row in mock_cluster_wallets)
+    panel_status = f"Updated {html.escape(updated_text or '-')}"
+    cluster_snapshot = snapshot["estimated_clusters"]
+    cluster_wallets = cluster_snapshot["wallets"]
+    cluster_index = cluster_snapshot["index"]
+    cluster_totals = cluster_snapshot["totals"]
+    cluster_last_height = cluster_index.get("last_height")
+    cluster_chain_height = cluster_index.get("chain_height")
+    cluster_progress_text = (
+        f"{int(cluster_last_height):,} / {int(cluster_chain_height):,}"
+        if isinstance(cluster_last_height, int) and isinstance(cluster_chain_height, int)
+        else "not started"
+    )
+    cluster_status = (
+        "Common-input index complete"
+        if cluster_index.get("complete")
+        else f"Building common-input index: {cluster_progress_text}"
+        if cluster_last_height is not None and int(cluster_last_height) >= 0
+        else "Common-input index not started"
+    )
+    cluster_rows_html = "\n".join(render_wallet_row(row) for row in cluster_wallets)
+    if not cluster_rows_html:
+        cluster_rows_html = "<tr><td class='empty' colspan='7'>No estimated holder clusters yet. Run the common-input cluster index to build this table.</td></tr>"
 
     return f"""<!doctype html>
 <html lang="en">
@@ -3232,7 +3552,6 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     main {{ display: grid; gap: 22px; margin-top: 22px; margin-bottom: 22px; padding: 0; }}
     .metrics {{ display: grid; grid-template-columns: repeat(5, minmax(140px, 1fr)); gap: 12px; }}
     .metric {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; padding: 14px 16px; min-width: 0; }}
-    .metric.mock-metric {{ background: #fffaf0; }}
     .metric span {{ display: block; color: #687177; font-size: 0.84rem; margin-bottom: 6px; }}
     .metric b {{ display: block; font-size: clamp(1.2rem, 1.8vw, 1.55rem); line-height: 1.1; overflow-wrap: anywhere; }}
     .panel-title {{ display: flex; align-items: end; justify-content: space-between; gap: 16px; }}
@@ -3264,8 +3583,6 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     .label-pill.exchange {{ background: #e8f3ff; color: #14589c; }}
     .label-pill.private {{ background: #f4edff; color: #6840a3; }}
     .label-pill.unknown {{ background: #eef1ef; color: #596268; }}
-    .mock-row td {{ background: #fffaf0; }}
-    .mock-badge {{ background: #fff0c2; border-radius: 999px; color: #7a5400; display: inline-flex; font-size: 0.68rem; font-weight: 800; line-height: 1; margin-left: 6px; padding: 4px 7px; vertical-align: middle; }}
     .amount {{ font-weight: 800; white-space: nowrap; }}
     .empty {{ color: #687177; padding: 18px 14px; text-align: center; }}
     a {{ color: #086788; text-decoration: none; }}
@@ -3282,7 +3599,6 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     @media (prefers-color-scheme: dark) {{
       body {{ background: #121619; color: #f3f4f6; }}
       .metric, .table-wrap, table {{ background: #1c2328; border-color: #334047; }}
-      .metric.mock-metric {{ background: #302a1d; }}
       th {{ background: #263139; }}
       th, td {{ border-color: #334047; }}
       a {{ color: #67d7ff; }}
@@ -3291,8 +3607,6 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
       .label-pill.exchange {{ background: #173754; color: #9ed2ff; }}
       .label-pill.private {{ background: #352451; color: #d6bcff; }}
       .label-pill.unknown {{ background: #30383d; color: #c0c9ce; }}
-      .mock-row td {{ background: #302a1d; }}
-      .mock-badge {{ background: #4b3711; color: #ffd982; }}
       .sort-button:hover, .sort-button:focus-visible {{ color: #67d7ff; }}
     }}
   </style>
@@ -3303,7 +3617,7 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
       <div class="topbar">
         <div>
           <h1>Syscoin Top Wallets</h1>
-          <div class="subtitle">Stage 1 address balances from our own RPC index. Estimated wallet clustering comes next; labels are not proof of ownership.</div>
+          <div class="subtitle">Experimental on-chain forensics from our own RPC index. Labels and wallet clusters are estimates, not proof of ownership.</div>
         </div>
         <nav class="nav" aria-label="Dashboard pages">
           <a href="/">Wallet Flows</a>
@@ -3324,21 +3638,21 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     <section>
       <div class="panel-title">
         <h2>Phase 2 Holder Estimate</h2>
-        <p>Mock preview</p>
+        <p>{html.escape(cluster_status)}</p>
       </div>
-      <p class="phase-note">Draft layout only. These holder counts and grouped balances are mocked so we can tune the page before common-input clustering is wired into the indexer.</p>
+      <p class="phase-note">Common-input clustering estimate. Address balances are exact; holder grouping is a forensic estimate, not proof of ownership.</p>
       <div class="metrics">
-        <div class="metric mock-metric"><span>Estimated Holders</span><b>4,820</b></div>
-        <div class="metric mock-metric"><span>Known Exchange Clusters</span><b>7</b></div>
-        <div class="metric mock-metric"><span>Estimated Private Holders</span><b>4,780</b></div>
-        <div class="metric mock-metric"><span>Known Exchange SYS</span><b>365.8M SYS</b></div>
-        <div class="metric mock-metric"><span>Unknown SYS</span><b>189.2M SYS</b></div>
+        <div class="metric"><span>Estimated Holders</span><b>{int(cluster_totals['clusters']):,}</b></div>
+        <div class="metric"><span>Known Exchange Clusters</span><b>{int(cluster_totals['known_exchange_clusters']):,}</b></div>
+        <div class="metric"><span>Estimated Private Holders</span><b>{int(cluster_totals['estimated_private_holders']):,}</b></div>
+        <div class="metric"><span>Known Exchange SYS</span><b title="{html.escape(cluster_totals['known_exchange_sys'])} SYS">{fmt_compact_sys(int(cluster_totals['known_exchange_sats']))}</b></div>
+        <div class="metric"><span>Private / Unknown SYS</span><b title="{html.escape(cluster_totals['private_unknown_sys'])} SYS">{fmt_compact_sys(int(cluster_totals['private_unknown_sats']))}</b></div>
       </div>
     </section>
     <section>
       <div class="panel-title">
         <h2>Estimated Holder Clusters</h2>
-        <p>Mock rows</p>
+        <p>{int(cluster_totals['edges']):,} common-input links</p>
       </div>
       <div class="table-wrap">
         <table class="sortable-wallet-table">
@@ -3353,7 +3667,7 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
               <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Last Change<span class="sort-icon" aria-hidden="true"></span></button></th>
             </tr>
           </thead>
-          <tbody>{mock_cluster_rows_html}</tbody>
+          <tbody>{cluster_rows_html}</tbody>
         </table>
       </div>
     </section>
@@ -4157,6 +4471,15 @@ def build_parser() -> argparse.ArgumentParser:
     top_wallet_p.add_argument("--json", type=Path, default=Path(TOP_WALLETS_JSON), help="Write top-wallet snapshot JSON")
     top_wallet_p.add_argument("--batch-size", type=int, default=50, help="RPC blocks to fetch per batch")
 
+    cluster_p = sub.add_parser("sync-top-wallet-clusters", help="Build estimated holder clusters from common-input history")
+    cluster_p.add_argument("--start-height", type=int, default=0, help="Height to start from when the cluster index is empty or reset")
+    cluster_p.add_argument("--to-height", type=int, help="Stop at this block height")
+    cluster_p.add_argument("--max-blocks", type=int, default=1000, help="Maximum blocks to index in this run")
+    cluster_p.add_argument("--reset", action="store_true", help="Clear the top-wallet cluster index before syncing")
+    cluster_p.add_argument("--top", type=int, default=100, help="Number of estimated clusters to include in the JSON snapshot")
+    cluster_p.add_argument("--json", type=Path, help="Write estimated cluster snapshot JSON")
+    cluster_p.add_argument("--batch-size", type=int, default=50, help="RPC blocks to fetch per batch")
+
     static_p = sub.add_parser("publish-static", help="Sync data and write pre-rendered dashboard pages")
     static_p.add_argument("--output-dir", type=Path, required=True, help="Directory to publish static HTML/data files")
     static_p.add_argument("--since-date", default="2026-04-14 12:30", help="Only show dashboard movements from this date/time")
@@ -4303,6 +4626,32 @@ def main(argv: list[str] | None = None) -> int:
             f"missing_spends={stats['missing_spends']} "
             f"height={stats['last_height']}/{stats['chain_height']} "
             f"top_addresses={len(snapshot['wallets'])}"
+        )
+        return 0
+
+    if args.command == "sync-top-wallet-clusters":
+        rpc = build_rpc_client(args)
+        if rpc is None:
+            print("No RPC URL/host supplied. Use --rpc-host/--rpc-url or SYS_RPC_URL.")
+            return 1
+        stats = sync_top_wallet_cluster_index(
+            store,
+            rpc,
+            start_height=args.start_height,
+            max_blocks=args.max_blocks,
+            to_height=args.to_height,
+            reset=args.reset,
+            batch_size=args.batch_size,
+        )
+        snapshot = top_wallet_cluster_snapshot(store, limit=args.top)
+        if args.json:
+            atomic_write_json(args.json, snapshot)
+        print(
+            f"Indexed top wallet clusters blocks={stats['blocks']} txs={stats['txs']} "
+            f"outputs={stats['outputs']} spends={stats['spends']} "
+            f"missing_spends={stats['missing_spends']} groups={stats['groups']} "
+            f"edges={stats['edges']} height={stats['last_height']}/{stats['chain_height']} "
+            f"clusters={snapshot['totals']['clusters']}"
         )
         return 0
 

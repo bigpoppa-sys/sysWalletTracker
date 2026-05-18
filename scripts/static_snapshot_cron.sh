@@ -37,6 +37,8 @@ fi
 : "${SYS_TOP_WALLET_MAX_BLOCKS:=0}"
 : "${SYS_TOP_WALLET_TOP:=100}"
 : "${SYS_TOP_WALLET_BATCH_SIZE:=50}"
+: "${SYS_TOP_WALLET_CLUSTER_MAX_BLOCKS:=0}"
+: "${SYS_TOP_WALLET_CLUSTER_BATCH_SIZE:=50}"
 
 {
   printf '\n[%s] static snapshot sync\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -51,6 +53,17 @@ fi
       --top "$SYS_TOP_WALLET_TOP" \
       --batch-size "$SYS_TOP_WALLET_BATCH_SIZE" \
       --json "$PUBLIC_DIR/top-wallets.json"
+  fi
+  if [ "$SYS_TOP_WALLET_CLUSTER_MAX_BLOCKS" -gt 0 ]; then
+    python3 syscoin_tracker.py \
+      --rpc-url "$SYS_RPC_URL" \
+      --rpc-user "$SYS_RPC_USER" \
+      --rpc-password "$SYS_RPC_PASSWORD" \
+      sync-top-wallet-clusters \
+      --max-blocks "$SYS_TOP_WALLET_CLUSTER_MAX_BLOCKS" \
+      --top "$SYS_TOP_WALLET_TOP" \
+      --batch-size "$SYS_TOP_WALLET_CLUSTER_BATCH_SIZE" \
+      --json "$PUBLIC_DIR/top-wallet-clusters.json"
   fi
   python3 syscoin_tracker.py \
     --rpc-url "$SYS_RPC_URL" \

@@ -28,7 +28,7 @@ The dashboard has two pages:
 
 - `/` tracks Binance hot-wallet recipient flows.
 - `/sentrynode` tracks the current network sentry node list from RPC, setup/takedown dates, moved collateral destination, and exchange label when the moved-to address is known.
-- `/top-wallets` shows the top 100 exact address balances from the local RPC-derived UTXO index. `/top-wallets.json` exposes the same prebuilt data. This is Stage 1 address ranking, not wallet clustering yet.
+- `/top-wallets` shows the top 100 exact address balances from the local RPC-derived UTXO index and, when enabled, estimated holder clusters built from common-input history. `/top-wallets.json` exposes the same prebuilt data.
 
 Manual top-wallet names can be added to `wallet_labels.csv` with
 `address,name,label`; for example, use labels such as `Exchange` or
@@ -192,6 +192,9 @@ Set `SYS_TOP_WALLET_MAX_BLOCKS` in `$HOME/sysWalletTracker/.env` to index top-wa
 blocks during each cron run; leave it at `0` to only publish the latest existing
 top-wallet snapshot. `SYS_TOP_WALLET_BATCH_SIZE` controls how many blocks are
 fetched per RPC batch.
+Set `SYS_TOP_WALLET_CLUSTER_MAX_BLOCKS` to backfill estimated holder clusters in
+chunks during the same cron run. This builds common-input links from historical
+transactions and does not reset the exact address-balance index.
 
 `verify-sentries` compares exact 100,000 SYS candidates against
 Syscoin Core `masternode_list` outpoints. If RPC is only bound locally on a remote node, use an
