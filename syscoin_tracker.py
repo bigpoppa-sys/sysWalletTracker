@@ -2864,7 +2864,8 @@ def masternodes_html(
     .table-controls input, .table-controls select {{ background: #fff; border: 1px solid #cfd7d1; border-radius: 6px; color: #1c2227; font: inherit; min-height: 36px; padding: 7px 9px; }}
     .search-control {{ flex: 1 1 300px; max-width: 520px; }}
     .page-size-control {{ width: 110px; }}
-    .pager {{ align-items: center; color: #687177; display: flex; gap: 8px; margin-left: auto; }}
+    .pagination-controls {{ align-items: end; display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; margin-left: auto; }}
+    .pager {{ align-items: center; color: #687177; display: flex; gap: 8px; }}
     .pager button {{ background: #fff; border: 1px solid #cfd7d1; border-radius: 6px; color: #1c2227; cursor: pointer; font: inherit; min-height: 36px; padding: 7px 10px; }}
     .pager button:disabled {{ cursor: default; opacity: 0.45; }}
     .page-status {{ color: #687177; font-size: 0.86rem; min-width: 96px; text-align: center; }}
@@ -2908,7 +2909,8 @@ def masternodes_html(
       .panel-title {{ align-items: start; flex-direction: column; }}
       .table-controls {{ align-items: stretch; flex-direction: column; }}
       .search-control, .page-size-control {{ max-width: none; width: 100%; }}
-      .pager {{ margin-left: 0; }}
+      .pagination-controls {{ align-items: stretch; flex-direction: column; margin-left: 0; width: 100%; }}
+      .pager {{ justify-content: space-between; }}
       .topbar {{ align-items: start; flex-direction: column; }}
       .nav {{ justify-content: flex-start; }}
       .header-inner, main {{ margin-left: 12px; margin-right: 12px; }}
@@ -2961,18 +2963,20 @@ def masternodes_html(
         <p>Snapshot banked {html.escape(baseline_text)}</p>
       </div>
       <div class="table-controls" aria-label="Changes since snapshot table controls">
-        <label class="page-size-control" for="mn-changes-page-size">
-          <span>Rows</span>
-          <select id="mn-changes-page-size">
-            <option value="20">20</option>
-            <option value="50" selected>50</option>
-            <option value="100">100</option>
-          </select>
-        </label>
-        <div class="pager" aria-label="Changes since snapshot pagination">
-          <button id="mn-changes-prev" type="button">Prev</button>
-          <span class="page-status" id="mn-changes-page-status">0 of 0</span>
-          <button id="mn-changes-next" type="button">Next</button>
+        <div class="pagination-controls">
+          <label class="page-size-control" for="mn-changes-page-size">
+            <span>Rows</span>
+            <select id="mn-changes-page-size">
+              <option value="20" selected>20</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+          </label>
+          <div class="pager" aria-label="Changes since snapshot pagination">
+            <button id="mn-changes-prev" type="button">Prev</button>
+            <span class="page-status" id="mn-changes-page-status">0 of 0</span>
+            <button id="mn-changes-next" type="button">Next</button>
+          </div>
         </div>
       </div>
       <div class="table-wrap">
@@ -3001,18 +3005,20 @@ def masternodes_html(
           <span>Search</span>
           <input id="mn-current-search" type="search" placeholder="IP or collateral address" autocomplete="off">
         </label>
-        <label class="page-size-control" for="mn-current-page-size">
-          <span>Rows</span>
-          <select id="mn-current-page-size">
-            <option value="20">20</option>
-            <option value="50" selected>50</option>
-            <option value="100">100</option>
-          </select>
-        </label>
-        <div class="pager" aria-label="Current sentry node pagination">
-          <button id="mn-current-prev" type="button">Prev</button>
-          <span class="page-status" id="mn-current-page-status">0 of 0</span>
-          <button id="mn-current-next" type="button">Next</button>
+        <div class="pagination-controls">
+          <label class="page-size-control" for="mn-current-page-size">
+            <span>Rows</span>
+            <select id="mn-current-page-size">
+              <option value="20" selected>20</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+          </label>
+          <div class="pager" aria-label="Current sentry node pagination">
+            <button id="mn-current-prev" type="button">Prev</button>
+            <span class="page-status" id="mn-current-page-status">0 of 0</span>
+            <button id="mn-current-next" type="button">Next</button>
+          </div>
         </div>
       </div>
       <div class="table-wrap">
@@ -3051,7 +3057,7 @@ def masternodes_html(
 
         const apply = () => {{
           const query = (searchInput?.value || "").trim().toLowerCase();
-          const pageSize = Number(pageSizeSelect.value) || 50;
+          const pageSize = Number(pageSizeSelect.value) || 20;
           const rows = dataRows();
           const matchedRows = rows.filter((row) => !query || (row.dataset.search || "").includes(query));
           const total = matchedRows.length;
