@@ -23,6 +23,18 @@
       "destination": "/api/index.py"
     },
     {
+      "source": "/top-wallets",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/top-wallets.html",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/top-wallets.json",
+      "destination": "/api/index.py"
+    },
+    {
       "source": "/masternodes",
       "destination": "/api/index.py"
     },

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import os
 import ssl
 import sys
@@ -27,6 +28,9 @@ from syscoin_tracker import (  # noqa: E402
     LEGACY_MASTERNODE_PATHS,
     SENTRY_COLLATERAL_SATS,
     SENTRY_NODE_PATHS,
+    TOP_WALLETS_JSON,
+    TOP_WALLETS_JSON_PATH,
+    TOP_WALLETS_PATHS,
     BlockbookClient,
     Store,
     SyscoinRpcClient,
@@ -42,6 +46,8 @@ from syscoin_tracker import (  # noqa: E402
     sync_address,
     sync_network_masternodes,
     sys_to_sats,
+    top_wallets_snapshot,
+    top_wallets_html,
 )
 
 
@@ -65,6 +71,7 @@ INSTALL_BUNDLE_FILES = (
     "exchange_cold_wallets.csv",
     "exchange_routes.csv",
     "exchange_tags.csv",
+    "wallet_labels.csv",
     "network_masternodes.csv",
     "node_outputs.csv",
     "verified_sentries.csv",
@@ -231,7 +238,14 @@ def fetch_static_page(path: str, *, force: bool = False) -> bytes | None:
     base_url = os.getenv("SYS_TRACKER_STATIC_BASE_URL", DEFAULT_STATIC_BASE_URL).strip().rstrip("/")
     if not base_url or base_url.lower() in {"0", "false", "none", "off"}:
         return None
-    page_name = "sentrynode.html" if path in (*SENTRY_NODE_PATHS, *LEGACY_MASTERNODE_PATHS) else "index.html"
+    if path in (*SENTRY_NODE_PATHS, *LEGACY_MASTERNODE_PATHS):
+        page_name = "sentrynode.html"
+    elif path in TOP_WALLETS_PATHS:
+        page_name = "top-wallets.html"
+    elif path == TOP_WALLETS_JSON_PATH:
+        page_name = TOP_WALLETS_JSON
+    else:
+        page_name = "index.html"
     url = f"{base_url}/{page_name}"
     cache_ttl = env_int("SYS_TRACKER_STATIC_CACHE_SECONDS", 30)
     cache_key = f"{base_url}/{page_name}"
@@ -381,16 +395,17 @@ class handler(BaseHTTPRequestHandler):
             self.redirect_to_sentry_node()
             return
 
-        if parsed.path not in ("/", "/index.html", "/api/index.py", *SENTRY_NODE_PATHS):
+        if parsed.path not in ("/", "/index.html", "/api/index.py", *SENTRY_NODE_PATHS, *TOP_WALLETS_PATHS, TOP_WALLETS_JSON_PATH):
             self.send_error(404)
             return
 
         force = urllib.parse.parse_qs(parsed.query).get("force", ["0"])[0] == "1"
+        content_type = "application/json; charset=utf-8" if parsed.path == TOP_WALLETS_JSON_PATH else "text/html; charset=utf-8"
         try:
             static_body = fetch_static_page(parsed.path, force=force)
             if static_body is not None:
                 self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Type", content_type)
                 cache_header = (
                     "no-store"
                     if force
@@ -412,6 +427,13 @@ class handler(BaseHTTPRequestHandler):
                     since_label=label,
                     refresh_seconds=env_int("SYS_TRACKER_SYNC_INTERVAL", 60),
                 )
+            elif parsed.path in TOP_WALLETS_PATHS:
+                html_body = top_wallets_html(
+                    store,
+                    refresh_seconds=env_int("SYS_TRACKER_SYNC_INTERVAL", 60),
+                )
+            elif parsed.path == TOP_WALLETS_JSON_PATH:
+                html_body = json.dumps(top_wallets_snapshot(store), indent=2)
             else:
                 html_body = dashboard_html(
                     store,
@@ -421,7 +443,7 @@ class handler(BaseHTTPRequestHandler):
                 )
             body = html_body.encode("utf-8")
             self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Type", content_type)
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()

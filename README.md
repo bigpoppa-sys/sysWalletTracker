@@ -28,6 +28,11 @@ The dashboard has two pages:
 
 - `/` tracks Binance hot-wallet recipient flows.
 - `/sentrynode` tracks the current network sentry node list from RPC, setup/takedown dates, moved collateral destination, and exchange label when the moved-to address is known.
+- `/top-wallets` shows the top 100 exact address balances from the local RPC-derived UTXO index. `/top-wallets.json` exposes the same prebuilt data. This is Stage 1 address ranking, not wallet clustering yet.
+
+Manual top-wallet names can be added to `wallet_labels.csv` with
+`address,name,label`; for example, use labels such as `Exchange` or
+`Private Wallet`. Known exchange names still come from `exchange_tags.csv`.
 
 ## Vercel
 
@@ -139,6 +144,7 @@ export SYS_RPC_USER="your-user"
 export SYS_RPC_PASSWORD="your-password"
 python3 syscoin_tracker.py rpc-check
 python3 syscoin_tracker.py sync-masternodes --csv network_masternodes.csv
+python3 syscoin_tracker.py sync-top-wallets --max-blocks 1000 --batch-size 50 --json top-wallets.json
 python3 syscoin_tracker.py verify-sentries --since-date "2026-04-14 12:30"
 ```
 
@@ -182,6 +188,10 @@ SYS_RPC_URL="http://127.0.0.1:8370/" \
 
 Cron logs go to `$HOME/sysWalletTracker/logs/static_snapshot_cron.log`. The cron job
 uses a lock so a slow RPC check cannot overlap the next minute's run.
+Set `SYS_TOP_WALLET_MAX_BLOCKS` in `$HOME/sysWalletTracker/.env` to index top-wallet
+blocks during each cron run; leave it at `0` to only publish the latest existing
+top-wallet snapshot. `SYS_TOP_WALLET_BATCH_SIZE` controls how many blocks are
+fetched per RPC batch.
 
 `verify-sentries` compares exact 100,000 SYS candidates against
 Syscoin Core `masternode_list` outpoints. If RPC is only bound locally on a remote node, use an

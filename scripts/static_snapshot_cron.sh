@@ -34,9 +34,24 @@ fi
 : "${SYS_BLOCKBOOK_URL:=https://explorer-blockbook.syscoin.org}"
 : "${SYS_TRACKER_SINCE_DATE:=2026-04-14 12:30}"
 : "${SYS_TRACKER_FROM_HEIGHT:=2221358}"
+: "${SYS_TOP_WALLET_MAX_BLOCKS:=0}"
+: "${SYS_TOP_WALLET_TOP:=100}"
+: "${SYS_TOP_WALLET_BATCH_SIZE:=50}"
 
 {
   printf '\n[%s] static snapshot sync\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  mkdir -p "$PUBLIC_DIR"
+  if [ "$SYS_TOP_WALLET_MAX_BLOCKS" -gt 0 ]; then
+    python3 syscoin_tracker.py \
+      --rpc-url "$SYS_RPC_URL" \
+      --rpc-user "$SYS_RPC_USER" \
+      --rpc-password "$SYS_RPC_PASSWORD" \
+      sync-top-wallets \
+      --max-blocks "$SYS_TOP_WALLET_MAX_BLOCKS" \
+      --top "$SYS_TOP_WALLET_TOP" \
+      --batch-size "$SYS_TOP_WALLET_BATCH_SIZE" \
+      --json "$PUBLIC_DIR/top-wallets.json"
+  fi
   python3 syscoin_tracker.py \
     --rpc-url "$SYS_RPC_URL" \
     --rpc-user "$SYS_RPC_USER" \

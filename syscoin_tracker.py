@@ -55,12 +55,17 @@ DEFAULT_EXCHANGE_TAGS_PATH = Path("exchange_tags.csv")
 DEFAULT_EXCHANGE_ROUTES_PATH = Path("exchange_routes.csv")
 DEFAULT_EXCHANGE_HOT_WALLETS_PATH = Path("exchange_hot_wallets.csv")
 DEFAULT_EXCHANGE_COLD_WALLETS_PATH = Path("exchange_cold_wallets.csv")
+DEFAULT_WALLET_LABELS_PATH = Path("wallet_labels.csv")
 DEFAULT_NETWORK_MASTERNODES_PATH = Path("network_masternodes.csv")
 DEFAULT_NODE_OUTPUTS_PATH = Path("node_outputs.csv")
 DEFAULT_VERIFIED_SENTRIES_PATH = Path("verified_sentries.csv")
 DEFAULT_MONITORING_FROM_HEIGHT = 2221358
 SENTRY_NODE_PATHS = ("/sentrynode", "/sentrynode.html")
 LEGACY_MASTERNODE_PATHS = ("/masternodes", "/masternodes.html")
+TOP_WALLETS_PATHS = ("/top-wallets", "/top-wallets.html")
+TOP_WALLETS_JSON = "top-wallets.json"
+TOP_WALLETS_HTML = "top-wallets.html"
+TOP_WALLETS_JSON_PATH = f"/{TOP_WALLETS_JSON}"
 NETWORK_MASTERNODE_HEADERS = [
     "outpoint",
     "source_txid",
@@ -207,6 +212,40 @@ def load_exchange_tags(path: Path = DEFAULT_EXCHANGE_TAGS_PATH) -> dict[str, str
         }
 
 
+def load_wallet_labels(path: Path = DEFAULT_WALLET_LABELS_PATH) -> dict[str, dict[str, str]]:
+    if not path.exists():
+        return {}
+    labels: dict[str, dict[str, str]] = {}
+    with path.open(newline="") as f:
+        for row in csv.DictReader(f):
+            address = (row.get("address") or "").strip()
+            if not address:
+                continue
+            labels[address] = {
+                "name": (row.get("name") or "").strip(),
+                "label": (row.get("label") or "").strip(),
+            }
+    return labels
+
+
+def wallet_identity_for_address(
+    address: str,
+    wallet_labels: dict[str, dict[str, str]],
+    exchange_tags: dict[str, str],
+) -> dict[str, str]:
+    custom = wallet_labels.get(address)
+    if custom:
+        name = custom.get("name") or short_address(address)
+        label = custom.get("label") or "Private Wallet"
+        return {"name": name, "label": label}
+
+    exchange_name = exchange_tags.get(address)
+    if exchange_name:
+        return {"name": exchange_name, "label": "Exchange"}
+
+    return {"name": short_address(address), "label": "Unknown"}
+
+
 def load_exchange_routes(path: Path = DEFAULT_EXCHANGE_ROUTES_PATH) -> dict[str, str]:
     if not path.exists():
         return {}
@@ -273,6 +312,10 @@ def sys_to_sats(value: str | None) -> int:
     if value is None:
         return 0
     return int(Decimal(value.replace(",", "")) * SATOSHI)
+
+
+def sats_to_sys_string(value: int) -> str:
+    return fmt_sys(value)
 
 
 def parse_since_date(value: str | None, timezone_name: str) -> tuple[int | None, str | None]:
@@ -899,6 +942,25 @@ class Store:
                 moved_to_address TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS top_wallet_utxos (
+                txid TEXT NOT NULL,
+                vout INTEGER NOT NULL,
+                address TEXT NOT NULL,
+                value_sats INTEGER NOT NULL,
+                block_height INTEGER NOT NULL,
+                block_time INTEGER,
+                PRIMARY KEY (txid, vout)
+            );
+
+            CREATE TABLE IF NOT EXISTS top_wallet_balances (
+                address TEXT PRIMARY KEY,
+                balance_sats INTEGER NOT NULL DEFAULT 0,
+                utxo_count INTEGER NOT NULL DEFAULT 0,
+                last_seen_height INTEGER,
+                last_seen_time INTEGER,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_movements_block
                 ON movements(block_height, block_time);
             CREATE INDEX IF NOT EXISTS idx_tracked_outputs_address
@@ -907,6 +969,10 @@ class Store:
                 ON tracked_outputs(spent, spent_txid);
             CREATE INDEX IF NOT EXISTS idx_network_masternodes_status
                 ON network_masternodes(status);
+            CREATE INDEX IF NOT EXISTS idx_top_wallet_balances_balance
+                ON top_wallet_balances(balance_sats DESC);
+            CREATE INDEX IF NOT EXISTS idx_top_wallet_utxos_address
+                ON top_wallet_utxos(address);
             """
         )
         self.ensure_network_masternode_columns()
@@ -923,13 +989,14 @@ class Store:
             if name not in columns:
                 self.conn.execute(f"ALTER TABLE network_masternodes ADD COLUMN {definition}")
 
-    def set_meta(self, key: str, value: Any) -> None:
+    def set_meta(self, key: str, value: Any, commit: bool = True) -> None:
         self.conn.execute(
             "INSERT INTO metadata(key, value) VALUES(?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, json.dumps(value)),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def get_meta(self, key: str, default: Any = None) -> Any:
         row = self.conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
@@ -1464,6 +1531,292 @@ def sync_network_masternodes(
     }
     store.set_meta("last_masternode_sync", {"synced_at": synced_at, **stats})
     return stats
+
+
+def rpc_output_address(vout: dict[str, Any]) -> str | None:
+    script = vout.get("scriptPubKey") or {}
+    address = script.get("address")
+    if address:
+        return str(address)
+    addresses = script.get("addresses") or []
+    if isinstance(addresses, str):
+        return addresses
+    if isinstance(addresses, list) and len(addresses) == 1 and addresses[0]:
+        return str(addresses[0])
+    return None
+
+
+def rpc_output_sats(vout: dict[str, Any]) -> int:
+    value = vout.get("value")
+    if value is None:
+        return 0
+    return sys_to_sats(str(value))
+
+
+def top_wallet_progress(store: Store) -> dict[str, Any]:
+    progress = store.get_meta("top_wallet_index", {}) or {}
+    if "last_height" not in progress:
+        progress["last_height"] = -1
+    return progress
+
+
+def reset_top_wallet_index(store: Store, start_height: int = 0) -> None:
+    store.conn.execute("DELETE FROM top_wallet_utxos")
+    store.conn.execute("DELETE FROM top_wallet_balances")
+    store.set_meta(
+        "top_wallet_index",
+        {
+            "last_height": start_height - 1,
+            "last_hash": "",
+            "chain_height": None,
+            "synced_at": now_iso(),
+            "reset_at": now_iso(),
+        },
+        commit=False,
+    )
+    store.conn.commit()
+
+
+def adjust_top_wallet_balance(
+    store: Store,
+    address: str,
+    delta_sats: int,
+    delta_utxos: int,
+    block_height: int,
+    block_time: int | None,
+) -> None:
+    stamp = now_iso()
+    store.conn.execute(
+        """
+        INSERT INTO top_wallet_balances(
+            address, balance_sats, utxo_count, last_seen_height, last_seen_time, updated_at
+        )
+        VALUES(?, ?, ?, ?, ?, ?)
+        ON CONFLICT(address) DO UPDATE SET
+            balance_sats = top_wallet_balances.balance_sats + excluded.balance_sats,
+            utxo_count = top_wallet_balances.utxo_count + excluded.utxo_count,
+            last_seen_height = CASE
+                WHEN excluded.last_seen_height >= COALESCE(top_wallet_balances.last_seen_height, -1)
+                THEN excluded.last_seen_height
+                ELSE top_wallet_balances.last_seen_height
+            END,
+            last_seen_time = CASE
+                WHEN excluded.last_seen_height >= COALESCE(top_wallet_balances.last_seen_height, -1)
+                THEN excluded.last_seen_time
+                ELSE top_wallet_balances.last_seen_time
+            END,
+            updated_at = excluded.updated_at
+        """,
+        (address, delta_sats, delta_utxos, block_height, block_time, stamp),
+    )
+
+
+def process_top_wallet_block(store: Store, block: dict[str, Any]) -> dict[str, int]:
+    block_height = int(block.get("height") or 0)
+    block_time = int_or_none(block.get("time"))
+    stats = {"txs": 0, "outputs": 0, "spends": 0, "missing_spends": 0}
+
+    for tx in block.get("tx") or []:
+        txid = tx.get("txid")
+        if not txid:
+            continue
+        stats["txs"] += 1
+
+        for vin in tx.get("vin") or []:
+            if vin.get("coinbase"):
+                continue
+            prev_txid = vin.get("txid")
+            if not prev_txid:
+                continue
+            prev_vout = input_prev_vout(vin)
+            previous = store.conn.execute(
+                """
+                SELECT address, value_sats
+                FROM top_wallet_utxos
+                WHERE txid = ? AND vout = ?
+                """,
+                (prev_txid, prev_vout),
+            ).fetchone()
+            if not previous:
+                stats["missing_spends"] += 1
+                continue
+            store.conn.execute(
+                "DELETE FROM top_wallet_utxos WHERE txid = ? AND vout = ?",
+                (prev_txid, prev_vout),
+            )
+            adjust_top_wallet_balance(
+                store,
+                previous["address"],
+                -int(previous["value_sats"]),
+                -1,
+                block_height,
+                block_time,
+            )
+            stats["spends"] += 1
+
+        for vout in tx.get("vout") or []:
+            address = rpc_output_address(vout)
+            if not address:
+                continue
+            value_sats = rpc_output_sats(vout)
+            if value_sats <= 0:
+                continue
+            output_index = int(vout.get("n", 0) or 0)
+            cursor = store.conn.execute(
+                """
+                INSERT OR IGNORE INTO top_wallet_utxos(
+                    txid, vout, address, value_sats, block_height, block_time
+                )
+                VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (txid, output_index, address, value_sats, block_height, block_time),
+            )
+            if cursor.rowcount:
+                adjust_top_wallet_balance(store, address, value_sats, 1, block_height, block_time)
+                stats["outputs"] += 1
+
+    return stats
+
+
+def sync_top_wallet_index(
+    store: Store,
+    rpc: SyscoinRpcClient,
+    *,
+    start_height: int = 0,
+    max_blocks: int | None = None,
+    to_height: int | None = None,
+    reset: bool = False,
+    batch_size: int = 50,
+) -> dict[str, Any]:
+    if reset:
+        reset_top_wallet_index(store, start_height=start_height)
+
+    progress = top_wallet_progress(store)
+    last_height = int_or_none(progress.get("last_height"))
+    if last_height is None or last_height < start_height - 1:
+        last_height = start_height - 1
+    chain_height = int(rpc.call("getblockcount"))
+    target_height = min(chain_height, to_height if to_height is not None else chain_height)
+    if max_blocks is not None:
+        target_height = min(target_height, last_height + max_blocks)
+
+    totals = {
+        "blocks": 0,
+        "txs": 0,
+        "outputs": 0,
+        "spends": 0,
+        "missing_spends": 0,
+        "start_height": last_height + 1,
+        "last_height": last_height,
+        "target_height": target_height,
+        "chain_height": chain_height,
+    }
+    if target_height <= last_height:
+        progress.update({"chain_height": chain_height, "synced_at": now_iso()})
+        store.set_meta("top_wallet_index", progress)
+        return totals
+
+    batch_size = max(1, batch_size)
+    height = last_height + 1
+    while height <= target_height:
+        heights = list(range(height, min(target_height, height + batch_size - 1) + 1))
+        block_hashes = rpc.batch_call([("getblockhash", [item]) for item in heights])
+        blocks = rpc.batch_call([("getblock", [block_hash, 2]) for block_hash in block_hashes])
+
+        for block_height, block_hash, block in zip(heights, block_hashes, blocks, strict=True):
+            previous_hash = progress.get("last_hash")
+            if block_height > 0 and previous_hash and block.get("previousblockhash") != previous_hash:
+                raise RuntimeError(
+                    "top wallet index hit a chain reorg; rerun sync-top-wallets with --reset to rebuild"
+                )
+
+            store.conn.execute("BEGIN")
+            block_stats = process_top_wallet_block(store, block)
+            progress = {
+                "last_height": block_height,
+                "last_hash": block_hash,
+                "chain_height": chain_height,
+                "synced_at": now_iso(),
+            }
+            store.set_meta("top_wallet_index", progress, commit=False)
+            store.conn.commit()
+
+            totals["blocks"] += 1
+            totals["last_height"] = block_height
+            for key in ("txs", "outputs", "spends", "missing_spends"):
+                totals[key] += block_stats[key]
+
+        height = heights[-1] + 1
+
+    return totals
+
+
+def top_wallets_snapshot(store: Store, limit: int = 100) -> dict[str, Any]:
+    progress = top_wallet_progress(store)
+    exchange_tags = load_exchange_tags()
+    wallet_labels = load_wallet_labels()
+    rows = store.conn.execute(
+        """
+        SELECT address, balance_sats, utxo_count, last_seen_height, last_seen_time
+        FROM top_wallet_balances
+        WHERE balance_sats > 0
+        ORDER BY balance_sats DESC, address
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    totals = store.conn.execute(
+        """
+        SELECT COUNT(*) AS addresses,
+               COALESCE(SUM(balance_sats), 0) AS balance_sats,
+               COALESCE(SUM(utxo_count), 0) AS utxos
+        FROM top_wallet_balances
+        WHERE balance_sats > 0
+        """
+    ).fetchone()
+    wallets = []
+    for rank, row in enumerate(rows, 1):
+        balance_sats = int(row["balance_sats"] or 0)
+        address = row["address"]
+        identity = wallet_identity_for_address(address, wallet_labels, exchange_tags)
+        wallets.append(
+            {
+                "rank": rank,
+                "name": identity["name"],
+                "label": identity["label"],
+                "address": address,
+                "addresses": [address],
+                "address_count": 1,
+                "balance_sats": balance_sats,
+                "balance_sys": sats_to_sys_string(balance_sats),
+                "utxo_count": int(row["utxo_count"] or 0),
+                "last_seen_height": row["last_seen_height"],
+                "last_seen_time": row["last_seen_time"],
+            }
+        )
+
+    last_height = int_or_none(progress.get("last_height"))
+    chain_height = int_or_none(progress.get("chain_height"))
+    complete = bool(chain_height is not None and last_height is not None and last_height >= chain_height)
+    return {
+        "generated_at": now_iso(),
+        "type": "address_balances",
+        "stage": "exact-addresses",
+        "limit": limit,
+        "index": {
+            "last_height": last_height,
+            "chain_height": chain_height,
+            "complete": complete,
+            "synced_at": progress.get("synced_at"),
+        },
+        "totals": {
+            "addresses": int(totals["addresses"] or 0),
+            "balance_sats": int(totals["balance_sats"] or 0),
+            "balance_sys": sats_to_sys_string(int(totals["balance_sats"] or 0)),
+            "utxos": int(totals["utxos"] or 0),
+        },
+        "wallets": wallets,
+    }
 
 
 def follow_outputs(
@@ -2159,10 +2512,14 @@ def publish_static_snapshot(
     )
     index_html = dashboard_html(store, since_time=since_time, since_label=since_label, refresh_seconds=refresh_seconds)
     masternode_page = masternodes_html(store, since_time=since_time, since_label=since_label, refresh_seconds=refresh_seconds)
+    top_wallets = top_wallets_snapshot(store)
+    top_wallets_page = top_wallets_html(store, refresh_seconds=refresh_seconds)
     atomic_write_text(output_dir / "index.html", index_html)
     atomic_write_text(output_dir / "wallet-flows.html", index_html)
     atomic_write_text(output_dir / "sentrynode.html", masternode_page)
     atomic_write_text(output_dir / "masternodes.html", masternode_page)
+    atomic_write_text(output_dir / TOP_WALLETS_HTML, top_wallets_page)
+    atomic_write_json(output_dir / TOP_WALLETS_JSON, top_wallets)
     if csv_path.exists():
         network_csv = output_dir / "network_masternodes.csv"
         temp_csv = network_csv.with_name(f".{network_csv.name}.tmp")
@@ -2176,6 +2533,8 @@ def publish_static_snapshot(
                 "wallet_flows": "index.html",
                 "sentry_node": "sentrynode.html",
                 "legacy_masternodes": "masternodes.html",
+                "top_wallets": TOP_WALLETS_HTML,
+                "top_wallets_json": TOP_WALLETS_JSON,
                 "network_masternodes": "network_masternodes.csv",
             },
         },
@@ -2516,6 +2875,7 @@ def dashboard_html(
         <nav class="nav" aria-label="Dashboard pages">
           <a class="active" href="/">Wallet Flows</a>
           <a href="/sentrynode">Sentry Nodes</a>
+          <a href="/top-wallets">Top Wallets</a>
         </nav>
       </div>
     </div>
@@ -2651,6 +3011,289 @@ def dashboard_html(
       }} catch (_error) {{
         localStorage.removeItem(storageKey);
       }}
+    }})();
+  </script>
+</body>
+</html>"""
+
+
+def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) -> str:
+    snapshot = top_wallets_snapshot(store, limit=limit)
+    wallets = snapshot["wallets"]
+    index = snapshot["index"]
+    totals = snapshot["totals"]
+    last_height = index.get("last_height")
+    chain_height = index.get("chain_height")
+    indexed_blocks = (int(last_height) + 1) if isinstance(last_height, int) and last_height >= 0 else 0
+    remaining_blocks = (
+        max(int(chain_height) - int(last_height), 0)
+        if isinstance(chain_height, int) and isinstance(last_height, int)
+        else None
+    )
+    progress_text = (
+        f"{int(last_height):,} / {int(chain_height):,}"
+        if isinstance(last_height, int) and isinstance(chain_height, int)
+        else "not started"
+    )
+    remaining_text = f"{remaining_blocks:,}" if remaining_blocks is not None else "-"
+    updated_text = fmt_iso_local_datetime(index.get("synced_at"))
+    indexed_total_sats = int(totals["balance_sats"] or 0)
+
+    def explorer_addr(addr: str) -> str:
+        return f"https://explorer-blockbook.syscoin.org/address/{urllib.parse.quote(addr)}"
+
+    def render_wallet_row(row: dict[str, Any], *, mock: bool = False) -> str:
+        last_seen = fmt_table_datetime(row["last_seen_time"]) if row.get("last_seen_time") else "-"
+        last_seen_full = fmt_local_datetime(row["last_seen_time"]) if row.get("last_seen_time") else ""
+        address = row["address"]
+        balance_sats = int(row["balance_sats"])
+        name = row.get("name") or short_address(address)
+        label = row.get("label") or "Unknown"
+        label_lower = label.lower()
+        label_class = (
+            "exchange"
+            if label_lower.startswith("exchange")
+            else "private"
+            if "private" in label_lower or "holder" in label_lower or "user" in label_lower or "person" in label_lower
+            else "unknown"
+        )
+        address_count = int(row.get("address_count") or 1)
+        address_word = "address" if address_count == 1 else "addresses"
+        mock_badge = " <span class='mock-badge'>Mock</span>" if mock else ""
+        return (
+            f"<tr class='{'mock-row' if mock else ''}'>"
+            f"<td class='rank' data-sort='{row['rank']}'>{row['rank']}</td>"
+            f"<td class='wallet-name' data-sort='{html.escape(name.lower())}'>{html.escape(name)}{mock_badge}</td>"
+            f"<td data-sort='{html.escape(label.lower())}'><span class='label-pill {label_class}'>{html.escape(label)}</span></td>"
+            f"<td class='address-list' data-sort='{address_count}'><a href='{explorer_addr(address)}' title='{html.escape(address)}'>{address_count:,} {address_word}</a><span>{html.escape(short_address(address))}</span></td>"
+            f"<td class='amount' data-sort='{balance_sats}' title='{html.escape(row['balance_sys'])} SYS'>{fmt_compact_sys(balance_sats)}</td>"
+            f"<td data-sort='{balance_sats}'>{row.get('percent_text') or fmt_percent(balance_sats, indexed_total_sats)}</td>"
+            f"<td data-sort='{row['last_seen_time'] or 0}' title='{html.escape(last_seen_full)}'>{html.escape(last_seen)}</td>"
+            f"</tr>"
+        )
+
+    rows = [render_wallet_row(row) for row in wallets]
+    showing_mock = False
+    if not rows:
+        showing_mock = True
+        mock_wallets = [
+            {
+                "rank": 1,
+                "name": "Binance",
+                "label": "Exchange",
+                "address": DEFAULT_ADDRESS,
+                "address_count": 2,
+                "balance_sats": sys_to_sats("195580000"),
+                "balance_sys": "195580000",
+                "percent_text": "64.20%",
+                "last_seen_time": int(time.time()) - 300,
+            },
+            {
+                "rank": 2,
+                "name": "Bitget",
+                "label": "Exchange",
+                "address": "sys1qwhd5dz4mxkfwylg9jz4x56ggnc4z2d22u4l78w",
+                "address_count": 1,
+                "balance_sats": sys_to_sats("32600000"),
+                "balance_sys": "32600000",
+                "percent_text": "10.70%",
+                "last_seen_time": int(time.time()) - 1800,
+            },
+            {
+                "rank": 3,
+                "name": "Example Holder",
+                "label": "Private Wallet",
+                "address": "sys1qexampleholder0000000000000000000000000",
+                "address_count": 3,
+                "balance_sats": sys_to_sats("4200000"),
+                "balance_sys": "4200000",
+                "percent_text": "1.38%",
+                "last_seen_time": int(time.time()) - 7200,
+            },
+            {
+                "rank": 4,
+                "name": "Unknown Wallet",
+                "label": "Unknown",
+                "address": "sys1qunknownwallet00000000000000000000000",
+                "address_count": 1,
+                "balance_sats": sys_to_sats("820000"),
+                "balance_sys": "820000",
+                "percent_text": "0.27%",
+                "last_seen_time": int(time.time()) - 14400,
+            },
+        ]
+        rows = [render_wallet_row(row, mock=True) for row in mock_wallets]
+    rows_html = "\n".join(rows)
+    panel_status = "Mock preview until index starts" if showing_mock else f"Updated {html.escape(updated_text or '-')}"
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="{max(refresh_seconds, 1)}">
+  <title>Syscoin Top Wallets</title>
+  <style>
+    :root {{ color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --page-gutter: clamp(24px, 3.8vw, 80px); }}
+    *, *::before, *::after {{ box-sizing: border-box; }}
+    html, body {{ margin: 0; max-width: 100%; overflow-x: hidden; }}
+    body {{ background: #f7f5f0; color: #1c2227; }}
+    header {{ background: #142026; color: #f8fafc; padding: 24px 0 22px; width: 100%; }}
+    .header-inner, main {{ margin-left: var(--page-gutter); margin-right: var(--page-gutter); width: auto; }}
+    .topbar {{ display: flex; align-items: end; justify-content: space-between; gap: 16px; }}
+    h1 {{ font-size: 1.8rem; margin: 0 0 8px; letter-spacing: 0; }}
+    .subtitle {{ color: #c9d5d8; font-size: 0.98rem; line-height: 1.45; }}
+    .nav {{ display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }}
+    .nav a {{ border: 1px solid rgba(248, 250, 252, 0.28); border-radius: 999px; color: #dbe6e9; font-size: 0.84rem; padding: 7px 11px; text-decoration: none; }}
+    .nav a.active {{ background: #f8fafc; color: #142026; }}
+    main {{ display: grid; gap: 22px; margin-top: 22px; margin-bottom: 22px; padding: 0; }}
+    .metrics {{ display: grid; grid-template-columns: repeat(5, minmax(140px, 1fr)); gap: 12px; }}
+    .metric {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; padding: 14px 16px; min-width: 0; }}
+    .metric span {{ display: block; color: #687177; font-size: 0.84rem; margin-bottom: 6px; }}
+    .metric b {{ display: block; font-size: clamp(1.2rem, 1.8vw, 1.55rem); line-height: 1.1; overflow-wrap: anywhere; }}
+    .panel-title {{ display: flex; align-items: end; justify-content: space-between; gap: 16px; }}
+    .panel-title h2 {{ margin: 0; font-size: 1.25rem; }}
+    .panel-title p {{ margin: 0; color: #687177; font-size: 0.9rem; }}
+    .table-wrap {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; max-width: 100%; min-width: 0; overflow-x: auto; width: 100%; }}
+    table {{ width: 100%; min-width: 980px; border-collapse: separate; border-spacing: 0; background: #fff; table-layout: fixed; }}
+    th, td {{ padding: 8px 10px; border-bottom: 1px solid #e4e8e2; text-align: left; font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; }}
+    th {{ background: #eaf0ec; position: sticky; top: 0; z-index: 10; box-shadow: 0 1px 0 #d9ded8; }}
+    .sort-button {{ appearance: none; border: 0; background: transparent; color: inherit; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; font: inherit; font-weight: 700; padding: 0; text-align: inherit; white-space: nowrap; }}
+    .sort-button:hover, .sort-button:focus-visible {{ color: #086788; outline: none; }}
+    .sort-icon {{ color: #687177; display: inline-block; font-size: 0.75rem; min-width: 1ch; }}
+    th[aria-sort="ascending"] .sort-icon::before {{ content: "^"; }}
+    th[aria-sort="descending"] .sort-icon::before {{ content: "v"; }}
+    th[aria-sort="none"] .sort-icon::before {{ content: ""; }}
+    th:nth-child(1), td:nth-child(1) {{ width: 70px; text-align: right; color: #687177; }}
+    th:nth-child(2), td:nth-child(2) {{ width: 220px; }}
+    th:nth-child(3), td:nth-child(3) {{ width: 130px; }}
+    th:nth-child(4), td:nth-child(4) {{ width: 220px; }}
+    th:nth-child(5), td:nth-child(5) {{ width: 145px; text-align: right; }}
+    th:nth-child(6), td:nth-child(6) {{ width: 160px; text-align: right; }}
+    th:nth-child(7), td:nth-child(7) {{ width: 145px; }}
+    .wallet-name {{ font-weight: 800; }}
+    .address-list {{ white-space: nowrap; }}
+    .address-list a {{ font-weight: 700; }}
+    .address-list span {{ color: #687177; display: block; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 0.78rem; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; }}
+    .label-pill {{ border-radius: 999px; display: inline-flex; font-size: 0.78rem; font-weight: 800; line-height: 1; padding: 5px 9px; white-space: nowrap; }}
+    .label-pill.exchange {{ background: #e8f3ff; color: #14589c; }}
+    .label-pill.private {{ background: #f4edff; color: #6840a3; }}
+    .label-pill.unknown {{ background: #eef1ef; color: #596268; }}
+    .mock-row td {{ background: #fffaf0; }}
+    .mock-badge {{ background: #fff0c2; border-radius: 999px; color: #7a5400; display: inline-flex; font-size: 0.68rem; font-weight: 800; line-height: 1; margin-left: 6px; padding: 4px 7px; vertical-align: middle; }}
+    .amount {{ font-weight: 800; white-space: nowrap; }}
+    .empty {{ color: #687177; padding: 18px 14px; text-align: center; }}
+    a {{ color: #086788; text-decoration: none; }}
+    @media(max-width: 820px) {{
+      .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .panel-title {{ align-items: start; flex-direction: column; }}
+      .topbar {{ align-items: start; flex-direction: column; }}
+      .nav {{ justify-content: flex-start; }}
+      .header-inner, main {{ margin-left: 12px; margin-right: 12px; }}
+    }}
+    @media(max-width: 520px) {{
+      .metrics {{ grid-template-columns: 1fr; }}
+    }}
+    @media (prefers-color-scheme: dark) {{
+      body {{ background: #121619; color: #f3f4f6; }}
+      .metric, .table-wrap, table {{ background: #1c2328; border-color: #334047; }}
+      th {{ background: #263139; }}
+      th, td {{ border-color: #334047; }}
+      a {{ color: #67d7ff; }}
+      .subtitle {{ color: #b6c3c7; }}
+      .metric span, .panel-title p, th:nth-child(1), td:nth-child(1), .address-list span, .sort-icon, .empty {{ color: #a7b0b5; }}
+      .label-pill.exchange {{ background: #173754; color: #9ed2ff; }}
+      .label-pill.private {{ background: #352451; color: #d6bcff; }}
+      .label-pill.unknown {{ background: #30383d; color: #c0c9ce; }}
+      .mock-row td {{ background: #302a1d; }}
+      .mock-badge {{ background: #4b3711; color: #ffd982; }}
+      .sort-button:hover, .sort-button:focus-visible {{ color: #67d7ff; }}
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <div class="topbar">
+        <div>
+          <h1>Syscoin Top Wallets</h1>
+          <div class="subtitle">Stage 1 address balances from our own RPC index. Estimated wallet clustering comes next; labels are not proof of ownership.</div>
+        </div>
+        <nav class="nav" aria-label="Dashboard pages">
+          <a href="/">Wallet Flows</a>
+          <a href="/sentrynode">Sentry Nodes</a>
+          <a class="active" href="/top-wallets">Top Wallets</a>
+        </nav>
+      </div>
+    </div>
+  </header>
+  <main>
+    <section class="metrics">
+      <div class="metric"><span>Indexed To</span><b>{html.escape(progress_text)}</b></div>
+      <div class="metric"><span>Blocks Indexed</span><b>{indexed_blocks:,}</b></div>
+      <div class="metric"><span>Blocks Remaining</span><b>{html.escape(remaining_text)}</b></div>
+      <div class="metric"><span>Addresses</span><b>{int(totals['addresses']):,}</b></div>
+      <div class="metric"><span>Indexed Balance</span><b title="{html.escape(str(totals['balance_sys']))} SYS">{fmt_compact_sys(indexed_total_sats)}</b></div>
+    </section>
+    <section>
+      <div class="panel-title">
+        <h2>Largest Guesstimated Wallets</h2>
+        <p>{panel_status}</p>
+      </div>
+      <div class="table-wrap">
+        <table id="top-wallets-table">
+          <thead>
+            <tr>
+              <th data-sort="number" data-default-dir="asc" aria-sort="ascending"><button class="sort-button" type="button">Rank<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Name<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Label<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Addresses<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Net Worth<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Percent of coins<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Last Change<span class="sort-icon" aria-hidden="true"></span></button></th>
+            </tr>
+          </thead>
+          <tbody>{rows_html}</tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+  <script>
+    (() => {{
+      const table = document.getElementById("top-wallets-table");
+      if (!table) return;
+      const headers = Array.from(table.querySelectorAll("th[data-sort]"));
+      const tbody = table.tBodies[0];
+      let activeIndex = 0;
+      let activeDirection = "asc";
+      const cellValue = (row, index, type) => {{
+        const raw = row.cells[index]?.dataset.sort ?? row.cells[index]?.textContent ?? "";
+        if (type === "number") return Number(raw) || 0;
+        return raw.toLowerCase();
+      }};
+      const updateHeaderState = (index, direction) => {{
+        headers.forEach((header, headerIndex) => {{
+          header.setAttribute("aria-sort", headerIndex === index ? (direction === "asc" ? "ascending" : "descending") : "none");
+        }});
+      }};
+      headers.forEach((header, index) => {{
+        header.querySelector("button")?.addEventListener("click", () => {{
+          const direction = activeIndex === index ? (activeDirection === "asc" ? "desc" : "asc") : (header.dataset.defaultDir || "asc");
+          const type = header.dataset.sort;
+          const multiplier = direction === "asc" ? 1 : -1;
+          Array.from(tbody.rows)
+            .sort((left, right) => {{
+              const leftValue = cellValue(left, index, type);
+              const rightValue = cellValue(right, index, type);
+              if (type === "number") return (leftValue - rightValue) * multiplier;
+              return String(leftValue).localeCompare(String(rightValue)) * multiplier;
+            }})
+            .forEach((row) => tbody.appendChild(row));
+          activeIndex = index;
+          activeDirection = direction;
+          updateHeaderState(index, direction);
+        }});
+      }});
     }})();
   </script>
 </body>
@@ -2949,6 +3592,7 @@ def masternodes_html(
         <nav class="nav" aria-label="Dashboard pages">
           <a href="/">Wallet Flows</a>
           <a class="active" href="/sentrynode">Sentry Nodes</a>
+          <a href="/top-wallets">Top Wallets</a>
         </nav>
       </div>
     </div>
@@ -3291,7 +3935,11 @@ def serve(
                 self.redirect_to_sentry_node()
                 return
             with DB_WRITE_LOCK:
-                if parsed.path in ("/", "/index.html"):
+                content_type = "text/html; charset=utf-8"
+                if parsed.path == TOP_WALLETS_JSON_PATH:
+                    html_body = json.dumps(top_wallets_snapshot(store), indent=2)
+                    content_type = "application/json; charset=utf-8"
+                elif parsed.path in ("/", "/index.html"):
                     html_body = dashboard_html(
                         store,
                         since_time=since_time,
@@ -3305,13 +3953,15 @@ def serve(
                         since_label=since_label,
                         refresh_seconds=refresh_seconds,
                     )
+                elif parsed.path in TOP_WALLETS_PATHS:
+                    html_body = top_wallets_html(store, refresh_seconds=refresh_seconds)
                 else:
                     self.send_error(404)
                     return
 
             body = html_body.encode("utf-8")
             self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             if include_body:
@@ -3374,6 +4024,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     mn_p = sub.add_parser("sync-masternodes", help="Fetch the full network sentry node snapshot from RPC")
     mn_p.add_argument("--csv", type=Path, default=DEFAULT_NETWORK_MASTERNODES_PATH, help="Write sentry node snapshot CSV")
+
+    top_wallet_p = sub.add_parser("sync-top-wallets", help="Index exact address balances from Syscoin Core blocks")
+    top_wallet_p.add_argument("--start-height", type=int, default=0, help="Height to start from when the index is empty or reset")
+    top_wallet_p.add_argument("--to-height", type=int, help="Stop at this block height")
+    top_wallet_p.add_argument("--max-blocks", type=int, default=1000, help="Maximum blocks to index in this run")
+    top_wallet_p.add_argument("--reset", action="store_true", help="Clear the top-wallet index before syncing")
+    top_wallet_p.add_argument("--top", type=int, default=100, help="Number of addresses to include in the JSON snapshot")
+    top_wallet_p.add_argument("--json", type=Path, default=Path(TOP_WALLETS_JSON), help="Write top-wallet snapshot JSON")
+    top_wallet_p.add_argument("--batch-size", type=int, default=50, help="RPC blocks to fetch per batch")
 
     static_p = sub.add_parser("publish-static", help="Sync data and write pre-rendered dashboard pages")
     static_p.add_argument("--output-dir", type=Path, required=True, help="Directory to publish static HTML/data files")
@@ -3495,6 +4154,32 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"Synced {stats['current']} sentry nodes ({stats['enabled']} enabled); "
             f"added {stats['added']}, removed {stats['removed']}, traced {stats['traced']}"
+        )
+        return 0
+
+    if args.command == "sync-top-wallets":
+        rpc = build_rpc_client(args)
+        if rpc is None:
+            print("No RPC URL/host supplied. Use --rpc-host/--rpc-url or SYS_RPC_URL.")
+            return 1
+        stats = sync_top_wallet_index(
+            store,
+            rpc,
+            start_height=args.start_height,
+            max_blocks=args.max_blocks,
+            to_height=args.to_height,
+            reset=args.reset,
+            batch_size=args.batch_size,
+        )
+        snapshot = top_wallets_snapshot(store, limit=args.top)
+        if args.json:
+            atomic_write_json(args.json, snapshot)
+        print(
+            f"Indexed top wallets blocks={stats['blocks']} txs={stats['txs']} "
+            f"outputs={stats['outputs']} spends={stats['spends']} "
+            f"missing_spends={stats['missing_spends']} "
+            f"height={stats['last_height']}/{stats['chain_height']} "
+            f"top_addresses={len(snapshot['wallets'])}"
         )
         return 0
 
