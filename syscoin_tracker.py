@@ -3042,9 +3042,11 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
         if isinstance(chain_height, int) and isinstance(last_height, int)
         else None
     )
-    progress_text = (
-        f"{int(last_height):,} / {int(chain_height):,}"
-        if isinstance(last_height, int) and isinstance(chain_height, int)
+    block_height_text = (
+        f"{int(chain_height):,}"
+        if isinstance(chain_height, int)
+        else f"{int(last_height):,}"
+        if isinstance(last_height, int) and last_height >= 0
         else "not started"
     )
     remaining_text = f"{remaining_blocks:,}" if remaining_blocks is not None else "-"
@@ -3137,6 +3139,75 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
         rows = [render_wallet_row(row, mock=True) for row in mock_wallets]
     rows_html = "\n".join(rows)
     panel_status = "Mock preview until index starts" if showing_mock else f"Updated {html.escape(updated_text or '-')}"
+    mock_cluster_wallets = [
+        {
+            "rank": 1,
+            "name": "Binance",
+            "label": "Exchange",
+            "address": DEFAULT_ADDRESS,
+            "address_count": 5,
+            "balance_sats": sys_to_sats("248100000"),
+            "balance_sys": "248100000",
+            "percent_text": "44.70%",
+            "last_seen_time": int(time.time()) - 600,
+        },
+        {
+            "rank": 2,
+            "name": "Binance Cold Wallet",
+            "label": "Exchange",
+            "address": "SUBbe8vb7ng9CxZE9J3hma2CCkBh5VBHrv",
+            "address_count": 1,
+            "balance_sats": sys_to_sats("52520000"),
+            "balance_sys": "52520000",
+            "percent_text": "9.46%",
+            "last_seen_time": int(time.time()) - 86400,
+        },
+        {
+            "rank": 3,
+            "name": "Bitget",
+            "label": "Exchange",
+            "address": "sys1qwhd5dz4mxkfwylg9jz4x56ggnc4z2d22u4l78w",
+            "address_count": 3,
+            "balance_sats": sys_to_sats("32600000"),
+            "balance_sys": "32600000",
+            "percent_text": "5.87%",
+            "last_seen_time": int(time.time()) - 1800,
+        },
+        {
+            "rank": 4,
+            "name": "Gate",
+            "label": "Exchange",
+            "address": "ScM7oHdCXXZistSxPr7YjxyZ8tUf3HG8c2",
+            "address_count": 2,
+            "balance_sats": sys_to_sats("24040000"),
+            "balance_sys": "24040000",
+            "percent_text": "4.33%",
+            "last_seen_time": int(time.time()) - 2400,
+        },
+        {
+            "rank": 5,
+            "name": "Large Private Cluster",
+            "label": "Private Wallet",
+            "address": "sys1qexampleholder0000000000000000000000000",
+            "address_count": 12,
+            "balance_sats": sys_to_sats("11800000"),
+            "balance_sys": "11800000",
+            "percent_text": "2.13%",
+            "last_seen_time": int(time.time()) - 5400,
+        },
+        {
+            "rank": 6,
+            "name": "Unknown Cluster",
+            "label": "Unknown",
+            "address": "sys1qunknownwallet00000000000000000000000",
+            "address_count": 6,
+            "balance_sats": sys_to_sats("6300000"),
+            "balance_sys": "6300000",
+            "percent_text": "1.13%",
+            "last_seen_time": int(time.time()) - 7200,
+        },
+    ]
+    mock_cluster_rows_html = "\n".join(render_wallet_row(row, mock=True) for row in mock_cluster_wallets)
 
     return f"""<!doctype html>
 <html lang="en">
@@ -3161,11 +3232,13 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     main {{ display: grid; gap: 22px; margin-top: 22px; margin-bottom: 22px; padding: 0; }}
     .metrics {{ display: grid; grid-template-columns: repeat(5, minmax(140px, 1fr)); gap: 12px; }}
     .metric {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; padding: 14px 16px; min-width: 0; }}
+    .metric.mock-metric {{ background: #fffaf0; }}
     .metric span {{ display: block; color: #687177; font-size: 0.84rem; margin-bottom: 6px; }}
     .metric b {{ display: block; font-size: clamp(1.2rem, 1.8vw, 1.55rem); line-height: 1.1; overflow-wrap: anywhere; }}
     .panel-title {{ display: flex; align-items: end; justify-content: space-between; gap: 16px; }}
     .panel-title h2 {{ margin: 0; font-size: 1.25rem; }}
     .panel-title p {{ margin: 0; color: #687177; font-size: 0.9rem; }}
+    .phase-note {{ color: #687177; font-size: 0.9rem; line-height: 1.45; margin: 8px 0 10px; max-width: 880px; }}
     .table-wrap {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; max-width: 100%; min-width: 0; overflow-x: auto; width: 100%; }}
     table {{ width: 100%; min-width: 980px; border-collapse: separate; border-spacing: 0; background: #fff; table-layout: fixed; }}
     th, td {{ padding: 8px 10px; border-bottom: 1px solid #e4e8e2; text-align: left; font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; }}
@@ -3209,11 +3282,12 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     @media (prefers-color-scheme: dark) {{
       body {{ background: #121619; color: #f3f4f6; }}
       .metric, .table-wrap, table {{ background: #1c2328; border-color: #334047; }}
+      .metric.mock-metric {{ background: #302a1d; }}
       th {{ background: #263139; }}
       th, td {{ border-color: #334047; }}
       a {{ color: #67d7ff; }}
       .subtitle {{ color: #b6c3c7; }}
-      .metric span, .panel-title p, th:nth-child(1), td:nth-child(1), .address-list span, .sort-icon, .empty {{ color: #a7b0b5; }}
+      .metric span, .panel-title p, .phase-note, th:nth-child(1), td:nth-child(1), .address-list span, .sort-icon, .empty {{ color: #a7b0b5; }}
       .label-pill.exchange {{ background: #173754; color: #9ed2ff; }}
       .label-pill.private {{ background: #352451; color: #d6bcff; }}
       .label-pill.unknown {{ background: #30383d; color: #c0c9ce; }}
@@ -3241,7 +3315,7 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
   </header>
   <main>
     <section class="metrics">
-      <div class="metric"><span>Indexed To</span><b>{html.escape(progress_text)}</b></div>
+      <div class="metric"><span>Block Height</span><b>{html.escape(block_height_text)}</b></div>
       <div class="metric"><span>Blocks Indexed</span><b>{indexed_blocks:,}</b></div>
       <div class="metric"><span>Blocks Remaining</span><b>{html.escape(remaining_text)}</b></div>
       <div class="metric"><span>Addresses</span><b>{int(totals['addresses']):,}</b></div>
@@ -3249,11 +3323,47 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     </section>
     <section>
       <div class="panel-title">
-        <h2>Largest Guesstimated Wallets</h2>
+        <h2>Phase 2 Holder Estimate</h2>
+        <p>Mock preview</p>
+      </div>
+      <p class="phase-note">Draft layout only. These holder counts and grouped balances are mocked so we can tune the page before common-input clustering is wired into the indexer.</p>
+      <div class="metrics">
+        <div class="metric mock-metric"><span>Estimated Holders</span><b>4,820</b></div>
+        <div class="metric mock-metric"><span>Known Exchange Clusters</span><b>7</b></div>
+        <div class="metric mock-metric"><span>Estimated Private Holders</span><b>4,780</b></div>
+        <div class="metric mock-metric"><span>Known Exchange SYS</span><b>365.8M SYS</b></div>
+        <div class="metric mock-metric"><span>Unknown SYS</span><b>189.2M SYS</b></div>
+      </div>
+    </section>
+    <section>
+      <div class="panel-title">
+        <h2>Estimated Holder Clusters</h2>
+        <p>Mock rows</p>
+      </div>
+      <div class="table-wrap">
+        <table class="sortable-wallet-table">
+          <thead>
+            <tr>
+              <th data-sort="number" data-default-dir="asc" aria-sort="ascending"><button class="sort-button" type="button">Rank<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Name<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Label<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Addresses<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Net Worth<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Percent of coins<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Last Change<span class="sort-icon" aria-hidden="true"></span></button></th>
+            </tr>
+          </thead>
+          <tbody>{mock_cluster_rows_html}</tbody>
+        </table>
+      </div>
+    </section>
+    <section>
+      <div class="panel-title">
+        <h2>Largest Addresses</h2>
         <p>{panel_status}</p>
       </div>
       <div class="table-wrap">
-        <table id="top-wallets-table">
+        <table class="sortable-wallet-table" id="top-wallets-table">
           <thead>
             <tr>
               <th data-sort="number" data-default-dir="asc" aria-sort="ascending"><button class="sort-button" type="button">Rank<span class="sort-icon" aria-hidden="true"></span></button></th>
@@ -3272,38 +3382,38 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
   </main>
   <script>
     (() => {{
-      const table = document.getElementById("top-wallets-table");
-      if (!table) return;
-      const headers = Array.from(table.querySelectorAll("th[data-sort]"));
-      const tbody = table.tBodies[0];
-      let activeIndex = 0;
-      let activeDirection = "asc";
-      const cellValue = (row, index, type) => {{
-        const raw = row.cells[index]?.dataset.sort ?? row.cells[index]?.textContent ?? "";
-        if (type === "number") return Number(raw) || 0;
-        return raw.toLowerCase();
-      }};
-      const updateHeaderState = (index, direction) => {{
-        headers.forEach((header, headerIndex) => {{
-          header.setAttribute("aria-sort", headerIndex === index ? (direction === "asc" ? "ascending" : "descending") : "none");
-        }});
-      }};
-      headers.forEach((header, index) => {{
-        header.querySelector("button")?.addEventListener("click", () => {{
-          const direction = activeIndex === index ? (activeDirection === "asc" ? "desc" : "asc") : (header.dataset.defaultDir || "asc");
-          const type = header.dataset.sort;
-          const multiplier = direction === "asc" ? 1 : -1;
-          Array.from(tbody.rows)
-            .sort((left, right) => {{
-              const leftValue = cellValue(left, index, type);
-              const rightValue = cellValue(right, index, type);
-              if (type === "number") return (leftValue - rightValue) * multiplier;
-              return String(leftValue).localeCompare(String(rightValue)) * multiplier;
-            }})
-            .forEach((row) => tbody.appendChild(row));
-          activeIndex = index;
-          activeDirection = direction;
-          updateHeaderState(index, direction);
+      document.querySelectorAll(".sortable-wallet-table").forEach((table) => {{
+        const headers = Array.from(table.querySelectorAll("th[data-sort]"));
+        const tbody = table.tBodies[0];
+        let activeIndex = 0;
+        let activeDirection = "asc";
+        const cellValue = (row, index, type) => {{
+          const raw = row.cells[index]?.dataset.sort ?? row.cells[index]?.textContent ?? "";
+          if (type === "number") return Number(raw) || 0;
+          return raw.toLowerCase();
+        }};
+        const updateHeaderState = (index, direction) => {{
+          headers.forEach((header, headerIndex) => {{
+            header.setAttribute("aria-sort", headerIndex === index ? (direction === "asc" ? "ascending" : "descending") : "none");
+          }});
+        }};
+        headers.forEach((header, index) => {{
+          header.querySelector("button")?.addEventListener("click", () => {{
+            const direction = activeIndex === index ? (activeDirection === "asc" ? "desc" : "asc") : (header.dataset.defaultDir || "asc");
+            const type = header.dataset.sort;
+            const multiplier = direction === "asc" ? 1 : -1;
+            Array.from(tbody.rows)
+              .sort((left, right) => {{
+                const leftValue = cellValue(left, index, type);
+                const rightValue = cellValue(right, index, type);
+                if (type === "number") return (leftValue - rightValue) * multiplier;
+                return String(leftValue).localeCompare(String(rightValue)) * multiplier;
+              }})
+              .forEach((row) => tbody.appendChild(row));
+            activeIndex = index;
+            activeDirection = direction;
+            updateHeaderState(index, direction);
+          }});
         }});
       }});
     }})();
