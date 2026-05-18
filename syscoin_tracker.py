@@ -1928,7 +1928,6 @@ def sync_top_wallet_index(
     target_height = min(chain_height, to_height if to_height is not None else chain_height)
     if max_blocks is not None:
         target_height = min(target_height, last_height + max_blocks)
-    sentry_collateral_outpoints = top_wallet_sentry_collateral_outpoints(store)
 
     totals = {
         "blocks": 0,
@@ -2005,6 +2004,7 @@ def sync_top_wallet_cluster_index(
     target_height = min(chain_height, to_height if to_height is not None else chain_height)
     if max_blocks is not None:
         target_height = min(target_height, last_height + max_blocks)
+    sentry_collateral_outpoints = top_wallet_sentry_collateral_outpoints(store)
 
     totals = {
         "blocks": 0,
