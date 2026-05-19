@@ -35,6 +35,18 @@
       "destination": "/api/index.py"
     },
     {
+      "source": "/emissions",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/emissions.html",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/emissions.json",
+      "destination": "/api/index.py"
+    },
+    {
       "source": "/assets/chart.umd.js",
       "destination": "/api/index.py"
     },
