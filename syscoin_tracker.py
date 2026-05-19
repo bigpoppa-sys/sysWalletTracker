@@ -3326,6 +3326,7 @@ def dashboard_html(
     .nav a.active {{ background: #f8fafc; color: #142026; }}
     main {{ display: grid; gap: 22px; margin-top: 22px; margin-bottom: 22px; padding: 0; }}
     main > * {{ min-width: 0; }}
+    .section-panel {{ background: rgba(255, 255, 255, 0.66); border: 1px solid #d9ded8; border-radius: 8px; min-width: 0; padding: 16px; }}
     .metrics {{ display: grid; grid-template-columns: repeat(5, minmax(150px, 1fr)); gap: 12px; }}
     .metric {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; padding: 14px 16px; min-width: 0; }}
     .metric span {{ display: block; color: #687177; font-size: 0.84rem; margin-bottom: 6px; }}
@@ -3396,6 +3397,7 @@ def dashboard_html(
       .topbar {{ align-items: start; flex-direction: column; }}
       .nav {{ justify-content: flex-start; }}
       .header-inner, main {{ margin-left: 12px; margin-right: 12px; }}
+      .section-panel {{ padding: 12px; }}
       table {{ min-width: 1060px; }}
     }}
     @media(max-width: 520px) {{
@@ -3403,6 +3405,7 @@ def dashboard_html(
     }}
     @media (prefers-color-scheme: dark) {{
       body {{ background: #121619; color: #f3f4f6; }}
+      .section-panel {{ background: rgba(28, 35, 40, 0.62); border-color: #334047; }}
       .metric, .wallet-card, .table-wrap, table, .floating-table-header {{ background: #1c2328; border-color: #334047; }}
       th {{ background: #263139; }}
       th, td {{ border-color: #334047; }}
@@ -3431,28 +3434,28 @@ def dashboard_html(
     </div>
   </header>
   <main>
-    <section class="metrics">
+    <section class="section-panel metrics">
       <div class="metric"><span>SYS Sent</span><b title="{html.escape(total_sent_full)} SYS">{fmt_compact_sys(window_summary["external_sats"])}</b></div>
       <div class="metric"><span>Binance Hot Wallet</span><b title="{html.escape(wallet_balance_full)} SYS">{fmt_compact_sys(wallet_balance_sats)}</b><a class="metric-address" href="{explorer_addr(hot_wallet_address)}" title="{html.escape(hot_wallet_address)}">{html.escape(short_address(hot_wallet_address))}</a></div>
       <div class="metric"><span>Transfers</span><b>{window_summary["txs"]}</b></div>
       <div class="metric"><span>Recipients</span><b>{destination_count}</b></div>
       <div class="metric"><span>Updated</span><b>{html.escape(updated_text)}</b></div>
     </section>
-    <section class="hot-wallets">
+    <section class="section-panel hot-wallets">
       <div class="panel-title">
         <h2>Known Exchange Hot Wallets</h2>
         <p>{visible_hot_wallet_count} Blockbook links</p>
       </div>
       <div class="wallet-list">{hot_wallet_html}</div>
     </section>
-    <section class="cold-wallets">
+    <section class="section-panel cold-wallets">
       <div class="panel-title">
         <h2>Known Cold Wallets</h2>
         <p>{visible_cold_wallet_count} Blockbook links</p>
       </div>
       <div class="wallet-list">{cold_wallet_html}</div>
     </section>
-    <section>
+    <section class="section-panel">
       <div class="panel-title">
         <h2>Recipients Ranked By SYS</h2>
         <p>{destination_count} addresses, high to low</p>
@@ -3758,12 +3761,18 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
         if not edge_count or not balance_count:
             return []
 
-        union = UnionFind()
-        for edge in store.conn.execute("SELECT address_a, address_b FROM top_wallet_cluster_edges"):
-            union.union(edge["address_a"], edge["address_b"])
-
         wallet_labels = load_wallet_labels()
         exchange_tags = load_exchange_tags()
+        exchange_addresses = set(exchange_tags)
+
+        union = UnionFind()
+        for edge in store.conn.execute("SELECT address_a, address_b FROM top_wallet_cluster_edges"):
+            address_a = str(edge["address_a"] or "")
+            address_b = str(edge["address_b"] or "")
+            if address_a in exchange_addresses or address_b in exchange_addresses:
+                continue
+            union.union(address_a, address_b)
+
         clusters: dict[str, dict[str, Any]] = {}
         for balance_row in store.conn.execute(
             """
@@ -3773,6 +3782,8 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
             """
         ):
             address = str(balance_row["address"] or "")
+            if address in exchange_addresses:
+                continue
             balance_sats = int(balance_row["balance_sats"] or 0)
             root = union.find(address)
             cluster = clusters.setdefault(
@@ -3790,9 +3801,9 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
             if balance_sats > int(cluster["representative_balance_sats"]):
                 cluster["address"] = address
                 cluster["representative_balance_sats"] = balance_sats
-            identity = wallet_identity_for_address(address, wallet_labels, exchange_tags)
+            identity = wallet_identity_for_address(address, wallet_labels, {})
             label = identity["label"]
-            priority = 2 if label == "Exchange" else 1 if label != "Unknown" else 0
+            priority = 1 if label != "Unknown" else 0
             if priority > int(cluster["label_priority"]):
                 cluster["name"] = identity["name"]
                 cluster["label"] = label
@@ -3811,6 +3822,8 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
         ):
             collateral_address = str(node_row["collateral_address"] or "")
             if not collateral_address:
+                continue
+            if collateral_address in exchange_addresses:
                 continue
             root = union.find(collateral_address)
             cluster = clusters.get(root)
@@ -3939,6 +3952,8 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     .nav a {{ border: 1px solid rgba(248, 250, 252, 0.28); border-radius: 999px; color: #dbe6e9; font-size: 0.84rem; padding: 7px 11px; text-decoration: none; }}
     .nav a.active {{ background: #f8fafc; color: #142026; }}
     main {{ display: grid; gap: 22px; margin-top: 22px; margin-bottom: 22px; padding: 0; }}
+    main > * {{ min-width: 0; }}
+    .section-panel {{ background: rgba(255, 255, 255, 0.66); border: 1px solid #d9ded8; border-radius: 8px; min-width: 0; padding: 16px; }}
     .metrics {{ display: grid; grid-template-columns: repeat(5, minmax(140px, 1fr)); gap: 12px; }}
     .metric {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; padding: 14px 16px; min-width: 0; }}
     .metric span {{ display: block; color: #687177; font-size: 0.84rem; margin-bottom: 6px; }}
@@ -4007,12 +4022,14 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
       .topbar {{ align-items: start; flex-direction: column; }}
       .nav {{ justify-content: flex-start; }}
       .header-inner, main {{ margin-left: 12px; margin-right: 12px; }}
+      .section-panel {{ padding: 12px; }}
     }}
     @media(max-width: 520px) {{
       .metrics {{ grid-template-columns: 1fr; }}
     }}
     @media (prefers-color-scheme: dark) {{
       body {{ background: #121619; color: #f3f4f6; }}
+      .section-panel {{ background: rgba(28, 35, 40, 0.62); border-color: #334047; }}
       .metric, .table-wrap, table {{ background: #1c2328; border-color: #334047; }}
       .page-size-control select, .pager button {{ background: #1c2328; border-color: #46555e; color: #f3f4f6; }}
       th {{ background: #263139; }}
@@ -4049,14 +4066,14 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     </div>
   </header>
   <main>
-    <section class="metrics">
+    <section class="section-panel metrics">
       <div class="metric"><span>Block Height</span><b>{html.escape(block_height_text)}</b></div>
       <div class="metric"><span>Blocks Indexed</span><b>{indexed_blocks:,}</b></div>
       <div class="metric"><span>Blocks Remaining</span><b>{html.escape(remaining_text)}</b></div>
       <div class="metric"><span>Addresses</span><b>{int(totals['addresses']):,}</b></div>
       <div class="metric"><span>Indexed Balance</span><b title="{html.escape(str(totals['balance_sys']))} SYS">{fmt_compact_sys(indexed_total_sats)}</b></div>
     </section>
-    <section>
+    <section class="section-panel">
       <div class="panel-title">
         <h2>Phase 2 Address Cluster Estimate</h2>
         <p>{html.escape(cluster_status)}</p>
@@ -4070,7 +4087,7 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
         <div class="metric"><span>Private / Unknown SYS</span><b title="{html.escape(cluster_totals['private_unknown_sys'])} SYS">{fmt_compact_sys(int(cluster_totals['private_unknown_sats']))}</b></div>
       </div>
     </section>
-    <section>
+    <section class="section-panel">
       <div class="panel-title">
         <h2>Estimated Address Clusters</h2>
         <p>{int(cluster_totals['edges']):,} forensic links</p>
@@ -4093,12 +4110,11 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
         </table>
       </div>
     </section>
-    <section>
+    <section class="section-panel">
       <div class="panel-title">
         <h2>Sentry Operator View</h2>
-        <p>Derived from indexed clusters</p>
       </div>
-      <p class="phase-note">Derived operator labels from estimated wallet clusters that contain active 100,000 SYS sentry collateral. Labels are thresholds, not identity proof.</p>
+      <p class="phase-note">Derived from estimated wallet clusters that contain active 100,000 SYS sentry collateral. Labels are thresholds, not identity proof.</p>
       {wallet_table_controls("sentry-operators", "Sentry operator view")}
       <div class="table-wrap">
         <table class="sortable-wallet-table operator-table" id="sentry-operators-table">
@@ -4118,7 +4134,7 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
         </table>
       </div>
     </section>
-    <section>
+    <section class="section-panel">
       <div class="panel-title">
         <h2>Largest Addresses</h2>
         <p>{panel_status}</p>
@@ -4495,6 +4511,7 @@ def masternodes_html(
     .nav a.active {{ background: #f8fafc; color: #142026; }}
     main {{ display: grid; gap: 22px; margin-top: 22px; margin-bottom: 22px; padding: 0; }}
     main > * {{ min-width: 0; }}
+    .section-panel {{ background: rgba(255, 255, 255, 0.66); border: 1px solid #d9ded8; border-radius: 8px; min-width: 0; padding: 16px; }}
     .metrics {{ display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 12px; }}
     .metric {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; padding: 14px 16px; min-width: 0; }}
     .metric span {{ display: block; color: #687177; font-size: 0.84rem; margin-bottom: 6px; }}
@@ -4574,9 +4591,11 @@ def masternodes_html(
       .topbar {{ align-items: start; flex-direction: column; }}
       .nav {{ justify-content: flex-start; }}
       .header-inner, main {{ margin-left: 12px; margin-right: 12px; }}
+      .section-panel {{ padding: 12px; }}
     }}
     @media (prefers-color-scheme: dark) {{
       body {{ background: #121619; color: #f3f4f6; }}
+      .section-panel {{ background: rgba(28, 35, 40, 0.62); border-color: #334047; }}
       .metric, .table-wrap, table {{ background: #1c2328; border-color: #334047; }}
       .chart-card {{ background: #1c2328; border-color: #334047; }}
       .table-controls input, .table-controls select, .pager button {{ background: #1c2328; border-color: #46555e; color: #f3f4f6; }}
@@ -4613,14 +4632,14 @@ def masternodes_html(
     </div>
   </header>
   <main>
-    <section class="metrics">
+    <section class="section-panel metrics">
       <div class="metric"><span>Sentry Nodes</span><b>{total_count}</b></div>
       <div class="metric"><span>Enabled</span><b>{enabled_count}</b></div>
       <div class="metric"><span>Banned</span><b>{banned_count}</b></div>
       <div class="metric"><span>New Setups</span><b>{new_setup_count}</b><small>Last Setup: <strong>{html.escape(last_setup_date)}</strong></small></div>
       <div class="metric"><span>Taken Down</span><b>{taken_down_count}</b><small>Last Taken Down: <strong>{html.escape(last_taken_down_date)}</strong></small></div>
     </section>
-    <section class="chart-grid" aria-label="Sentry node charts">
+    <section class="section-panel chart-grid" aria-label="Sentry node charts">
       <article class="chart-card">
         <h2>Enabled vs Banned</h2>
         <div class="chart-body">
@@ -4636,7 +4655,7 @@ def masternodes_html(
         </div>
       </article>
     </section>
-    <section>
+    <section class="section-panel">
       <div class="panel-title">
         <h2>Changes Since Snapshot</h2>
         <p>Snapshot banked {html.escape(baseline_text)}</p>
@@ -4676,7 +4695,7 @@ def masternodes_html(
         </table>
       </div>
     </section>
-    <section>
+    <section class="section-panel">
       <div class="panel-title">
         <h2>Current Sentry Node List</h2>
         <p>Updated {html.escape(updated_text)}</p>
