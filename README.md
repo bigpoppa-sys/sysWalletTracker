@@ -24,11 +24,12 @@ Then open:
 
 `http://127.0.0.1:8787`
 
-The dashboard has two pages:
+The dashboard has these pages:
 
 - `/` tracks Binance hot-wallet recipient flows.
 - `/sentrynode` tracks the current network sentry node list from RPC, setup/takedown dates, moved collateral destination, and exchange label when the moved-to address is known.
 - `/top-wallets` shows the top 100 exact address balances from the local RPC-derived UTXO index and, when enabled, estimated holder clusters built from common-input and sentry-collateral history. `/top-wallets.json` exposes the same prebuilt data.
+- `/emissions` shows indexed UTXO miner, sentry node, governance, NEVM miner reward, priority fee, and fee-burn data. `/emissions.json` exposes the same prebuilt data.
 
 Manual top-wallet names can be added to `wallet_labels.csv` with
 `address,name,label`; for example, use labels such as `Exchange` or
@@ -145,6 +146,8 @@ export SYS_RPC_PASSWORD="your-password"
 python3 syscoin_tracker.py rpc-check
 python3 syscoin_tracker.py sync-masternodes --csv network_masternodes.csv
 python3 syscoin_tracker.py sync-top-wallets --max-blocks 1000 --batch-size 50 --json top-wallets.json
+python3 syscoin_tracker.py sync-emissions --max-blocks 1000 --batch-size 50 --json emissions.json
+python3 syscoin_tracker.py --nevm-rpc-url http://127.0.0.1:8545/ sync-nevm-emissions --max-blocks 1000 --batch-size 50 --json emissions.json
 python3 syscoin_tracker.py verify-sentries --since-date "2026-04-14 12:30"
 ```
 
@@ -196,6 +199,14 @@ Set `SYS_TOP_WALLET_CLUSTER_MAX_BLOCKS` to backfill estimated holder clusters in
 chunks during the same cron run. This builds common-input links from historical
 transactions and links known 100,000 SYS sentry collateral outputs to their
 funding inputs. It does not reset the exact address-balance index.
+Set `SYS_EMISSIONS_MAX_BLOCKS` to backfill the Network Emissions index in chunks
+during the static cron run. The index reads each block's coinbase transaction,
+separates miner, sentry, and governance payouts, and subtracts RPC-reported
+transaction fees for the estimated issuance rate.
+Set `SYS_NEVM_EMISSIONS_MAX_BLOCKS` and `SYS_NEVM_RPC_URL` to backfill the NEVM
+side of Network Emissions. The NEVM index records the static miner reward,
+priority fees, and EIP-1559 base-fee burns, then folds the net supply impact
+into the same `/emissions` view.
 
 `verify-sentries` compares exact 100,000 SYS candidates against
 Syscoin Core `masternode_list` outpoints. If RPC is only bound locally on a remote node, use an

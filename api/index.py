@@ -26,6 +26,9 @@ from syscoin_tracker import (  # noqa: E402
     DEFAULT_ADDRESS,
     DEFAULT_BLOCKBOOK_URL,
     DEFAULT_TIMEZONE,
+    EMISSIONS_JSON,
+    EMISSIONS_JSON_PATH,
+    EMISSIONS_PATHS,
     LEGACY_MASTERNODE_PATHS,
     SENTRY_COLLATERAL_SATS,
     SENTRY_NODE_PATHS,
@@ -38,6 +41,8 @@ from syscoin_tracker import (  # noqa: E402
     block_height_at_or_after,
     chart_asset_bytes,
     dashboard_html,
+    emissions_html,
+    emissions_snapshot,
     load_network_masternodes_csv,
     load_network_masternodes_csv_rows,
     masternodes_html,
@@ -79,6 +84,7 @@ INSTALL_BUNDLE_FILES = (
     "network_masternodes.csv",
     "node_outputs.csv",
     "verified_sentries.csv",
+    "emissions.json",
     "api/index.py",
     "static/assets/chart.umd.js",
     "scripts/install_vps_cron.sh",
@@ -249,6 +255,10 @@ def fetch_static_page(path: str, *, force: bool = False) -> bytes | None:
         page_name = "top-wallets.html"
     elif path == TOP_WALLETS_JSON_PATH:
         page_name = TOP_WALLETS_JSON
+    elif path in EMISSIONS_PATHS:
+        page_name = "emissions.html"
+    elif path == EMISSIONS_JSON_PATH:
+        page_name = EMISSIONS_JSON
     else:
         page_name = "index.html"
     url = f"{base_url}/{page_name}"
@@ -288,7 +298,11 @@ def fetch_static_page(path: str, *, force: bool = False) -> bytes | None:
             body = resp.read()
             if path in TOP_WALLETS_PATHS and b"Syscoin Top Wallets" not in body:
                 return None
+            if path in EMISSIONS_PATHS and b"Syscoin Network Emissions" not in body:
+                return None
             if path == TOP_WALLETS_JSON_PATH and not body.lstrip().startswith(b"{"):
+                return None
+            if path == EMISSIONS_JSON_PATH and not body.lstrip().startswith(b"{"):
                 return None
             if cache_ttl > 0:
                 _static_page_cache[cache_key] = (now, body)
@@ -418,12 +432,25 @@ class handler(BaseHTTPRequestHandler):
             self.redirect_to_sentry_node()
             return
 
-        if parsed.path not in ("/", "/index.html", "/api/index.py", *SENTRY_NODE_PATHS, *TOP_WALLETS_PATHS, TOP_WALLETS_JSON_PATH):
+        if parsed.path not in (
+            "/",
+            "/index.html",
+            "/api/index.py",
+            *SENTRY_NODE_PATHS,
+            *TOP_WALLETS_PATHS,
+            TOP_WALLETS_JSON_PATH,
+            *EMISSIONS_PATHS,
+            EMISSIONS_JSON_PATH,
+        ):
             self.send_error(404)
             return
 
         force = urllib.parse.parse_qs(parsed.query).get("force", ["0"])[0] == "1"
-        content_type = "application/json; charset=utf-8" if parsed.path == TOP_WALLETS_JSON_PATH else "text/html; charset=utf-8"
+        content_type = (
+            "application/json; charset=utf-8"
+            if parsed.path in (TOP_WALLETS_JSON_PATH, EMISSIONS_JSON_PATH)
+            else "text/html; charset=utf-8"
+        )
         try:
             static_body = fetch_static_page(parsed.path, force=force)
             if static_body is not None:
@@ -457,6 +484,13 @@ class handler(BaseHTTPRequestHandler):
                 )
             elif parsed.path == TOP_WALLETS_JSON_PATH:
                 html_body = json.dumps(top_wallets_snapshot(store), indent=2)
+            elif parsed.path in EMISSIONS_PATHS:
+                html_body = emissions_html(
+                    store,
+                    refresh_seconds=env_int("SYS_TRACKER_SYNC_INTERVAL", 60),
+                )
+            elif parsed.path == EMISSIONS_JSON_PATH:
+                html_body = json.dumps(emissions_snapshot(store), indent=2)
             else:
                 html_body = dashboard_html(
                     store,

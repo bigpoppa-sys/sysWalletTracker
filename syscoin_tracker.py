@@ -25,7 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -66,6 +66,10 @@ TOP_WALLETS_PATHS = ("/top-wallets", "/top-wallets.html")
 TOP_WALLETS_JSON = "top-wallets.json"
 TOP_WALLETS_HTML = "top-wallets.html"
 TOP_WALLETS_JSON_PATH = f"/{TOP_WALLETS_JSON}"
+EMISSIONS_PATHS = ("/emissions", "/emissions.html")
+EMISSIONS_JSON = "emissions.json"
+EMISSIONS_HTML = "emissions.html"
+EMISSIONS_JSON_PATH = f"/{EMISSIONS_JSON}"
 CHART_ASSET_ROUTE = "/assets/chart.umd.js"
 CHART_ASSET_PATH = Path("static/assets/chart.umd.js")
 NETWORK_MASTERNODE_HEADERS = [
@@ -96,6 +100,15 @@ SENTRY_COLLATERAL_SATS = 100_000 * 100_000_000
 SENIORITY_LEVEL_1_BLOCKS = 210_240
 SENIORITY_LEVEL_2_BLOCKS = 525_600
 SATOSHI = Decimal("100000000")
+WEI_PER_SYS_INT = 10**18
+WEI_PER_SAT_INT = 10**10
+NEVM_STATIC_REWARD_WEI = 10_550_000_000_000_000_000
+SENTRY_REWARD_RATIOS = {
+    "Base": Decimal("3"),
+    "Level 1": Decimal("4.05"),
+    "Level 2": Decimal("6"),
+}
+EMISSION_SUBSET_TOLERANCE_SATS = 25_000
 DB_WRITE_LOCK = threading.Lock()
 
 
@@ -130,6 +143,15 @@ def int_or_none(value: Any) -> int | None:
         return None
 
 
+def hex_int(value: Any) -> int:
+    if value is None or value == "":
+        return 0
+    if isinstance(value, int):
+        return value
+    text = str(value)
+    return int(text, 16) if text.startswith("0x") else int(text)
+
+
 def fmt_sys(sat: int) -> str:
     amount = Decimal(sat) / SATOSHI
     return f"{amount:,.8f}".rstrip("0").rstrip(".")
@@ -144,6 +166,34 @@ def fmt_compact_sys(sat: int) -> str:
     if amount >= Decimal("1000"):
         return f"{sign}{amount / Decimal('1000'):,.2f}K SYS"
     return f"{sign}{amount:,.2f} SYS".rstrip("0").rstrip(".")
+
+
+def fmt_wei_sys(wei: int) -> str:
+    amount = Decimal(wei) / Decimal(WEI_PER_SYS_INT)
+    return f"{amount:,.12f}".rstrip("0").rstrip(".")
+
+
+def fmt_compact_wei_sys(wei: int) -> str:
+    amount = Decimal(wei) / Decimal(WEI_PER_SYS_INT)
+    sign = "-" if amount < 0 else ""
+    amount = abs(amount)
+    if amount == 0:
+        return "0 SYS"
+    if amount >= Decimal("1000000"):
+        return f"{sign}{amount / Decimal('1000000'):,.2f}M SYS"
+    if amount >= Decimal("1000"):
+        return f"{sign}{amount / Decimal('1000'):,.2f}K SYS"
+    if amount < Decimal("0.01"):
+        return f"{sign}<0.01 SYS"
+    return f"{sign}{amount:,.2f} SYS".rstrip("0").rstrip(".")
+
+
+def sats_to_wei(value: int) -> int:
+    return int(value) * WEI_PER_SAT_INT
+
+
+def wei_to_sats_floor(value: int) -> int:
+    return int(value) // WEI_PER_SAT_INT
 
 
 def fmt_percent(part: int, total: int) -> str:
@@ -507,6 +557,72 @@ class SyscoinRpcClient:
         return results
 
 
+class EvmRpcClient:
+    def __init__(self, url: str, timeout: int = 20, insecure_tls: bool = False) -> None:
+        self.url = url
+        self.timeout = timeout
+        self.insecure_tls = insecure_tls
+        self.ssl_context = self._ssl_context()
+
+    def _ssl_context(self) -> ssl.SSLContext | None:
+        if not self.url.startswith("https://"):
+            return None
+        if self.insecure_tls:
+            return ssl._create_unverified_context()
+
+        candidates = [
+            os.getenv("SSL_CERT_FILE"),
+            os.getenv("REQUESTS_CA_BUNDLE"),
+            "/etc/ssl/cert.pem",
+            "/opt/homebrew/etc/ca-certificates/cert.pem",
+            "/usr/local/etc/openssl@3/cert.pem",
+        ]
+        try:
+            import certifi  # type: ignore
+
+            candidates.insert(0, certifi.where())
+        except Exception:
+            pass
+        for cafile in candidates:
+            if cafile and Path(cafile).exists():
+                return ssl.create_default_context(cafile=cafile)
+        return ssl.create_default_context()
+
+    def call(self, method: str, params: list[Any] | None = None) -> Any:
+        payload = json.dumps({"jsonrpc": "2.0", "id": "syscoin-tracker", "method": method, "params": params or []}).encode()
+        headers = {"Content-Type": "application/json", "User-Agent": "syscoin-tracker/0.1"}
+        req = urllib.request.Request(self.url, data=payload, headers=headers)
+        with urllib.request.urlopen(req, timeout=self.timeout, context=self.ssl_context) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if data.get("error"):
+            raise RuntimeError(data["error"])
+        return data.get("result")
+
+    def batch_call(self, calls: list[tuple[str, list[Any]]]) -> list[Any]:
+        if not calls:
+            return []
+        payload = json.dumps(
+            [
+                {"jsonrpc": "2.0", "id": str(index), "method": method, "params": params}
+                for index, (method, params) in enumerate(calls)
+            ]
+        ).encode()
+        headers = {"Content-Type": "application/json", "User-Agent": "syscoin-tracker/0.1"}
+        req = urllib.request.Request(self.url, data=payload, headers=headers)
+        with urllib.request.urlopen(req, timeout=max(self.timeout, 60), context=self.ssl_context) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if not isinstance(data, list):
+            raise RuntimeError("NEVM RPC batch response was not a list")
+        by_id = {int(item["id"]): item for item in data}
+        results = []
+        for index in range(len(calls)):
+            item = by_id[index]
+            if item.get("error"):
+                raise RuntimeError(item["error"])
+            results.append(item.get("result"))
+        return results
+
+
 def build_rpc_client(args: argparse.Namespace) -> SyscoinRpcClient | None:
     url = args.rpc_url or os.getenv("SYS_RPC_URL")
     host = args.rpc_host or os.getenv("SYS_RPC_HOST")
@@ -520,6 +636,13 @@ def build_rpc_client(args: argparse.Namespace) -> SyscoinRpcClient | None:
         args.rpc_user or os.getenv("SYS_RPC_USER"),
         args.rpc_password or os.getenv("SYS_RPC_PASSWORD"),
     )
+
+
+def build_nevm_rpc_client(args: argparse.Namespace) -> EvmRpcClient | None:
+    url = getattr(args, "nevm_rpc_url", None) or os.getenv("SYS_NEVM_RPC_URL")
+    if not url:
+        return None
+    return EvmRpcClient(url, insecure_tls=getattr(args, "insecure_tls", False))
 
 
 def normalize_outpoint(value: str) -> str:
@@ -1006,6 +1129,46 @@ class Store:
                 PRIMARY KEY (address_a, address_b)
             );
 
+            CREATE TABLE IF NOT EXISTS emission_blocks (
+                height INTEGER PRIMARY KEY,
+                block_hash TEXT NOT NULL,
+                block_time INTEGER,
+                coinbase_txid TEXT NOT NULL,
+                positive_outputs INTEGER NOT NULL,
+                miner_sats INTEGER NOT NULL,
+                sentry_sats INTEGER NOT NULL,
+                governance_sats INTEGER NOT NULL,
+                initial_sats INTEGER NOT NULL DEFAULT 0,
+                fee_sats INTEGER NOT NULL,
+                payout_sats INTEGER NOT NULL,
+                issued_sats INTEGER NOT NULL,
+                sentry_base_sats INTEGER NOT NULL DEFAULT 0,
+                sentry_l1_sats INTEGER NOT NULL DEFAULT 0,
+                sentry_l2_sats INTEGER NOT NULL DEFAULT 0,
+                sentry_tier TEXT,
+                raw_outputs_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS nevm_emission_blocks (
+                height INTEGER PRIMARY KEY,
+                block_hash TEXT NOT NULL,
+                block_time INTEGER,
+                miner_address TEXT,
+                tx_count INTEGER NOT NULL DEFAULT 0,
+                gas_used INTEGER NOT NULL DEFAULT 0,
+                base_fee_per_gas_wei TEXT NOT NULL DEFAULT '0',
+                static_reward_wei TEXT NOT NULL DEFAULT '0',
+                priority_fee_wei TEXT NOT NULL DEFAULT '0',
+                burned_wei TEXT NOT NULL DEFAULT '0',
+                miner_total_wei TEXT NOT NULL DEFAULT '0',
+                net_issued_wei TEXT NOT NULL DEFAULT '0',
+                raw_summary_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_movements_block
                 ON movements(block_height, block_time);
             CREATE INDEX IF NOT EXISTS idx_tracked_outputs_address
@@ -1022,9 +1185,14 @@ class Store:
                 ON top_wallet_cluster_utxos(address);
             CREATE INDEX IF NOT EXISTS idx_top_wallet_cluster_edges_b
                 ON top_wallet_cluster_edges(address_b);
+            CREATE INDEX IF NOT EXISTS idx_emission_blocks_time
+                ON emission_blocks(block_time);
+            CREATE INDEX IF NOT EXISTS idx_nevm_emission_blocks_time
+                ON nevm_emission_blocks(block_time);
             """
         )
         self.ensure_network_masternode_columns()
+        self.ensure_emission_columns()
         self.conn.commit()
 
     def ensure_network_masternode_columns(self) -> None:
@@ -1037,6 +1205,15 @@ class Store:
         for name, definition in additions.items():
             if name not in columns:
                 self.conn.execute(f"ALTER TABLE network_masternodes ADD COLUMN {definition}")
+
+    def ensure_emission_columns(self) -> None:
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(emission_blocks)").fetchall()}
+        additions = {
+            "initial_sats": "initial_sats INTEGER NOT NULL DEFAULT 0",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                self.conn.execute(f"ALTER TABLE emission_blocks ADD COLUMN {definition}")
 
     def set_meta(self, key: str, value: Any, commit: bool = True) -> None:
         self.conn.execute(
@@ -1600,6 +1777,504 @@ def rpc_output_sats(vout: dict[str, Any]) -> int:
     if value is None:
         return 0
     return sys_to_sats(str(value))
+
+
+def emission_progress(store: Store) -> dict[str, Any]:
+    progress = store.get_meta("emission_index", {}) or {}
+    if "last_height" not in progress:
+        progress["last_height"] = -1
+    return progress
+
+
+def nevm_emission_progress(store: Store) -> dict[str, Any]:
+    progress = store.get_meta("nevm_emission_index", {}) or {}
+    if "last_height" not in progress:
+        progress["last_height"] = -1
+    return progress
+
+
+def reset_emission_index(store: Store, start_height: int = 0) -> None:
+    store.conn.execute("DELETE FROM emission_blocks")
+    store.set_meta(
+        "emission_index",
+        {
+            "last_height": start_height - 1,
+            "last_hash": "",
+            "chain_height": None,
+            "synced_at": now_iso(),
+            "reset_at": now_iso(),
+        },
+        commit=False,
+    )
+    store.conn.commit()
+
+
+def reset_nevm_emission_index(store: Store, start_height: int = 0) -> None:
+    store.conn.execute("DELETE FROM nevm_emission_blocks")
+    store.set_meta(
+        "nevm_emission_index",
+        {
+            "last_height": start_height - 1,
+            "last_hash": "",
+            "chain_height": None,
+            "synced_at": now_iso(),
+            "reset_at": now_iso(),
+        },
+        commit=False,
+    )
+    store.conn.commit()
+
+
+def expected_sentry_reward_sats(miner_sats: int, tier: str) -> int:
+    return int((Decimal(miner_sats) * SENTRY_REWARD_RATIOS[tier]).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+def closest_sentry_tier(miner_sats: int, amount_sats: int) -> tuple[str, int, int]:
+    if miner_sats <= 0:
+        return "", amount_sats, 0
+    best_tier = ""
+    best_expected = 0
+    best_diff: int | None = None
+    for tier in ("Base", "Level 1", "Level 2"):
+        expected = expected_sentry_reward_sats(miner_sats, tier)
+        diff = abs(amount_sats - expected)
+        if best_diff is None or diff < best_diff:
+            best_tier = tier
+            best_expected = expected
+            best_diff = diff
+    return best_tier, int(best_diff or 0), best_expected
+
+
+def emission_match_tolerance(miner_sats: int) -> int:
+    return max(EMISSION_SUBSET_TOLERANCE_SATS, int(miner_sats * 0.001))
+
+
+def subset_sum_near(values: list[int], target: int, tolerance: int) -> int | None:
+    if not values:
+        return None
+    best_sum: int | None = None
+    best_diff: int | None = None
+    if len(values) <= 18:
+        for mask in range(1, 1 << len(values)):
+            total = 0
+            for index, value in enumerate(values):
+                if mask & (1 << index):
+                    total += value
+            diff = abs(total - target)
+            if best_diff is None or diff < best_diff:
+                best_sum = total
+                best_diff = diff
+                if diff <= tolerance:
+                    return total
+        return best_sum if best_diff is not None and best_diff <= tolerance else None
+
+    # Sentry rewards commonly appear as one output, or owner/operator split outputs.
+    # For unusually large governance blocks, avoid exponential subset work and test
+    # small combinations first.
+    from itertools import combinations
+
+    max_group = min(4, len(values))
+    for size in range(1, max_group + 1):
+        for combo in combinations(values, size):
+            total = sum(combo)
+            if abs(total - target) <= tolerance:
+                return total
+    return None
+
+
+def classify_emission_outputs(
+    block_height: int,
+    outputs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    payout_sats = sum(int(output["value_sats"]) for output in outputs)
+    if not outputs:
+        return {
+            "miner_sats": 0,
+            "sentry_sats": 0,
+            "governance_sats": 0,
+            "initial_sats": 0,
+            "sentry_tier": "",
+        }
+
+    if block_height <= 1 and payout_sats >= sys_to_sats("1000000"):
+        return {
+            "miner_sats": 0,
+            "sentry_sats": 0,
+            "governance_sats": 0,
+            "initial_sats": payout_sats,
+            "sentry_tier": "Initial",
+        }
+
+    miner_sats = int(outputs[0]["value_sats"])
+    non_miner_values = [int(output["value_sats"]) for output in outputs[1:]]
+    non_miner_total = sum(non_miner_values)
+    if non_miner_total <= 0 or miner_sats <= 0:
+        return {
+            "miner_sats": miner_sats,
+            "sentry_sats": 0,
+            "governance_sats": max(0, payout_sats - miner_sats),
+            "initial_sats": 0,
+            "sentry_tier": "",
+        }
+
+    tolerance = emission_match_tolerance(miner_sats)
+    total_tier, total_diff, total_expected = closest_sentry_tier(miner_sats, non_miner_total)
+    max_expected = expected_sentry_reward_sats(miner_sats, "Level 2")
+    if total_diff <= tolerance or non_miner_total <= max_expected + tolerance:
+        sentry_sats = non_miner_total
+        sentry_tier = total_tier
+    else:
+        best_subset: tuple[str, int, int] | None = None
+        for tier in ("Base", "Level 1", "Level 2"):
+            expected = expected_sentry_reward_sats(miner_sats, tier)
+            subset_total = subset_sum_near(non_miner_values, expected, tolerance)
+            if subset_total is None:
+                continue
+            diff = abs(subset_total - expected)
+            if best_subset is None or diff < best_subset[2]:
+                best_subset = (tier, subset_total, diff)
+        if best_subset is not None:
+            sentry_tier, sentry_sats, _diff = best_subset
+        else:
+            sentry_tier = total_tier
+            sentry_sats = min(total_expected, non_miner_total)
+
+    governance_sats = max(0, non_miner_total - sentry_sats)
+    return {
+        "miner_sats": miner_sats,
+        "sentry_sats": sentry_sats,
+        "governance_sats": governance_sats,
+        "initial_sats": 0,
+        "sentry_tier": sentry_tier,
+    }
+
+
+def process_emission_block(store: Store, block: dict[str, Any]) -> dict[str, int]:
+    height = int(block.get("height") or 0)
+    block_hash = str(block.get("hash") or "")
+    block_time = int_or_none(block.get("time"))
+    transactions = block.get("tx") or []
+    if not transactions:
+        return {"blocks": 0, "positive_outputs": 0, "fees_sats": 0}
+
+    coinbase = transactions[0]
+    coinbase_txid = str(coinbase.get("txid") or "")
+    outputs: list[dict[str, Any]] = []
+    for vout in coinbase.get("vout") or []:
+        value_sats = rpc_output_sats(vout)
+        if value_sats <= 0:
+            continue
+        outputs.append(
+            {
+                "n": int(vout.get("n", 0) or 0),
+                "value_sats": value_sats,
+                "value_sys": sats_to_sys_string(value_sats),
+                "address": rpc_output_address(vout) or "",
+            }
+        )
+
+    fee_sats = 0
+    for tx in transactions[1:]:
+        if tx.get("fee") is not None:
+            fee_sats += sys_to_sats(str(tx.get("fee")))
+
+    classified = classify_emission_outputs(height, outputs)
+    miner_sats = int(classified["miner_sats"])
+    sentry_sats = int(classified["sentry_sats"])
+    governance_sats = int(classified["governance_sats"])
+    initial_sats = int(classified["initial_sats"])
+    sentry_tier = str(classified["sentry_tier"] or "")
+    payout_sats = sum(int(output["value_sats"]) for output in outputs)
+    issued_sats = max(0, payout_sats - fee_sats)
+    base_sats = sentry_sats if sentry_tier == "Base" else 0
+    l1_sats = sentry_sats if sentry_tier == "Level 1" else 0
+    l2_sats = sentry_sats if sentry_tier == "Level 2" else 0
+    stamp = now_iso()
+    store.conn.execute(
+        """
+        INSERT INTO emission_blocks(
+            height, block_hash, block_time, coinbase_txid, positive_outputs,
+            miner_sats, sentry_sats, governance_sats, initial_sats, fee_sats,
+            payout_sats, issued_sats, sentry_base_sats, sentry_l1_sats,
+            sentry_l2_sats, sentry_tier, raw_outputs_json, created_at, updated_at
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(height) DO UPDATE SET
+            block_hash=excluded.block_hash,
+            block_time=excluded.block_time,
+            coinbase_txid=excluded.coinbase_txid,
+            positive_outputs=excluded.positive_outputs,
+            miner_sats=excluded.miner_sats,
+            sentry_sats=excluded.sentry_sats,
+            governance_sats=excluded.governance_sats,
+            initial_sats=excluded.initial_sats,
+            fee_sats=excluded.fee_sats,
+            payout_sats=excluded.payout_sats,
+            issued_sats=excluded.issued_sats,
+            sentry_base_sats=excluded.sentry_base_sats,
+            sentry_l1_sats=excluded.sentry_l1_sats,
+            sentry_l2_sats=excluded.sentry_l2_sats,
+            sentry_tier=excluded.sentry_tier,
+            raw_outputs_json=excluded.raw_outputs_json,
+            updated_at=excluded.updated_at
+        """,
+        (
+            height,
+            block_hash,
+            block_time,
+            coinbase_txid,
+            len(outputs),
+            miner_sats,
+            sentry_sats,
+            governance_sats,
+            initial_sats,
+            fee_sats,
+            payout_sats,
+            issued_sats,
+            base_sats,
+            l1_sats,
+            l2_sats,
+            sentry_tier,
+            json.dumps(outputs, separators=(",", ":")),
+            stamp,
+            stamp,
+        ),
+    )
+    return {"blocks": 1, "positive_outputs": len(outputs), "fees_sats": fee_sats}
+
+
+def sync_emission_index(
+    store: Store,
+    rpc: SyscoinRpcClient,
+    *,
+    start_height: int = 0,
+    max_blocks: int | None = None,
+    to_height: int | None = None,
+    reset: bool = False,
+    batch_size: int = 50,
+) -> dict[str, Any]:
+    if reset:
+        reset_emission_index(store, start_height=start_height)
+
+    progress = emission_progress(store)
+    last_height = int_or_none(progress.get("last_height"))
+    if last_height is None or last_height < start_height - 1:
+        last_height = start_height - 1
+    chain_height = int(rpc.call("getblockcount"))
+    target_height = min(chain_height, to_height if to_height is not None else chain_height)
+    if max_blocks is not None:
+        target_height = min(target_height, last_height + max_blocks)
+
+    totals = {
+        "blocks": 0,
+        "positive_outputs": 0,
+        "fees_sats": 0,
+        "start_height": last_height + 1,
+        "last_height": last_height,
+        "target_height": target_height,
+        "chain_height": chain_height,
+    }
+    if target_height <= last_height:
+        progress.update({"chain_height": chain_height, "synced_at": now_iso()})
+        store.set_meta("emission_index", progress)
+        return totals
+
+    batch_size = max(1, batch_size)
+    height = last_height + 1
+    while height <= target_height:
+        heights = list(range(height, min(target_height, height + batch_size - 1) + 1))
+        block_hashes = rpc.batch_call([("getblockhash", [item]) for item in heights])
+        blocks = rpc.batch_call([("getblock", [block_hash, 2]) for block_hash in block_hashes])
+        if len(block_hashes) != len(heights) or len(blocks) != len(heights):
+            raise RuntimeError("emission RPC batch returned an unexpected number of results")
+
+        for block_height, block_hash, block in zip(heights, block_hashes, blocks):
+            previous_hash = progress.get("last_hash")
+            if block_height > 0 and previous_hash and block.get("previousblockhash") != previous_hash:
+                raise RuntimeError("emission index hit a chain reorg; rerun sync-emissions with --reset to rebuild")
+
+            store.conn.execute("BEGIN")
+            block_stats = process_emission_block(store, block)
+            progress = {
+                "last_height": block_height,
+                "last_hash": block_hash,
+                "chain_height": chain_height,
+                "synced_at": now_iso(),
+            }
+            store.set_meta("emission_index", progress, commit=False)
+            store.conn.commit()
+
+            totals["blocks"] += block_stats["blocks"]
+            totals["positive_outputs"] += block_stats["positive_outputs"]
+            totals["fees_sats"] += block_stats["fees_sats"]
+            totals["last_height"] = block_height
+
+        height = heights[-1] + 1
+
+    return totals
+
+
+def process_nevm_emission_block(
+    store: Store,
+    block: dict[str, Any],
+    receipts: list[dict[str, Any] | None],
+) -> dict[str, int]:
+    height = hex_int(block.get("number"))
+    block_hash = str(block.get("hash") or "")
+    block_time = hex_int(block.get("timestamp"))
+    miner_address = str(block.get("miner") or "")
+    txs = block.get("transactions") or []
+    tx_count = len(txs)
+    gas_used = hex_int(block.get("gasUsed"))
+    base_fee_per_gas = hex_int(block.get("baseFeePerGas"))
+    burned_wei = base_fee_per_gas * gas_used
+    priority_fee_wei = 0
+    for receipt in receipts:
+        if not receipt:
+            continue
+        tx_gas_used = hex_int(receipt.get("gasUsed"))
+        effective_gas_price = hex_int(receipt.get("effectiveGasPrice"))
+        priority_fee_wei += max(0, effective_gas_price - base_fee_per_gas) * tx_gas_used
+
+    static_reward_wei = NEVM_STATIC_REWARD_WEI if height > 0 else 0
+    miner_total_wei = static_reward_wei + priority_fee_wei
+    net_issued_wei = static_reward_wei - burned_wei
+    stamp = now_iso()
+    raw_summary = {
+        "base_fee_per_gas_wei": str(base_fee_per_gas),
+        "gas_used": gas_used,
+        "tx_count": tx_count,
+        "miner_address": miner_address,
+    }
+    store.conn.execute(
+        """
+        INSERT INTO nevm_emission_blocks(
+            height, block_hash, block_time, miner_address, tx_count, gas_used,
+            base_fee_per_gas_wei, static_reward_wei, priority_fee_wei,
+            burned_wei, miner_total_wei, net_issued_wei, raw_summary_json,
+            created_at, updated_at
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(height) DO UPDATE SET
+            block_hash=excluded.block_hash,
+            block_time=excluded.block_time,
+            miner_address=excluded.miner_address,
+            tx_count=excluded.tx_count,
+            gas_used=excluded.gas_used,
+            base_fee_per_gas_wei=excluded.base_fee_per_gas_wei,
+            static_reward_wei=excluded.static_reward_wei,
+            priority_fee_wei=excluded.priority_fee_wei,
+            burned_wei=excluded.burned_wei,
+            miner_total_wei=excluded.miner_total_wei,
+            net_issued_wei=excluded.net_issued_wei,
+            raw_summary_json=excluded.raw_summary_json,
+            updated_at=excluded.updated_at
+        """,
+        (
+            height,
+            block_hash,
+            block_time,
+            miner_address,
+            tx_count,
+            gas_used,
+            str(base_fee_per_gas),
+            str(static_reward_wei),
+            str(priority_fee_wei),
+            str(burned_wei),
+            str(miner_total_wei),
+            str(net_issued_wei),
+            json.dumps(raw_summary, separators=(",", ":")),
+            stamp,
+            stamp,
+        ),
+    )
+    return {
+        "blocks": 1,
+        "txs": tx_count,
+        "burned_wei": burned_wei,
+        "priority_fee_wei": priority_fee_wei,
+        "static_reward_wei": static_reward_wei,
+    }
+
+
+def sync_nevm_emission_index(
+    store: Store,
+    rpc: EvmRpcClient,
+    *,
+    start_height: int = 0,
+    max_blocks: int | None = None,
+    to_height: int | None = None,
+    reset: bool = False,
+    batch_size: int = 50,
+) -> dict[str, Any]:
+    if reset:
+        reset_nevm_emission_index(store, start_height=start_height)
+
+    progress = nevm_emission_progress(store)
+    last_height = int_or_none(progress.get("last_height"))
+    if last_height is None or last_height < start_height - 1:
+        last_height = start_height - 1
+    chain_height = hex_int(rpc.call("eth_blockNumber"))
+    target_height = min(chain_height, to_height if to_height is not None else chain_height)
+    if max_blocks is not None:
+        target_height = min(target_height, last_height + max_blocks)
+
+    totals = {
+        "blocks": 0,
+        "txs": 0,
+        "burned_wei": 0,
+        "priority_fee_wei": 0,
+        "static_reward_wei": 0,
+        "start_height": last_height + 1,
+        "last_height": last_height,
+        "target_height": target_height,
+        "chain_height": chain_height,
+    }
+    if target_height <= last_height:
+        progress.update({"chain_height": chain_height, "synced_at": now_iso()})
+        store.set_meta("nevm_emission_index", progress)
+        return totals
+
+    batch_size = max(1, batch_size)
+    height = last_height + 1
+    while height <= target_height:
+        heights = list(range(height, min(target_height, height + batch_size - 1) + 1))
+        blocks = rpc.batch_call([("eth_getBlockByNumber", [hex(item), False]) for item in heights])
+        if len(blocks) != len(heights):
+            raise RuntimeError("NEVM emission RPC batch returned an unexpected number of results")
+
+        for block_height, block in zip(heights, blocks):
+            if not block:
+                raise RuntimeError(f"NEVM block {block_height} was not returned by RPC")
+            block_hash = str(block.get("hash") or "")
+            previous_hash = progress.get("last_hash")
+            if block_height > 0 and previous_hash and block.get("parentHash") != previous_hash:
+                raise RuntimeError("NEVM emission index hit a chain reorg; rerun sync-nevm-emissions with --reset to rebuild")
+
+            tx_hashes = [str(tx.get("hash") if isinstance(tx, dict) else tx) for tx in (block.get("transactions") or [])]
+            receipts = rpc.batch_call([("eth_getTransactionReceipt", [tx_hash]) for tx_hash in tx_hashes]) if tx_hashes else []
+
+            store.conn.execute("BEGIN")
+            block_stats = process_nevm_emission_block(store, block, receipts)
+            progress = {
+                "last_height": block_height,
+                "last_hash": block_hash,
+                "chain_height": chain_height,
+                "synced_at": now_iso(),
+            }
+            store.set_meta("nevm_emission_index", progress, commit=False)
+            store.conn.commit()
+
+            totals["blocks"] += block_stats["blocks"]
+            totals["txs"] += block_stats["txs"]
+            totals["burned_wei"] += block_stats["burned_wei"]
+            totals["priority_fee_wei"] += block_stats["priority_fee_wei"]
+            totals["static_reward_wei"] += block_stats["static_reward_wei"]
+            totals["last_height"] = block_height
+
+        height = heights[-1] + 1
+
+    return totals
 
 
 def top_wallet_progress(store: Store) -> dict[str, Any]:
@@ -2350,6 +3025,476 @@ def top_wallets_snapshot(store: Store, limit: int = 100) -> dict[str, Any]:
     }
 
 
+def period_start_label(ts: int, period: str) -> tuple[int, str]:
+    value = dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc)
+    if period == "yearly":
+        start = dt.datetime(value.year, 1, 1, tzinfo=dt.timezone.utc)
+        return int(start.timestamp()), str(value.year)
+    if period == "monthly":
+        start = dt.datetime(value.year, value.month, 1, tzinfo=dt.timezone.utc)
+        return int(start.timestamp()), start.strftime("%b %Y")
+    weekday = value.weekday()
+    start_date = (value - dt.timedelta(days=weekday)).date()
+    start = dt.datetime(start_date.year, start_date.month, start_date.day, tzinfo=dt.timezone.utc)
+    return int(start.timestamp()), f"{start.strftime('%b %-d, %Y')}"
+
+
+def annualized_issuance_rate_text(issued_sats: int, start_supply_sats: int, periods_per_year: Decimal) -> str:
+    if issued_sats <= 0 or start_supply_sats <= 0:
+        return "0%"
+    rate = Decimal(issued_sats) * periods_per_year * Decimal("100") / Decimal(start_supply_sats)
+    return f"{rate:.2f}%"
+
+
+def annualized_issuance_rate_text_from_wei(issued_wei: int, start_supply_wei: int, periods_per_year: Decimal) -> str:
+    if issued_wei <= 0 or start_supply_wei <= 0:
+        return "0%"
+    rate = Decimal(issued_wei) * periods_per_year * Decimal("100") / Decimal(start_supply_wei)
+    return f"{rate:.2f}%"
+
+
+def empty_period_record(period: str, start_time: int, label: str, start_supply_sats: int) -> dict[str, Any]:
+    return {
+        "period": period,
+        "label": label,
+        "start_time": start_time,
+        "blocks": 0,
+        "miner_sats": 0,
+        "sentry_sats": 0,
+        "governance_sats": 0,
+        "initial_sats": 0,
+        "fee_sats": 0,
+        "payout_sats": 0,
+        "issued_sats": 0,
+        "sentry_base_sats": 0,
+        "sentry_l1_sats": 0,
+        "sentry_l2_sats": 0,
+        "start_supply_sats": start_supply_sats,
+        "start_supply_wei": sats_to_wei(start_supply_sats),
+        "net_issued_wei": 0,
+        "nevm_blocks": 0,
+        "nevm_txs": 0,
+        "nevm_static_reward_wei": 0,
+        "nevm_priority_fee_wei": 0,
+        "nevm_miner_total_wei": 0,
+        "nevm_burned_wei": 0,
+        "nevm_net_issued_wei": 0,
+    }
+
+
+def finalize_period_record(record: dict[str, Any]) -> dict[str, Any]:
+    periods_per_year = {
+        "weekly": Decimal("52.142857"),
+        "monthly": Decimal("12"),
+        "yearly": Decimal("1"),
+    }.get(record["period"], Decimal("1"))
+    utxo_issued_wei = sats_to_wei(int(record["issued_sats"]))
+    net_issued_wei = utxo_issued_wei + int(record.get("nevm_net_issued_wei", 0))
+    combined_miner_wei = sats_to_wei(int(record["miner_sats"])) + int(record.get("nevm_miner_total_wei", 0))
+    return {
+        **record,
+        "miner_sys": sats_to_sys_string(int(record["miner_sats"])),
+        "sentry_sys": sats_to_sys_string(int(record["sentry_sats"])),
+        "governance_sys": sats_to_sys_string(int(record["governance_sats"])),
+        "initial_sys": sats_to_sys_string(int(record["initial_sats"])),
+        "fees_sys": sats_to_sys_string(int(record["fee_sats"])),
+        "payout_sys": sats_to_sys_string(int(record["payout_sats"])),
+        "issued_sys": sats_to_sys_string(int(record["issued_sats"])),
+        "sentry_base_sys": sats_to_sys_string(int(record["sentry_base_sats"])),
+        "sentry_l1_sys": sats_to_sys_string(int(record["sentry_l1_sats"])),
+        "sentry_l2_sys": sats_to_sys_string(int(record["sentry_l2_sats"])),
+        "nevm_static_reward_sys": fmt_wei_sys(int(record.get("nevm_static_reward_wei", 0))),
+        "nevm_priority_fee_sys": fmt_wei_sys(int(record.get("nevm_priority_fee_wei", 0))),
+        "nevm_miner_total_sys": fmt_wei_sys(int(record.get("nevm_miner_total_wei", 0))),
+        "nevm_burned_sys": fmt_wei_sys(int(record.get("nevm_burned_wei", 0))),
+        "nevm_net_issued_sys": fmt_wei_sys(int(record.get("nevm_net_issued_wei", 0))),
+        "combined_miner_sys": fmt_wei_sys(combined_miner_wei),
+        "net_issued_sys": fmt_wei_sys(net_issued_wei),
+        "net_issued_wei": net_issued_wei,
+        "combined_miner_wei": combined_miner_wei,
+        "issuance_rate_text": annualized_issuance_rate_text_from_wei(
+            net_issued_wei,
+            int(record.get("start_supply_wei", 0)),
+            periods_per_year,
+        ),
+    }
+
+
+def mock_emissions_snapshot() -> dict[str, Any]:
+    now_ts = int(time.time())
+    month_start = int(dt.datetime.fromtimestamp(now_ts, tz=dt.timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp())
+    sample_rows = [
+        {
+            "height": 2241216,
+            "block_time": now_ts - 500,
+            "miner_sats": sys_to_sats("15.919"),
+            "sentry_sats": sys_to_sats("95.516"),
+            "governance_sats": 0,
+            "initial_sats": 0,
+            "fee_sats": sys_to_sats("0.00035"),
+            "payout_sats": sys_to_sats("111.435"),
+            "issued_sats": sys_to_sats("111.435"),
+            "sentry_base_sats": 0,
+            "sentry_l1_sats": 0,
+            "sentry_l2_sats": sys_to_sats("95.516"),
+            "sentry_tier": "Level 2",
+            "positive_outputs": 2,
+        },
+        {
+            "height": 2241215,
+            "block_time": now_ts - 650,
+            "miner_sats": sys_to_sats("15.919"),
+            "sentry_sats": sys_to_sats("64.473"),
+            "governance_sats": 0,
+            "initial_sats": 0,
+            "fee_sats": 0,
+            "payout_sats": sys_to_sats("80.392"),
+            "issued_sats": sys_to_sats("80.392"),
+            "sentry_base_sats": 0,
+            "sentry_l1_sats": sys_to_sats("64.473"),
+            "sentry_l2_sats": 0,
+            "sentry_tier": "Level 1",
+            "positive_outputs": 3,
+        },
+        {
+            "height": 2241214,
+            "block_time": now_ts - 800,
+            "miner_sats": sys_to_sats("15.919"),
+            "sentry_sats": sys_to_sats("47.758"),
+            "governance_sats": 0,
+            "initial_sats": 0,
+            "fee_sats": 0,
+            "payout_sats": sys_to_sats("63.677"),
+            "issued_sats": sys_to_sats("63.677"),
+            "sentry_base_sats": sys_to_sats("47.758"),
+            "sentry_l1_sats": 0,
+            "sentry_l2_sats": 0,
+            "sentry_tier": "Base",
+            "positive_outputs": 2,
+        },
+    ]
+    period = finalize_period_record(
+        {
+            **empty_period_record("monthly", month_start, dt.datetime.fromtimestamp(month_start, tz=dt.timezone.utc).strftime("%b %Y"), sys_to_sats("832000000")),
+            "blocks": 16540,
+            "miner_sats": sys_to_sats("263250"),
+            "sentry_sats": sys_to_sats("1240000"),
+            "governance_sats": sys_to_sats("151767"),
+            "fee_sats": sys_to_sats("34"),
+            "payout_sats": sys_to_sats("1655017"),
+            "issued_sats": sys_to_sats("1654983"),
+            "sentry_base_sats": sys_to_sats("155000"),
+            "sentry_l1_sats": sys_to_sats("210000"),
+            "sentry_l2_sats": sys_to_sats("875000"),
+            "nevm_blocks": 16540,
+            "nevm_txs": 1242,
+            "nevm_static_reward_wei": NEVM_STATIC_REWARD_WEI * 16540,
+            "nevm_priority_fee_wei": 2_500_000_000_000_000,
+            "nevm_miner_total_wei": NEVM_STATIC_REWARD_WEI * 16540 + 2_500_000_000_000_000,
+            "nevm_burned_wei": 640_000_000_000_000,
+            "nevm_net_issued_wei": NEVM_STATIC_REWARD_WEI * 16540 - 640_000_000_000_000,
+            "net_issued_wei": sats_to_wei(sys_to_sats("1654983")) + NEVM_STATIC_REWARD_WEI * 16540 - 640_000_000_000_000,
+        }
+    )
+    latest_nevm = [
+        {
+            "height": 923732,
+            "block_time": now_ts - 500,
+            "miner_address": "0xd2708979f9f92d3e282ed9fd35fa2a19bec23b14",
+            "tx_count": 1,
+            "gas_used": 86424,
+            "base_fee_per_gas_wei": "7",
+            "static_reward_wei": str(NEVM_STATIC_REWARD_WEI),
+            "priority_fee_wei": "2856960000",
+            "burned_wei": "604968",
+            "miner_total_wei": str(NEVM_STATIC_REWARD_WEI + 2_856_960_000),
+            "net_issued_wei": str(NEVM_STATIC_REWARD_WEI - 604_968),
+        }
+    ]
+    mock_net_issued_wei = sats_to_wei(sys_to_sats("1654983")) + NEVM_STATIC_REWARD_WEI * 16540 - 640_000_000_000_000
+    mock_miner_wei = sats_to_wei(sys_to_sats("263250")) + NEVM_STATIC_REWARD_WEI * 16540 + 2_500_000_000_000_000
+    return {
+        "generated_at": now_iso(),
+        "type": "network_emissions",
+        "mock": True,
+        "index": {
+            "last_height": None,
+            "chain_height": None,
+            "complete": False,
+            "synced_at": None,
+            "nevm_last_height": None,
+            "nevm_chain_height": None,
+            "nevm_complete": False,
+            "nevm_synced_at": None,
+        },
+        "totals": {
+            "blocks": 0,
+            "miner_sats": 0,
+            "sentry_sats": 0,
+            "governance_sats": 0,
+            "initial_sats": 0,
+            "fee_sats": 0,
+            "payout_sats": 0,
+            "issued_sats": 0,
+            "sentry_base_sats": 0,
+            "sentry_l1_sats": 0,
+            "sentry_l2_sats": 0,
+            "issuance_rate_text": "Preview",
+            "combined_miner_wei": mock_miner_wei,
+            "combined_miner_sys": fmt_wei_sys(mock_miner_wei),
+            "net_issued_wei": mock_net_issued_wei,
+            "net_issued_sys": fmt_wei_sys(mock_net_issued_wei),
+            "nevm": {
+                "blocks": 16540,
+                "txs": 1242,
+                "static_reward_wei": NEVM_STATIC_REWARD_WEI * 16540,
+                "priority_fee_wei": 2_500_000_000_000_000,
+                "burned_wei": 640_000_000_000_000,
+                "miner_total_wei": NEVM_STATIC_REWARD_WEI * 16540 + 2_500_000_000_000_000,
+                "net_issued_wei": NEVM_STATIC_REWARD_WEI * 16540 - 640_000_000_000_000,
+                "first_height": 1,
+                "last_height": 923732,
+                "first_time": now_ts - 86400,
+                "last_time": now_ts - 500,
+                "static_reward_sys": fmt_wei_sys(NEVM_STATIC_REWARD_WEI * 16540),
+                "priority_fee_sys": fmt_wei_sys(2_500_000_000_000_000),
+                "burned_sys": fmt_wei_sys(640_000_000_000_000),
+                "miner_total_sys": fmt_wei_sys(NEVM_STATIC_REWARD_WEI * 16540 + 2_500_000_000_000_000),
+                "net_issued_sys": fmt_wei_sys(NEVM_STATIC_REWARD_WEI * 16540 - 640_000_000_000_000),
+            },
+        },
+        "periods": {
+            "weekly": [period],
+            "monthly": [period],
+            "yearly": [{**period, "period": "yearly", "label": str(dt.datetime.now().year)}],
+        },
+        "latest_blocks": sample_rows,
+        "latest_nevm_blocks": latest_nevm,
+    }
+
+
+def emissions_snapshot(store: Store, latest_limit: int = 100) -> dict[str, Any]:
+    progress = emission_progress(store)
+    nevm_progress = nevm_emission_progress(store)
+    count_row = store.conn.execute("SELECT COUNT(*) AS count FROM emission_blocks").fetchone()
+    nevm_count_row = store.conn.execute("SELECT COUNT(*) AS count FROM nevm_emission_blocks").fetchone()
+    if (
+        (not count_row or int(count_row["count"] or 0) == 0)
+        and (not nevm_count_row or int(nevm_count_row["count"] or 0) == 0)
+    ):
+        return mock_emissions_snapshot()
+
+    totals_row = store.conn.execute(
+        """
+        SELECT COUNT(*) AS blocks,
+               MIN(height) AS first_height,
+               MAX(height) AS last_height,
+               MIN(block_time) AS first_time,
+               MAX(block_time) AS last_time,
+               COALESCE(SUM(miner_sats), 0) AS miner_sats,
+               COALESCE(SUM(sentry_sats), 0) AS sentry_sats,
+               COALESCE(SUM(governance_sats), 0) AS governance_sats,
+               COALESCE(SUM(initial_sats), 0) AS initial_sats,
+               COALESCE(SUM(fee_sats), 0) AS fee_sats,
+               COALESCE(SUM(payout_sats), 0) AS payout_sats,
+               COALESCE(SUM(issued_sats), 0) AS issued_sats,
+               COALESCE(SUM(sentry_base_sats), 0) AS sentry_base_sats,
+               COALESCE(SUM(sentry_l1_sats), 0) AS sentry_l1_sats,
+               COALESCE(SUM(sentry_l2_sats), 0) AS sentry_l2_sats
+        FROM emission_blocks
+        """
+    ).fetchone()
+    nevm_rows = [
+        dict(row)
+        for row in store.conn.execute(
+            """
+            SELECT height, block_time, miner_address, tx_count, gas_used,
+                   static_reward_wei, priority_fee_wei, burned_wei,
+                   miner_total_wei, net_issued_wei, base_fee_per_gas_wei
+            FROM nevm_emission_blocks
+            ORDER BY height ASC
+            """
+        )
+    ]
+    nevm_totals = {
+        "blocks": len(nevm_rows),
+        "txs": sum(int(row["tx_count"] or 0) for row in nevm_rows),
+        "static_reward_wei": sum(int(row["static_reward_wei"] or 0) for row in nevm_rows),
+        "priority_fee_wei": sum(int(row["priority_fee_wei"] or 0) for row in nevm_rows),
+        "burned_wei": sum(int(row["burned_wei"] or 0) for row in nevm_rows),
+        "miner_total_wei": sum(int(row["miner_total_wei"] or 0) for row in nevm_rows),
+        "net_issued_wei": sum(int(row["net_issued_wei"] or 0) for row in nevm_rows),
+        "first_height": min((int(row["height"]) for row in nevm_rows), default=None),
+        "last_height": max((int(row["height"]) for row in nevm_rows), default=None),
+        "first_time": min((int(row["block_time"]) for row in nevm_rows if row.get("block_time")), default=None),
+        "last_time": max((int(row["block_time"]) for row in nevm_rows if row.get("block_time")), default=None),
+    }
+
+    period_maps: dict[str, dict[int, dict[str, Any]]] = {"weekly": {}, "monthly": {}, "yearly": {}}
+    running_issued = 0
+    for row in store.conn.execute(
+        """
+        SELECT height, block_time, miner_sats, sentry_sats, governance_sats, initial_sats,
+               fee_sats, payout_sats, issued_sats, sentry_base_sats, sentry_l1_sats, sentry_l2_sats
+        FROM emission_blocks
+        ORDER BY height ASC
+        """
+    ):
+        block_time = int_or_none(row["block_time"])
+        if block_time is None:
+            running_issued += int(row["issued_sats"] or 0)
+            continue
+        for period in ("weekly", "monthly", "yearly"):
+            start_time, label = period_start_label(block_time, period)
+            bucket = period_maps[period].setdefault(
+                start_time,
+                empty_period_record(period, start_time, label, running_issued),
+            )
+            bucket["blocks"] += 1
+            for key in (
+                "miner_sats",
+                "sentry_sats",
+                "governance_sats",
+                "initial_sats",
+                "fee_sats",
+                "payout_sats",
+                "issued_sats",
+                "sentry_base_sats",
+                "sentry_l1_sats",
+                "sentry_l2_sats",
+            ):
+                bucket[key] += int(row[key] or 0)
+            bucket["net_issued_wei"] += sats_to_wei(int(row["issued_sats"] or 0))
+        running_issued += int(row["issued_sats"] or 0)
+
+    running_nevm_net_wei = sats_to_wei(running_issued)
+    for row in nevm_rows:
+        block_time = int_or_none(row["block_time"])
+        if block_time is None:
+            running_nevm_net_wei += int(row["net_issued_wei"] or 0)
+            continue
+        for period in ("weekly", "monthly", "yearly"):
+            start_time, label = period_start_label(block_time, period)
+            bucket = period_maps[period].setdefault(
+                start_time,
+                empty_period_record(period, start_time, label, wei_to_sats_floor(running_nevm_net_wei)),
+            )
+            bucket["nevm_blocks"] += 1
+            bucket["nevm_txs"] += int(row["tx_count"] or 0)
+            bucket["nevm_static_reward_wei"] += int(row["static_reward_wei"] or 0)
+            bucket["nevm_priority_fee_wei"] += int(row["priority_fee_wei"] or 0)
+            bucket["nevm_miner_total_wei"] += int(row["miner_total_wei"] or 0)
+            bucket["nevm_burned_wei"] += int(row["burned_wei"] or 0)
+            bucket["nevm_net_issued_wei"] += int(row["net_issued_wei"] or 0)
+            bucket["net_issued_wei"] += int(row["net_issued_wei"] or 0)
+        running_nevm_net_wei += int(row["net_issued_wei"] or 0)
+
+    periods: dict[str, list[dict[str, Any]]] = {}
+    for period in ("weekly", "monthly", "yearly"):
+        finalized_records: list[dict[str, Any]] = []
+        running_period_supply_wei = 0
+        for _start, record in sorted(period_maps[period].items(), key=lambda item: item[0]):
+            record["start_supply_wei"] = running_period_supply_wei
+            record["start_supply_sats"] = wei_to_sats_floor(running_period_supply_wei)
+            finalized_records.append(finalize_period_record(record))
+            running_period_supply_wei += int(record.get("net_issued_wei", 0))
+        periods[period] = list(reversed(finalized_records))
+
+    latest_blocks = [
+        dict(row)
+        for row in store.conn.execute(
+            """
+            SELECT height, block_time, miner_sats, sentry_sats, governance_sats, initial_sats,
+                   fee_sats, payout_sats, issued_sats, sentry_base_sats, sentry_l1_sats,
+                   sentry_l2_sats, sentry_tier, positive_outputs
+            FROM emission_blocks
+            ORDER BY height DESC
+            LIMIT ?
+            """,
+            (latest_limit,),
+        )
+    ]
+    latest_nevm_blocks = list(reversed(nevm_rows[-latest_limit:]))
+
+    last_time = int_or_none(totals_row["last_time"])
+    total_issued = int(totals_row["issued_sats"] or 0)
+    total_net_issued_wei = sats_to_wei(total_issued) + nevm_totals["net_issued_wei"]
+    issuance_rate_text = "0%"
+    combined_last_time = max((value for value in (last_time, nevm_totals["last_time"]) if value), default=None)
+    if combined_last_time:
+        window_start = combined_last_time - 30 * 86400
+        window_row = store.conn.execute(
+            """
+            SELECT COALESCE(SUM(issued_sats), 0) AS issued_sats
+            FROM emission_blocks
+            WHERE block_time >= ?
+            """,
+            (window_start,),
+        ).fetchone()
+        nevm_window_wei = sum(int(row["net_issued_wei"] or 0) for row in nevm_rows if int_or_none(row.get("block_time")) and int(row["block_time"]) >= window_start)
+        window_issued_wei = sats_to_wei(int(window_row["issued_sats"] or 0)) + nevm_window_wei
+        issuance_rate_text = annualized_issuance_rate_text_from_wei(
+            window_issued_wei,
+            max(0, total_net_issued_wei - window_issued_wei),
+            Decimal("12.1667"),
+        )
+
+    last_height = int_or_none(progress.get("last_height"))
+    chain_height = int_or_none(progress.get("chain_height"))
+    nevm_last_height = int_or_none(nevm_progress.get("last_height"))
+    nevm_chain_height = int_or_none(nevm_progress.get("chain_height"))
+    complete = bool(chain_height is not None and last_height is not None and last_height >= chain_height)
+    nevm_complete = bool(nevm_chain_height is not None and nevm_last_height is not None and nevm_last_height >= nevm_chain_height)
+    totals = {key: int(totals_row[key] or 0) for key in totals_row.keys() if key.endswith("_sats") or key == "blocks"}
+    totals.update(
+        {
+            "first_height": int_or_none(totals_row["first_height"]),
+            "last_height": int_or_none(totals_row["last_height"]),
+            "first_time": int_or_none(totals_row["first_time"]),
+            "last_time": last_time,
+            "miner_sys": sats_to_sys_string(int(totals_row["miner_sats"] or 0)),
+            "sentry_sys": sats_to_sys_string(int(totals_row["sentry_sats"] or 0)),
+            "governance_sys": sats_to_sys_string(int(totals_row["governance_sats"] or 0)),
+            "initial_sys": sats_to_sys_string(int(totals_row["initial_sats"] or 0)),
+            "fees_sys": sats_to_sys_string(int(totals_row["fee_sats"] or 0)),
+            "payout_sys": sats_to_sys_string(int(totals_row["payout_sats"] or 0)),
+            "issued_sys": sats_to_sys_string(total_issued),
+            "issuance_rate_text": issuance_rate_text,
+            "nevm": {
+                **nevm_totals,
+                "static_reward_sys": fmt_wei_sys(nevm_totals["static_reward_wei"]),
+                "priority_fee_sys": fmt_wei_sys(nevm_totals["priority_fee_wei"]),
+                "burned_sys": fmt_wei_sys(nevm_totals["burned_wei"]),
+                "miner_total_sys": fmt_wei_sys(nevm_totals["miner_total_wei"]),
+                "net_issued_sys": fmt_wei_sys(nevm_totals["net_issued_wei"]),
+            },
+            "combined_miner_wei": sats_to_wei(int(totals_row["miner_sats"] or 0)) + nevm_totals["miner_total_wei"],
+            "combined_miner_sys": fmt_wei_sys(sats_to_wei(int(totals_row["miner_sats"] or 0)) + nevm_totals["miner_total_wei"]),
+            "net_issued_wei": total_net_issued_wei,
+            "net_issued_sys": fmt_wei_sys(total_net_issued_wei),
+        }
+    )
+    return {
+        "generated_at": now_iso(),
+        "type": "network_emissions",
+        "mock": False,
+        "index": {
+            "last_height": last_height,
+            "chain_height": chain_height,
+            "complete": complete,
+            "synced_at": progress.get("synced_at"),
+            "nevm_last_height": nevm_last_height,
+            "nevm_chain_height": nevm_chain_height,
+            "nevm_complete": nevm_complete,
+            "nevm_synced_at": nevm_progress.get("synced_at"),
+        },
+        "totals": totals,
+        "periods": periods,
+        "latest_blocks": latest_blocks,
+        "latest_nevm_blocks": latest_nevm_blocks,
+    }
+
+
 def follow_outputs(
     store: Store,
     client: BlockbookClient,
@@ -3045,12 +4190,16 @@ def publish_static_snapshot(
     masternode_page = masternodes_html(store, since_time=since_time, since_label=since_label, refresh_seconds=refresh_seconds)
     top_wallets = top_wallets_snapshot(store)
     top_wallets_page = top_wallets_html(store, refresh_seconds=refresh_seconds)
+    emissions = emissions_snapshot(store)
+    emissions_page = emissions_html(store, refresh_seconds=refresh_seconds)
     atomic_write_text(output_dir / "index.html", index_html)
     atomic_write_text(output_dir / "wallet-flows.html", index_html)
     atomic_write_text(output_dir / "sentrynode.html", masternode_page)
     atomic_write_text(output_dir / "masternodes.html", masternode_page)
     atomic_write_text(output_dir / TOP_WALLETS_HTML, top_wallets_page)
+    atomic_write_text(output_dir / EMISSIONS_HTML, emissions_page)
     atomic_write_json(output_dir / TOP_WALLETS_JSON, top_wallets)
+    atomic_write_json(output_dir / EMISSIONS_JSON, emissions)
     if CHART_ASSET_PATH.exists():
         asset_target = output_dir / CHART_ASSET_ROUTE.lstrip("/")
         asset_target.parent.mkdir(parents=True, exist_ok=True)
@@ -3072,11 +4221,616 @@ def publish_static_snapshot(
                 "legacy_masternodes": "masternodes.html",
                 "top_wallets": TOP_WALLETS_HTML,
                 "top_wallets_json": TOP_WALLETS_JSON,
+                "emissions": EMISSIONS_HTML,
+                "emissions_json": EMISSIONS_JSON,
                 "network_masternodes": "network_masternodes.csv",
             },
         },
     )
     return sync_stats
+
+
+def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
+    snapshot = emissions_snapshot(store)
+    totals = snapshot["totals"]
+    index = snapshot["index"]
+    is_mock = bool(snapshot.get("mock"))
+    block_height = index.get("last_height") or totals.get("last_height")
+    chain_height = index.get("chain_height")
+    nevm_totals = totals.get("nevm") or {}
+    nevm_height = index.get("nevm_last_height") or nevm_totals.get("last_height")
+    nevm_chain_height = index.get("nevm_chain_height")
+    blocks_remaining = (
+        max(0, int(chain_height) - int(block_height))
+        if chain_height is not None and block_height is not None
+        else None
+    )
+    nevm_blocks_remaining = (
+        max(0, int(nevm_chain_height) - int(nevm_height))
+        if nevm_chain_height is not None and nevm_height is not None
+        else None
+    )
+    status_text = "Preview data; emission index has not run yet." if is_mock else (
+        "Emission indexes complete" if index.get("complete") and index.get("nevm_complete") else "Emission index in progress"
+    )
+    updated_text = fmt_iso_local_datetime(snapshot.get("generated_at"))
+
+    def metric(title: str, value: str, detail: str = "") -> str:
+        detail_html = f"<small>{html.escape(detail)}</small>" if detail else ""
+        return f"<div class='metric'><span>{html.escape(title)}</span><b>{html.escape(value)}</b>{detail_html}</div>"
+
+    def table_controls(control_id: str, label: str) -> str:
+        return f"""
+      <div class="table-controls" aria-label="{html.escape(label)} table controls">
+        <div class="pagination-controls">
+          <label class="page-size-control" for="{control_id}-page-size">
+            <span>Rows</span>
+            <select id="{control_id}-page-size">
+              <option value="20" selected>20</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+          </label>
+          <div class="pager" aria-label="{html.escape(label)} pagination">
+            <button id="{control_id}-first" type="button">First</button>
+            <button id="{control_id}-prev" type="button">Prev</button>
+            <span class="page-status" id="{control_id}-page-status">0 of 0</span>
+            <button id="{control_id}-next" type="button">Next</button>
+            <button id="{control_id}-last" type="button">Last</button>
+          </div>
+        </div>
+      </div>"""
+
+    def period_rows(period: str) -> str:
+        rows = snapshot["periods"].get(period, [])
+        if not rows:
+            return f"<tr data-period='{period}'><td class='empty' colspan='12'>No {period} emission rows yet.</td></tr>"
+        html_rows = []
+        for row in rows:
+            nevm_burned_wei = int(row.get("nevm_burned_wei", 0))
+            combined_miner_wei = int(row.get("combined_miner_wei", 0))
+            net_issued_wei = int(row.get("net_issued_wei", 0))
+            html_rows.append(
+                "<tr "
+                f"data-period='{html.escape(period)}' "
+                f"data-period-start='{int(row['start_time'])}'>"
+                f"<td data-sort='{int(row['start_time'])}'>{html.escape(row['label'])}</td>"
+                f"<td class='amount' data-sort='{int(row['blocks'])}'>{int(row['blocks']):,}</td>"
+                f"<td class='amount' data-sort='{int(row.get('nevm_blocks', 0))}'>{int(row.get('nevm_blocks', 0)):,}</td>"
+                f"<td class='amount' data-sort='{combined_miner_wei}' title='{fmt_wei_sys(combined_miner_wei)} SYS'>{fmt_compact_wei_sys(combined_miner_wei)}</td>"
+                f"<td class='amount' data-sort='{int(row['sentry_sats'])}' title='{fmt_sys(int(row['sentry_sats']))} SYS'>{fmt_compact_sys(int(row['sentry_sats']))}</td>"
+                f"<td class='amount' data-sort='{int(row['governance_sats'])}' title='{fmt_sys(int(row['governance_sats']))} SYS'>{fmt_compact_sys(int(row['governance_sats']))}</td>"
+                f"<td class='amount' data-sort='{nevm_burned_wei}' title='{fmt_wei_sys(nevm_burned_wei)} SYS'>{fmt_compact_wei_sys(nevm_burned_wei)}</td>"
+                f"<td class='amount' data-sort='{net_issued_wei}' title='{fmt_wei_sys(net_issued_wei)} SYS'>{fmt_compact_wei_sys(net_issued_wei)}</td>"
+                f"<td class='amount' data-sort='{int(row['sentry_base_sats'])}'>{fmt_compact_sys(int(row['sentry_base_sats']))}</td>"
+                f"<td class='amount' data-sort='{int(row['sentry_l1_sats'])}'>{fmt_compact_sys(int(row['sentry_l1_sats']))}</td>"
+                f"<td class='amount' data-sort='{int(row['sentry_l2_sats'])}'>{fmt_compact_sys(int(row['sentry_l2_sats']))}</td>"
+                f"<td class='amount' data-sort='{html.escape(row['issuance_rate_text'].rstrip('%') if row['issuance_rate_text'].endswith('%') else '0')}'>{html.escape(row['issuance_rate_text'])}</td>"
+                "</tr>"
+            )
+        return "\n".join(html_rows)
+
+    period_rows_html = "\n".join(period_rows(period) for period in ("monthly", "weekly", "yearly"))
+    latest_rows = []
+    for row in snapshot.get("latest_blocks", []):
+        ts = int_or_none(row.get("block_time"))
+        latest_rows.append(
+            "<tr>"
+            f"<td data-sort='{int(row.get('height') or 0)}'>{int(row.get('height') or 0):,}</td>"
+            f"<td data-sort='{ts or 0}'>{html.escape(fmt_table_datetime(ts))}</td>"
+            f"<td class='amount' data-sort='{int(row.get('miner_sats') or 0)}'>{fmt_compact_sys(int(row.get('miner_sats') or 0))}</td>"
+            f"<td class='amount' data-sort='{int(row.get('sentry_sats') or 0)}'>{fmt_compact_sys(int(row.get('sentry_sats') or 0))}</td>"
+            f"<td class='amount' data-sort='{int(row.get('governance_sats') or 0)}'>{fmt_compact_sys(int(row.get('governance_sats') or 0))}</td>"
+            f"<td class='amount' data-sort='{int(row.get('fee_sats') or 0)}'>{fmt_compact_sys(int(row.get('fee_sats') or 0))}</td>"
+            f"<td data-sort='{html.escape(str(row.get('sentry_tier') or ''))}'>{html.escape(str(row.get('sentry_tier') or '-'))}</td>"
+            "</tr>"
+        )
+    latest_rows_html = "\n".join(latest_rows) or "<tr><td class='empty' colspan='7'>No recent block emissions yet.</td></tr>"
+    latest_nevm_rows = []
+    for row in snapshot.get("latest_nevm_blocks", []):
+        ts = int_or_none(row.get("block_time"))
+        miner_address = str(row.get("miner_address") or "")
+        latest_nevm_rows.append(
+            "<tr>"
+            f"<td data-sort='{int(row.get('height') or 0)}'>{int(row.get('height') or 0):,}</td>"
+            f"<td data-sort='{ts or 0}'>{html.escape(fmt_table_datetime(ts))}</td>"
+            f"<td class='amount' data-sort='{int(row.get('static_reward_wei') or 0)}'>{fmt_compact_wei_sys(int(row.get('static_reward_wei') or 0))}</td>"
+            f"<td class='amount' data-sort='{int(row.get('priority_fee_wei') or 0)}'>{fmt_compact_wei_sys(int(row.get('priority_fee_wei') or 0))}</td>"
+            f"<td class='amount' data-sort='{int(row.get('burned_wei') or 0)}'>{fmt_compact_wei_sys(int(row.get('burned_wei') or 0))}</td>"
+            f"<td class='amount' data-sort='{int(row.get('gas_used') or 0)}'>{int(row.get('gas_used') or 0):,}</td>"
+            f"<td class='amount' data-sort='{int(row.get('tx_count') or 0)}'>{int(row.get('tx_count') or 0):,}</td>"
+            f"<td class='mono' title='{html.escape(miner_address)}'>{html.escape(short_address(miner_address))}</td>"
+            "</tr>"
+        )
+    latest_nevm_rows_html = "\n".join(latest_nevm_rows) or "<tr><td class='empty' colspan='8'>No recent NEVM emissions yet.</td></tr>"
+
+    def chart_records(period: str, limit: int) -> list[dict[str, Any]]:
+        records = list(reversed(snapshot["periods"].get(period, [])[:limit]))
+        return [
+            {
+                "label": row["label"],
+                "miner": round(float(Decimal(int(row["miner_sats"])) / SATOSHI), 4),
+                "combinedMiner": round(float(Decimal(int(row.get("combined_miner_wei", 0))) / Decimal(WEI_PER_SYS_INT)), 4),
+                "nevmMiner": round(float(Decimal(int(row.get("nevm_miner_total_wei", 0))) / Decimal(WEI_PER_SYS_INT)), 4),
+                "nevmStatic": round(float(Decimal(int(row.get("nevm_static_reward_wei", 0))) / Decimal(WEI_PER_SYS_INT)), 4),
+                "nevmPriority": round(float(Decimal(int(row.get("nevm_priority_fee_wei", 0))) / Decimal(WEI_PER_SYS_INT)), 8),
+                "nevmBurned": round(float(Decimal(int(row.get("nevm_burned_wei", 0))) / Decimal(WEI_PER_SYS_INT)), 8),
+                "netIssued": round(float(Decimal(int(row.get("net_issued_wei", 0))) / Decimal(WEI_PER_SYS_INT)), 4),
+                "sentry": round(float(Decimal(int(row["sentry_sats"])) / SATOSHI), 4),
+                "governance": round(float(Decimal(int(row["governance_sats"])) / SATOSHI), 4),
+                "initial": round(float(Decimal(int(row["initial_sats"])) / SATOSHI), 4),
+                "base": round(float(Decimal(int(row["sentry_base_sats"])) / SATOSHI), 4),
+                "l1": round(float(Decimal(int(row["sentry_l1_sats"])) / SATOSHI), 4),
+                "l2": round(float(Decimal(int(row["sentry_l2_sats"])) / SATOSHI), 4),
+                "fees": round(float(Decimal(int(row["fee_sats"])) / SATOSHI), 4),
+                "rate": float(row["issuance_rate_text"].rstrip("%")) if row["issuance_rate_text"].endswith("%") else 0,
+            }
+            for row in records
+        ]
+
+    chart_data = {
+        "monthly": chart_records("monthly", 18),
+        "weekly": chart_records("weekly", 26),
+        "yearly": chart_records("yearly", 12),
+    }
+    chart_data_json = json.dumps(chart_data).replace("</", "<\\/")
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="{max(refresh_seconds, 1)}">
+  <title>Syscoin Network Emissions</title>
+  <style>
+    :root {{ color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --page-gutter: clamp(24px, 3.8vw, 80px); }}
+    *, *::before, *::after {{ box-sizing: border-box; }}
+    html, body {{ margin: 0; max-width: 100%; overflow-x: hidden; }}
+    body {{ background: #f7f5f0; color: #1c2227; }}
+    header {{ background: #142026; color: #f8fafc; padding: 24px 0 22px; width: 100%; }}
+    .header-inner, main {{ margin-left: var(--page-gutter); margin-right: var(--page-gutter); width: auto; }}
+    .topbar {{ display: flex; align-items: end; justify-content: space-between; gap: 16px; }}
+    h1 {{ font-size: 1.8rem; margin: 0 0 8px; letter-spacing: 0; }}
+    .subtitle {{ color: #c9d5d8; font-size: 0.98rem; line-height: 1.45; }}
+    .nav {{ display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }}
+    .nav a {{ border: 1px solid rgba(248, 250, 252, 0.28); border-radius: 999px; color: #dbe6e9; font-size: 0.84rem; padding: 7px 11px; text-decoration: none; }}
+    .nav a.active {{ background: #f8fafc; color: #142026; }}
+    main {{ display: grid; gap: 22px; margin-top: 22px; margin-bottom: 22px; padding: 0; }}
+    main > * {{ min-width: 0; }}
+    .section-panel {{ background: rgba(255, 255, 255, 0.66); border: 1px solid #d9ded8; border-radius: 8px; min-width: 0; padding: 16px; }}
+    .metrics {{ display: grid; grid-template-columns: repeat(6, minmax(130px, 1fr)); gap: 12px; }}
+    .metric {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; padding: 14px 16px; min-width: 0; }}
+    .metric span {{ display: block; color: #687177; font-size: 0.84rem; margin-bottom: 6px; }}
+    .metric b {{ display: block; font-size: clamp(1.18rem, 1.8vw, 1.55rem); line-height: 1.1; overflow-wrap: anywhere; }}
+    .metric small {{ color: #687177; display: block; font-size: 0.78rem; font-weight: 700; margin-top: 8px; }}
+    .panel-title {{ display: flex; align-items: end; justify-content: space-between; gap: 16px; }}
+    .panel-title h2 {{ margin: 0; font-size: 1.25rem; }}
+    .panel-title p {{ margin: 0; color: #687177; font-size: 0.9rem; }}
+    .phase-note {{ color: #687177; font-size: 0.9rem; line-height: 1.45; margin: 8px 0 10px; max-width: 900px; }}
+    .period-summary {{ display: grid; grid-template-columns: repeat(6, minmax(120px, 1fr)); gap: 10px; margin: 12px 0; }}
+    .period-summary article {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; min-width: 0; padding: 12px; }}
+    .period-summary span {{ color: #687177; display: block; font-size: 0.78rem; font-weight: 700; margin-bottom: 5px; }}
+    .period-summary b {{ display: block; font-size: 1.05rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .emissions-overview {{ border-top: 1px solid #d9ded8; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 12px; }}
+    .allocation-block {{ min-width: 0; padding: 18px 18px 10px 0; }}
+    .allocation-block + .allocation-block {{ border-left: 1px solid #d9ded8; padding-left: 18px; }}
+    .allocation-block h3 {{ font-size: 1rem; margin: 0 0 4px; }}
+    .allocation-block p {{ color: #687177; font-size: 0.82rem; line-height: 1.4; margin: 0 0 12px; }}
+    .stack-bar {{ background: #edf1ed; border-radius: 999px; display: flex; height: 18px; margin: 10px 0 14px; min-width: 0; overflow: hidden; }}
+    .stack-bar span {{ display: block; min-width: 2px; }}
+    .allocation-list {{ display: grid; gap: 7px; margin: 0; }}
+    .allocation-row {{ align-items: center; display: grid; gap: 8px; grid-template-columns: 10px minmax(80px, 1fr) auto auto; min-width: 0; }}
+    .allocation-row .swatch {{ border-radius: 999px; height: 10px; width: 10px; }}
+    .allocation-row dt, .allocation-row dd {{ margin: 0; }}
+    .allocation-row dt {{ color: #687177; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .allocation-row dd {{ font-weight: 800; white-space: nowrap; }}
+    .allocation-row .pct {{ color: #687177; font-size: 0.8rem; min-width: 48px; text-align: right; }}
+    .rate-block b {{ display: block; font-size: clamp(1.5rem, 3vw, 2.3rem); line-height: 1.05; margin: 8px 0 14px; }}
+    .rate-facts {{ display: grid; gap: 8px; }}
+    .rate-facts div {{ display: flex; justify-content: space-between; gap: 12px; }}
+    .rate-facts span {{ color: #687177; }}
+    .rate-facts strong {{ white-space: nowrap; }}
+    .trend-panel {{ border-top: 1px solid #d9ded8; margin-top: 12px; padding-top: 16px; }}
+    .trend-panel h3 {{ font-size: 1rem; margin: 0 0 4px; }}
+    .trend-panel p {{ color: #687177; font-size: 0.82rem; line-height: 1.4; margin: 0 0 10px; }}
+    .chart-canvas-wrap {{ height: 260px; min-width: 0; position: relative; }}
+    .table-controls {{ align-items: end; display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; margin: 10px 0; }}
+    .pagination-controls {{ align-items: end; display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; margin-left: auto; }}
+    .page-size-control {{ color: #687177; display: grid; font-size: 0.78rem; font-weight: 700; gap: 4px; width: 110px; }}
+    .table-controls label {{ color: #687177; display: grid; font-size: 0.78rem; font-weight: 700; gap: 4px; }}
+    .table-controls select {{ background: #fff; border: 1px solid #cfd7d1; border-radius: 6px; color: #1c2227; font: inherit; min-height: 36px; padding: 7px 9px; }}
+    .pager {{ align-items: center; color: #687177; display: flex; gap: 8px; justify-content: flex-end; }}
+    .pager button {{ background: #fff; border: 1px solid #cfd7d1; border-radius: 6px; color: #1c2227; cursor: pointer; font: inherit; min-height: 36px; padding: 7px 10px; }}
+    .pager button:disabled {{ cursor: default; opacity: 0.45; }}
+    .page-status {{ color: #687177; font-size: 0.86rem; min-width: 96px; text-align: center; }}
+    .table-wrap {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; max-width: 100%; min-width: 0; overflow-x: auto; width: 100%; }}
+    table {{ width: 100%; min-width: 1120px; border-collapse: separate; border-spacing: 0; background: #fff; table-layout: fixed; }}
+    th, td {{ padding: 8px 10px; border-bottom: 1px solid #e4e8e2; text-align: left; font-size: 0.88rem; overflow: hidden; text-overflow: ellipsis; }}
+    th {{ background: #eaf0ec; position: sticky; top: 0; z-index: 10; box-shadow: 0 1px 0 #d9ded8; }}
+    th:nth-child(n+2), td:nth-child(n+2) {{ text-align: right; white-space: nowrap; }}
+    .latest-blocks th:nth-child(2), .latest-blocks td:nth-child(2),
+    .latest-blocks th:nth-child(7), .latest-blocks td:nth-child(7),
+    .latest-nevm-blocks th:nth-child(2), .latest-nevm-blocks td:nth-child(2),
+    .latest-nevm-blocks th:nth-child(8), .latest-nevm-blocks td:nth-child(8) {{ text-align: left; }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }}
+    .amount {{ font-weight: 800; white-space: nowrap; }}
+    .empty {{ color: #687177; padding: 18px 14px; text-align: center; }}
+    a {{ color: #086788; text-decoration: none; }}
+    @media(max-width: 1080px) {{
+      .metrics {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
+      .period-summary {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .emissions-overview {{ grid-template-columns: 1fr; }}
+      .allocation-block {{ border-left: 0 !important; border-top: 1px solid #d9ded8; padding: 16px 0 8px; }}
+      .pagination-controls {{ align-items: stretch; flex-direction: column; margin-left: 0; width: 100%; }}
+      .page-size-control {{ width: 100%; }}
+      .pager {{ justify-content: space-between; }}
+      .topbar {{ align-items: start; flex-direction: column; }}
+      .nav {{ justify-content: flex-start; }}
+    }}
+    @media(max-width: 720px) {{
+      .metrics {{ grid-template-columns: 1fr; }}
+      .period-summary {{ grid-template-columns: 1fr; }}
+      .chart-canvas-wrap {{ height: 240px; }}
+      .panel-title {{ align-items: start; flex-direction: column; }}
+      .header-inner, main {{ margin-left: 12px; margin-right: 12px; }}
+      .section-panel {{ padding: 12px; }}
+    }}
+    @media (prefers-color-scheme: dark) {{
+      body {{ background: #121619; color: #f3f4f6; }}
+      .section-panel {{ background: rgba(28, 35, 40, 0.62); border-color: #334047; }}
+      .metric, .period-summary article, .table-wrap, table {{ background: #1c2328; border-color: #334047; }}
+      .table-controls select, .pager button {{ background: #1c2328; border-color: #46555e; color: #f3f4f6; }}
+      th {{ background: #263139; }}
+      th, td {{ border-color: #334047; }}
+      a {{ color: #67d7ff; }}
+      .subtitle {{ color: #b6c3c7; }}
+      .emissions-overview, .allocation-block + .allocation-block, .trend-panel, .allocation-block {{ border-color: #334047; }}
+      .stack-bar {{ background: #263139; }}
+      .metric span, .metric small, .period-summary span, .allocation-block p, .allocation-row dt, .allocation-row .pct, .rate-facts span, .trend-panel p, .panel-title p, .phase-note, .empty, .table-controls label, .page-size-control, .pager, .page-status {{ color: #a7b0b5; }}
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <div class="topbar">
+        <div>
+          <h1>Syscoin Network Emissions</h1>
+          <div class="subtitle">Experimental view. Reward payouts and issuance estimates from indexed block coinbase data.</div>
+        </div>
+        <nav class="nav" aria-label="Dashboard pages">
+          <a href="/">Wallet Flows</a>
+          <a href="/sentrynode">Sentry Nodes</a>
+          <a href="/top-wallets">Top Wallets</a>
+          <a class="active" href="/emissions">Network Emissions</a>
+        </nav>
+      </div>
+    </div>
+  </header>
+  <main>
+    <section class="section-panel metrics">
+      {metric("UTXO Height", f"{block_height:,}" if block_height is not None else "Not indexed", f"{blocks_remaining:,} remaining" if blocks_remaining is not None else status_text)}
+      {metric("NEVM Height", f"{nevm_height:,}" if nevm_height is not None else "Not indexed", f"{nevm_blocks_remaining:,} remaining" if nevm_blocks_remaining is not None else "NEVM index not run")}
+      {metric("Miner Rewards", fmt_compact_wei_sys(int(totals.get("combined_miner_wei", 0))), "UTXO + NEVM")}
+      {metric("Sentry Payouts", fmt_compact_sys(int(totals.get("sentry_sats", 0))))}
+      {metric("NEVM Fee Burns", fmt_compact_wei_sys(int(nevm_totals.get("burned_wei", 0))))}
+      {metric("Est. Issuance Rate", str(totals.get("issuance_rate_text") or "0%"), "30-day annualized")}
+    </section>
+    <section class="section-panel">
+      <div class="panel-title">
+        <h2>Reward Breakdown</h2>
+        <p>{html.escape(status_text)} · Updated {html.escape(updated_text)}</p>
+      </div>
+      <p class="phase-note">UTXO payouts come from coinbase outputs. NEVM adds a static miner reward, priority fees, and burned base fees. Net issuance counts new rewards minus NEVM burns; priority fees are miner income but not new supply.</p>
+      <div class="table-controls">
+        <label for="emission-period-select">
+          <span>Breakdown</span>
+          <select id="emission-period-select">
+            <option value="monthly" selected>Monthly</option>
+            <option value="weekly">Weekly</option>
+            <option value="yearly">Yearly</option>
+          </select>
+        </label>
+      </div>
+      <div class="period-summary" aria-label="Selected period summary">
+        <article><span>Period</span><b id="summary-period">-</b></article>
+        <article><span>Net Issuance</span><b id="summary-issued">-</b></article>
+        <article><span>Miner Rewards</span><b id="summary-miner">-</b></article>
+        <article><span>Sentry</span><b id="summary-sentry">-</b></article>
+        <article><span>Fee Burns</span><b id="summary-burned">-</b></article>
+        <article><span>Inflation</span><b id="summary-rate">-</b></article>
+      </div>
+      <div class="emissions-overview">
+        <section class="allocation-block">
+          <h3>Reward Split</h3>
+          <p>Where selected period rewards went.</p>
+          <div class="stack-bar" id="reward-bar" aria-label="Reward split bar"></div>
+          <dl class="allocation-list" id="reward-list"></dl>
+        </section>
+        <section class="allocation-block">
+          <h3>NEVM Fee Market</h3>
+          <p>Miner rewards, priority fees, and burned base fees.</p>
+          <div class="stack-bar" id="nevm-bar" aria-label="NEVM fee market bar"></div>
+          <dl class="allocation-list" id="nevm-list"></dl>
+        </section>
+        <section class="allocation-block">
+          <h3>Sentry Seniority Split</h3>
+          <p>How sentry payouts split across Base, Level 1, and Level 2.</p>
+          <div class="stack-bar" id="seniority-bar" aria-label="Sentry seniority split bar"></div>
+          <dl class="allocation-list" id="seniority-list"></dl>
+        </section>
+        <section class="allocation-block rate-block">
+          <h3>Inflation Estimate</h3>
+          <p>Annualized from indexed block issuance.</p>
+          <b id="rate-main">-</b>
+          <div class="rate-facts">
+            <div><span>Net issued</span><strong id="rate-issued">-</strong></div>
+            <div><span>NEVM burns</span><strong id="rate-fees">-</strong></div>
+            <div><span>Period</span><strong id="rate-period">-</strong></div>
+          </div>
+        </section>
+      </div>
+      <div class="trend-panel" id="trend-panel" hidden>
+        <h3>History Trend</h3>
+        <p>Shown when the selected breakdown has enough periods to compare.</p>
+        <div class="chart-canvas-wrap"><canvas id="trend-chart" role="img" aria-label="Emission history trend"></canvas></div>
+      </div>
+    </section>
+    <section class="section-panel">
+      <div class="panel-title">
+        <h2>Period Table</h2>
+        <p>Monthly, weekly, and yearly views</p>
+      </div>
+      {table_controls("emission-periods", "Emission period")}
+      <div class="table-wrap">
+        <table id="emission-periods-table" class="paginated-table">
+          <thead><tr><th>Period</th><th>UTXO Blocks</th><th>NEVM Blocks</th><th>Miner</th><th>Sentry</th><th>Governance</th><th>Burned</th><th>Net Issuance</th><th>Base</th><th>Level 1</th><th>Level 2</th><th>Inflation</th></tr></thead>
+          <tbody>{period_rows_html}</tbody>
+        </table>
+      </div>
+    </section>
+    <section class="section-panel">
+      <div class="panel-title">
+        <h2>Latest UTXO Blocks</h2>
+        <p>Recent UTXO coinbase payouts</p>
+      </div>
+      {table_controls("latest-blocks", "Latest blocks")}
+      <div class="table-wrap">
+        <table id="latest-blocks-table" class="latest-blocks paginated-table">
+          <thead><tr><th>Block</th><th>Time</th><th>Miner</th><th>Sentry</th><th>Governance</th><th>Fees</th><th>Sentry Tier</th></tr></thead>
+          <tbody>{latest_rows_html}</tbody>
+        </table>
+      </div>
+    </section>
+    <section class="section-panel">
+      <div class="panel-title">
+        <h2>Latest NEVM Blocks</h2>
+        <p>Recent NEVM rewards and burns</p>
+      </div>
+      {table_controls("latest-nevm-blocks", "Latest NEVM blocks")}
+      <div class="table-wrap">
+        <table id="latest-nevm-blocks-table" class="latest-nevm-blocks paginated-table">
+          <thead><tr><th>Block</th><th>Time</th><th>Static Reward</th><th>Priority Fees</th><th>Burned</th><th>Gas Used</th><th>Txns</th><th>Miner</th></tr></thead>
+          <tbody>{latest_nevm_rows_html}</tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+  <script type="application/json" id="emission-chart-data">{chart_data_json}</script>
+  <script src="{CHART_ASSET_ROUTE}"></script>
+  <script>
+    (() => {{
+      const selector = document.getElementById("emission-period-select");
+      const rows = Array.from(document.querySelectorAll("#emission-periods-table tbody tr"));
+      const chartData = JSON.parse(document.getElementById("emission-chart-data")?.textContent || "{{}}");
+      const palette = {{
+        miner: "#2f7ebc",
+        sentry: "#169950",
+        governance: "#9b6bca",
+        initial: "#7a858a",
+        nevm: "#b15a2b",
+        burn: "#d64d3c",
+        base: "#7a858a",
+        l1: "#2f7ebc",
+        l2: "#169950",
+        rate: "#b15a2b"
+      }};
+      let trendChart;
+      const sysTooltip = (value) => `${{Number(value).toLocaleString(undefined, {{ maximumFractionDigits: 2 }})}} SYS`;
+      const compactSys = (value) => {{
+        const number = Number(value) || 0;
+        if (Math.abs(number) >= 1000000) return `${{(number / 1000000).toFixed(2)}}M SYS`;
+        if (Math.abs(number) >= 1000) return `${{(number / 1000).toFixed(2)}}K SYS`;
+        return `${{number.toFixed(2)}} SYS`;
+      }};
+      const percent = (value, total) => total > 0 ? `${{((value / total) * 100).toFixed(1)}}%` : "0.0%";
+      const setText = (id, value) => {{
+        const node = document.getElementById(id);
+        if (node) node.textContent = value;
+      }};
+      const renderAllocation = (barId, listId, items) => {{
+        const bar = document.getElementById(barId);
+        const list = document.getElementById(listId);
+        const total = items.reduce((sum, item) => sum + Math.max(0, item.value || 0), 0);
+        if (bar) {{
+          bar.replaceChildren();
+          items.filter((item) => item.value > 0).forEach((item) => {{
+            const segment = document.createElement("span");
+            segment.style.flexBasis = `${{Math.max(0.5, (item.value / total) * 100)}}%`;
+            segment.style.backgroundColor = item.color;
+            segment.title = `${{item.label}}: ${{compactSys(item.value)}} (${{percent(item.value, total)}})`;
+            bar.appendChild(segment);
+          }});
+        }}
+        if (list) {{
+          list.replaceChildren();
+          items.forEach((item) => {{
+            const row = document.createElement("div");
+            row.className = "allocation-row";
+            const swatch = document.createElement("span");
+            swatch.className = "swatch";
+            swatch.style.backgroundColor = item.color;
+            const label = document.createElement("dt");
+            label.textContent = item.label;
+            const value = document.createElement("dd");
+            value.textContent = compactSys(item.value);
+            const share = document.createElement("dd");
+            share.className = "pct";
+            share.textContent = percent(item.value, total);
+            row.append(swatch, label, value, share);
+            list.appendChild(row);
+          }});
+        }}
+      }};
+      const setRows = (period) => {{
+        rows.forEach((row) => {{
+          row.hidden = row.dataset.period !== period;
+          row.dataset.periodFiltered = row.dataset.period !== period ? "true" : "false";
+        }});
+        window.dispatchEvent(new CustomEvent("emissions:period-change"));
+      }};
+      const recordsFor = (period) => chartData[period] || [];
+      const upsertCharts = (period) => {{
+        const records = recordsFor(period);
+        const labels = records.map((item) => item.label);
+        const latest = records[records.length - 1] || {{}};
+        setText("summary-period", latest.label || "-");
+        setText("summary-issued", compactSys(latest.netIssued || 0));
+        setText("summary-miner", compactSys(latest.combinedMiner || 0));
+        setText("summary-sentry", compactSys(latest.sentry || 0));
+        setText("summary-burned", compactSys(latest.nevmBurned || 0));
+        setText("summary-rate", Number.isFinite(latest.rate) ? `${{latest.rate.toFixed(2)}}%` : "-");
+        renderAllocation("reward-bar", "reward-list", [
+          {{ label: "UTXO Miner", value: latest.miner || 0, color: palette.miner }},
+          {{ label: "NEVM Miner", value: latest.nevmMiner || 0, color: palette.nevm }},
+          {{ label: "Sentry", value: latest.sentry || 0, color: palette.sentry }},
+          {{ label: "Governance", value: latest.governance || 0, color: palette.governance }},
+          {{ label: "Initial", value: latest.initial || 0, color: palette.initial }}
+        ]);
+        renderAllocation("nevm-bar", "nevm-list", [
+          {{ label: "Static Reward", value: latest.nevmStatic || 0, color: palette.nevm }},
+          {{ label: "Priority Fees", value: latest.nevmPriority || 0, color: palette.miner }},
+          {{ label: "Fee Burns", value: latest.nevmBurned || 0, color: palette.burn }}
+        ]);
+        renderAllocation("seniority-bar", "seniority-list", [
+          {{ label: "Base", value: latest.base || 0, color: palette.base }},
+          {{ label: "Level 1", value: latest.l1 || 0, color: palette.l1 }},
+          {{ label: "Level 2", value: latest.l2 || 0, color: palette.l2 }}
+        ]);
+        setText("rate-main", Number.isFinite(latest.rate) ? `${{latest.rate.toFixed(2)}}%` : "-");
+        setText("rate-issued", compactSys(latest.netIssued || 0));
+        setText("rate-fees", compactSys(latest.nevmBurned || 0));
+        setText("rate-period", latest.label || "-");
+
+        const trendPanel = document.getElementById("trend-panel");
+        if (trendPanel) trendPanel.hidden = records.length < 2;
+        if (trendChart) {{
+          trendChart.destroy();
+          trendChart = null;
+        }}
+        if (!window.Chart || records.length < 2) return;
+        const trendConfig = {{
+          type: "line",
+          data: {{
+            labels,
+            datasets: [
+              {{ label: "Issued", data: records.map((item) => (item.miner || 0) + (item.sentry || 0) + (item.governance || 0) + (item.initial || 0)), borderColor: palette.sentry, backgroundColor: "rgba(22,153,80,0.12)", yAxisID: "sys", tension: 0.25, fill: true }},
+              {{ label: "Net issuance", data: records.map((item) => item.netIssued || 0), borderColor: palette.nevm, backgroundColor: "rgba(177,90,43,0.12)", yAxisID: "sys", tension: 0.25 }},
+              {{ label: "Inflation", data: records.map((item) => item.rate), borderColor: palette.rate, backgroundColor: "rgba(177,90,43,0.12)", yAxisID: "rate", tension: 0.25 }}
+            ]
+          }},
+          options: {{
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: {{ mode: "index", intersect: false }},
+            plugins: {{
+              legend: {{ position: "bottom" }},
+              tooltip: {{
+                callbacks: {{
+                  label: (ctx) => ctx.dataset.yAxisID === "rate"
+                    ? `${{ctx.dataset.label}}: ${{ctx.parsed.y.toFixed(2)}}%`
+                    : `${{ctx.dataset.label}}: ${{sysTooltip(ctx.parsed.y)}}`
+                }}
+              }}
+            }},
+            scales: {{
+              x: {{ grid: {{ display: false }} }},
+              sys: {{ beginAtZero: true, position: "left" }},
+              rate: {{ beginAtZero: true, position: "right", grid: {{ drawOnChartArea: false }}, ticks: {{ callback: (value) => `${{value}}%` }} }}
+            }}
+          }}
+        }};
+        trendChart = new Chart(document.getElementById("trend-chart"), trendConfig);
+      }};
+      const update = () => {{
+        const period = selector?.value || "monthly";
+        setRows(period);
+        upsertCharts(period);
+      }};
+      selector?.addEventListener("change", update);
+      update();
+    }})();
+    (() => {{
+      document.querySelectorAll(".paginated-table").forEach((table) => {{
+        const tbody = table.tBodies[0];
+        if (!tbody) return;
+        const controlId = table.id ? table.id.replace(/-table$/, "") : "";
+        const pageSizeSelect = controlId ? document.getElementById(`${{controlId}}-page-size`) : null;
+        const firstButton = controlId ? document.getElementById(`${{controlId}}-first`) : null;
+        const prevButton = controlId ? document.getElementById(`${{controlId}}-prev`) : null;
+        const nextButton = controlId ? document.getElementById(`${{controlId}}-next`) : null;
+        const lastButton = controlId ? document.getElementById(`${{controlId}}-last`) : null;
+        const pageStatus = controlId ? document.getElementById(`${{controlId}}-page-status`) : null;
+        let page = 1;
+        let pageSize = Number(pageSizeSelect?.value || 20);
+        const rowsForPage = () => Array.from(tbody.rows).filter((row) => !row.querySelector(".empty") && row.dataset.periodFiltered !== "true");
+        const renderPage = () => {{
+          const rows = rowsForPage();
+          const total = rows.length;
+          const totalPages = Math.max(1, Math.ceil(total / pageSize));
+          page = Math.min(Math.max(page, 1), totalPages);
+          const start = (page - 1) * pageSize;
+          const end = Math.min(start + pageSize, total);
+          Array.from(tbody.rows).forEach((row) => {{
+            if (row.querySelector(".empty")) {{
+              row.hidden = total > 0;
+              return;
+            }}
+            if (row.dataset.periodFiltered === "true") {{
+              row.hidden = true;
+              return;
+            }}
+            const index = rows.indexOf(row);
+            row.hidden = index < start || index >= end;
+          }});
+          if (pageStatus) pageStatus.textContent = total ? `${{start + 1}}-${{end}} of ${{total}}` : "0 of 0";
+          if (firstButton) firstButton.disabled = page <= 1 || total === 0;
+          if (prevButton) prevButton.disabled = page <= 1 || total === 0;
+          if (nextButton) nextButton.disabled = page >= totalPages || total === 0;
+          if (lastButton) lastButton.disabled = page >= totalPages || total === 0;
+        }};
+        pageSizeSelect?.addEventListener("change", () => {{
+          pageSize = Number(pageSizeSelect.value || 20);
+          page = 1;
+          renderPage();
+        }});
+        firstButton?.addEventListener("click", () => {{ page = 1; renderPage(); }});
+        prevButton?.addEventListener("click", () => {{ page -= 1; renderPage(); }});
+        nextButton?.addEventListener("click", () => {{ page += 1; renderPage(); }});
+        lastButton?.addEventListener("click", () => {{
+          page = Math.max(1, Math.ceil(rowsForPage().length / pageSize));
+          renderPage();
+        }});
+        window.addEventListener("emissions:period-change", () => {{
+          page = 1;
+          renderPage();
+        }});
+        renderPage();
+      }});
+    }})();
+  </script>
+</body>
+</html>"""
 
 
 def dashboard_html(
@@ -3429,6 +5183,7 @@ def dashboard_html(
           <a class="active" href="/">Wallet Flows</a>
           <a href="/sentrynode">Sentry Nodes</a>
           <a href="/top-wallets">Top Wallets</a>
+          <a href="/emissions">Network Emissions</a>
         </nav>
       </div>
     </div>
@@ -4061,6 +5816,7 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
           <a href="/">Wallet Flows</a>
           <a href="/sentrynode">Sentry Nodes</a>
           <a class="active" href="/top-wallets">Top Wallets</a>
+          <a href="/emissions">Network Emissions</a>
         </nav>
       </div>
     </div>
@@ -4627,6 +6383,7 @@ def masternodes_html(
           <a href="/">Wallet Flows</a>
           <a class="active" href="/sentrynode">Sentry Nodes</a>
           <a href="/top-wallets">Top Wallets</a>
+          <a href="/emissions">Network Emissions</a>
         </nav>
       </div>
     </div>
@@ -5072,6 +6829,9 @@ def serve(
                 if parsed.path == TOP_WALLETS_JSON_PATH:
                     html_body = json.dumps(top_wallets_snapshot(store), indent=2)
                     content_type = "application/json; charset=utf-8"
+                elif parsed.path == EMISSIONS_JSON_PATH:
+                    html_body = json.dumps(emissions_snapshot(store), indent=2)
+                    content_type = "application/json; charset=utf-8"
                 elif parsed.path in ("/", "/index.html"):
                     html_body = dashboard_html(
                         store,
@@ -5088,6 +6848,8 @@ def serve(
                     )
                 elif parsed.path in TOP_WALLETS_PATHS:
                     html_body = top_wallets_html(store, refresh_seconds=refresh_seconds)
+                elif parsed.path in EMISSIONS_PATHS:
+                    html_body = emissions_html(store, refresh_seconds=refresh_seconds)
                 else:
                     self.send_error(404)
                     return
@@ -5127,6 +6889,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rpc-port", help="Syscoin Core RPC port, default 8370")
     parser.add_argument("--rpc-user", help="Syscoin Core RPC username")
     parser.add_argument("--rpc-password", help="Syscoin Core RPC password; prefer SYS_RPC_PASSWORD env var")
+    parser.add_argument("--nevm-rpc-url", help="Syscoin NEVM JSON-RPC URL, e.g. http://127.0.0.1:8545/")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sync_p = sub.add_parser("sync", help="Fetch transactions for the watched address")
@@ -5175,6 +6938,22 @@ def build_parser() -> argparse.ArgumentParser:
     cluster_p.add_argument("--top", type=int, default=100, help="Number of estimated clusters to include in the JSON snapshot")
     cluster_p.add_argument("--json", type=Path, help="Write estimated cluster snapshot JSON")
     cluster_p.add_argument("--batch-size", type=int, default=50, help="RPC blocks to fetch per batch")
+
+    emission_p = sub.add_parser("sync-emissions", help="Index miner, sentry, governance, and issuance payouts from coinbase blocks")
+    emission_p.add_argument("--start-height", type=int, default=0, help="Height to start from when the emission index is empty or reset")
+    emission_p.add_argument("--to-height", type=int, help="Stop at this block height")
+    emission_p.add_argument("--max-blocks", type=int, default=1000, help="Maximum blocks to index in this run")
+    emission_p.add_argument("--reset", action="store_true", help="Clear the emission index before syncing")
+    emission_p.add_argument("--json", type=Path, default=Path(EMISSIONS_JSON), help="Write emissions snapshot JSON")
+    emission_p.add_argument("--batch-size", type=int, default=50, help="RPC blocks to fetch per batch")
+
+    nevm_emission_p = sub.add_parser("sync-nevm-emissions", help="Index NEVM miner rewards, priority fees, and base-fee burns")
+    nevm_emission_p.add_argument("--start-height", type=int, default=0, help="NEVM height to start from when the index is empty or reset")
+    nevm_emission_p.add_argument("--to-height", type=int, help="Stop at this NEVM block height")
+    nevm_emission_p.add_argument("--max-blocks", type=int, default=1000, help="Maximum NEVM blocks to index in this run")
+    nevm_emission_p.add_argument("--reset", action="store_true", help="Clear the NEVM emission index before syncing")
+    nevm_emission_p.add_argument("--json", type=Path, default=Path(EMISSIONS_JSON), help="Write combined emissions snapshot JSON")
+    nevm_emission_p.add_argument("--batch-size", type=int, default=50, help="NEVM RPC blocks to fetch per batch")
 
     static_p = sub.add_parser("publish-static", help="Sync data and write pre-rendered dashboard pages")
     static_p.add_argument("--output-dir", type=Path, required=True, help="Directory to publish static HTML/data files")
@@ -5351,6 +7130,57 @@ def main(argv: list[str] | None = None) -> int:
             f"sentry_outpoints={stats['sentry_collateral_outpoints']} "
             f"height={stats['last_height']}/{stats['chain_height']} "
             f"clusters={snapshot['totals']['clusters']}"
+        )
+        return 0
+
+    if args.command == "sync-emissions":
+        rpc = build_rpc_client(args)
+        if rpc is None:
+            print("No RPC URL/host supplied. Use --rpc-host/--rpc-url or SYS_RPC_URL.")
+            return 1
+        stats = sync_emission_index(
+            store,
+            rpc,
+            start_height=args.start_height,
+            max_blocks=args.max_blocks,
+            to_height=args.to_height,
+            reset=args.reset,
+            batch_size=args.batch_size,
+        )
+        snapshot = emissions_snapshot(store)
+        if args.json:
+            atomic_write_json(args.json, snapshot)
+        print(
+            f"Indexed emissions blocks={stats['blocks']} "
+            f"positive_outputs={stats['positive_outputs']} "
+            f"fees={fmt_sys(stats['fees_sats'])} SYS "
+            f"height={stats['last_height']}/{stats['chain_height']}"
+        )
+        return 0
+
+    if args.command == "sync-nevm-emissions":
+        nevm_rpc = build_nevm_rpc_client(args)
+        if nevm_rpc is None:
+            print("No NEVM RPC URL supplied. Use --nevm-rpc-url or SYS_NEVM_RPC_URL.")
+            return 1
+        stats = sync_nevm_emission_index(
+            store,
+            nevm_rpc,
+            start_height=args.start_height,
+            max_blocks=args.max_blocks,
+            to_height=args.to_height,
+            reset=args.reset,
+            batch_size=args.batch_size,
+        )
+        snapshot = emissions_snapshot(store)
+        if args.json:
+            atomic_write_json(args.json, snapshot)
+        print(
+            f"Indexed NEVM emissions blocks={stats['blocks']} txs={stats['txs']} "
+            f"static_reward={fmt_compact_wei_sys(stats['static_reward_wei'])} "
+            f"priority_fees={fmt_compact_wei_sys(stats['priority_fee_wei'])} "
+            f"burned={fmt_compact_wei_sys(stats['burned_wei'])} "
+            f"height={stats['last_height']}/{stats['chain_height']}"
         )
         return 0
 

@@ -39,6 +39,11 @@ fi
 : "${SYS_TOP_WALLET_BATCH_SIZE:=50}"
 : "${SYS_TOP_WALLET_CLUSTER_MAX_BLOCKS:=0}"
 : "${SYS_TOP_WALLET_CLUSTER_BATCH_SIZE:=50}"
+: "${SYS_EMISSIONS_MAX_BLOCKS:=0}"
+: "${SYS_EMISSIONS_BATCH_SIZE:=50}"
+: "${SYS_NEVM_RPC_URL:=http://127.0.0.1:8545/}"
+: "${SYS_NEVM_EMISSIONS_MAX_BLOCKS:=0}"
+: "${SYS_NEVM_EMISSIONS_BATCH_SIZE:=50}"
 
 {
   printf '\n[%s] static snapshot sync\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -64,6 +69,24 @@ fi
       --top "$SYS_TOP_WALLET_TOP" \
       --batch-size "$SYS_TOP_WALLET_CLUSTER_BATCH_SIZE" \
       --json "$PUBLIC_DIR/top-wallet-clusters.json"
+  fi
+  if [ "$SYS_EMISSIONS_MAX_BLOCKS" -gt 0 ]; then
+    python3 syscoin_tracker.py \
+      --rpc-url "$SYS_RPC_URL" \
+      --rpc-user "$SYS_RPC_USER" \
+      --rpc-password "$SYS_RPC_PASSWORD" \
+      sync-emissions \
+      --max-blocks "$SYS_EMISSIONS_MAX_BLOCKS" \
+      --batch-size "$SYS_EMISSIONS_BATCH_SIZE" \
+      --json "$PUBLIC_DIR/emissions.json"
+  fi
+  if [ "$SYS_NEVM_EMISSIONS_MAX_BLOCKS" -gt 0 ]; then
+    python3 syscoin_tracker.py \
+      --nevm-rpc-url "$SYS_NEVM_RPC_URL" \
+      sync-nevm-emissions \
+      --max-blocks "$SYS_NEVM_EMISSIONS_MAX_BLOCKS" \
+      --batch-size "$SYS_NEVM_EMISSIONS_BATCH_SIZE" \
+      --json "$PUBLIC_DIR/emissions.json"
   fi
   python3 syscoin_tracker.py \
     --rpc-url "$SYS_RPC_URL" \
