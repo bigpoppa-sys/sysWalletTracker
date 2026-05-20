@@ -237,6 +237,19 @@ def fmt_iso_local_datetime(value: str | None, timezone_name: str = DEFAULT_TIMEZ
     return parsed.astimezone(ZoneInfo(timezone_name)).strftime("%b %-d, %-I:%M %p")
 
 
+def fmt_iso_local_date(value: str | None, timezone_name: str = DEFAULT_TIMEZONE) -> str:
+    if not value:
+        return ""
+    text = value.replace("Z", "+00:00")
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return value
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(ZoneInfo(timezone_name)).strftime("%b %-d, %Y")
+
+
 def short_address(address: str) -> str:
     if len(address) <= 18:
         return address
@@ -6148,17 +6161,22 @@ def masternodes_html(
             if moved_to_address
             else "-"
         )
-        taken_down_display = item["taken_down_text"] if item["change_type"] == "Taken down" and item["taken_down_text"] else "-"
+        taken_down_display = (
+            fmt_local_date(item["taken_down_sort"])
+            if item["change_type"] == "Taken down" and item["taken_down_sort"]
+            else "-"
+        )
         change_detail_cells = (
-            f"<td data-sort='{item['taken_down_sort'] or 0}'>{html.escape(taken_down_display)}</td>"
+            f"<td data-sort='{item['taken_down_sort'] or 0}' title='{html.escape(item['taken_down_text'])}'>{html.escape(taken_down_display)}</td>"
             f"<td class='address' data-sort='{html.escape(moved_to_address.lower())}'>{moved_to_html}</td>"
             f"<td data-sort='{html.escape(item['exchange_text'].lower())}'>{html.escape(item['exchange_text'])}</td>"
             if include_change
             else ""
         )
+        setup_display = fmt_local_date(item["setup_time"]) if include_change else fmt_table_datetime(item["setup_time"])
         setup_cell = (
             f"<td data-sort='{item['setup_time'] or 0}' title='{html.escape(fmt_local_datetime(item['setup_time']))}'>"
-            f"{html.escape(fmt_table_datetime(item['setup_time']))}</td>"
+            f"{html.escape(setup_display)}</td>"
         )
         status_cell = (
             f"<td data-sort='{html.escape(item['status_sort'])}'>"
@@ -6201,7 +6219,7 @@ def masternodes_html(
     current_no_results_html = "<tr class='mn-no-results' hidden><td class='empty' colspan='6'>No matching sentry nodes.</td></tr>"
     since_text = f"{fmt_local_datetime(since_time)} Sydney" if since_time else "all tracked history"
     updated_text = fmt_iso_local_datetime(masternode_meta.get("synced_at") or store.get_meta("last_summary", {}).get("synced_at"))
-    baseline_text = fmt_iso_local_datetime(baseline_iso) if baseline_iso else "not set"
+    baseline_text = fmt_iso_local_date(baseline_iso) if baseline_iso else "not set"
     total_count = len(current_items)
 
     def chart_legend(parts: list[tuple[str, int, str]], total: int) -> str:
