@@ -4343,7 +4343,7 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
         latest_rows.append(
             "<tr>"
             f"<td data-sort='{int(row.get('height') or 0)}'>{int(row.get('height') or 0):,}</td>"
-            f"<td data-sort='{ts or 0}'>{html.escape(fmt_table_datetime(ts))}</td>"
+            f"<td data-sort='{ts or 0}'>{html.escape(fmt_local_datetime(ts))}</td>"
             f"<td class='amount' data-sort='{int(row.get('miner_sats') or 0)}'>{fmt_compact_sys(int(row.get('miner_sats') or 0))}</td>"
             f"<td class='amount' data-sort='{int(row.get('sentry_sats') or 0)}'>{fmt_compact_sys(int(row.get('sentry_sats') or 0))}</td>"
             f"<td class='amount' data-sort='{int(row.get('governance_sats') or 0)}'>{fmt_compact_sys(int(row.get('governance_sats') or 0))}</td>"
@@ -4359,7 +4359,7 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
         latest_nevm_rows.append(
             "<tr>"
             f"<td data-sort='{int(row.get('height') or 0)}'>{int(row.get('height') or 0):,}</td>"
-            f"<td data-sort='{ts or 0}'>{html.escape(fmt_table_datetime(ts))}</td>"
+            f"<td data-sort='{ts or 0}'>{html.escape(fmt_local_datetime(ts))}</td>"
             f"<td class='amount' data-sort='{int(row.get('static_reward_wei') or 0)}'>{fmt_compact_wei_sys(int(row.get('static_reward_wei') or 0))}</td>"
             f"<td class='amount' data-sort='{int(row.get('priority_fee_wei') or 0)}'>{fmt_compact_wei_sys(int(row.get('priority_fee_wei') or 0))}</td>"
             f"<td class='amount' data-sort='{int(row.get('burned_wei') or 0)}'>{fmt_compact_wei_sys(int(row.get('burned_wei') or 0))}</td>"
