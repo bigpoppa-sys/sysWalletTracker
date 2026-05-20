@@ -70,6 +70,8 @@ npx vercel inspect https://syswallettracker.vercel.app --timeout 20
 curl -fsSL "https://syswallettracker.vercel.app/sentrynode?force=1&t=$(date +%s)" | head
 ```
 
+If Vercel reports the new deployment as `UNKNOWN`, `BLOCKED`, or refuses `vercel promote` because the deployment is not ready, treat Vercel as checked but not promotable. Continue with the VPS local publish fallback and verify the public pages. Do not keep creating new Vercel deployments unless the user specifically asks to debug Vercel.
+
 Do not use random Vercel deployment URLs as the primary verification target; they can return `401` when deployment protection is enabled. Use the canonical production URL.
 
 5. Refresh the VPS static pages.
