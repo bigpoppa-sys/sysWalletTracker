@@ -40,6 +40,10 @@ Manual top-wallet names can be added to `wallet_labels.csv` with
 This repo includes a Vercel Python function at `api/index.py`, so the same
 dashboard can be deployed without running a local process forever.
 
+For live deployments, follow `DEPLOYMENT.md`. The production site uses both
+Vercel and the VPS-published static files on `syscoin.dev`; pushing GitHub or
+deploying Vercel alone is not enough for a complete update.
+
 ```sh
 npx vercel
 npx vercel --prod

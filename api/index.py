@@ -67,6 +67,7 @@ VERIFIED_SENTRIES_PATH = ROOT / "verified_sentries.csv"
 NODE_OUTPUTS_PATH = ROOT / "node_outputs.csv"
 INSTALL_BUNDLE_FILES = (
     "syscoin_tracker.py",
+    "DEPLOYMENT.md",
     "README.md",
     "package.json",
     "package-lock.json",
@@ -90,6 +91,7 @@ INSTALL_BUNDLE_FILES = (
     "scripts/install_vps_cron.sh",
     "scripts/masternode_cron_sync.sh",
     "scripts/static_snapshot_cron.sh",
+    "scripts/update_vps_from_vercel_bundle.sh",
 )
 
 _lock = threading.Lock()
