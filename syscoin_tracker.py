@@ -94,6 +94,7 @@ NETWORK_MASTERNODE_HEADERS = [
     "removed_at",
     "taken_down_txid",
     "taken_down_time",
+    "taken_down_height",
     "moved_to_address",
 ]
 SENTRY_COLLATERAL_SATS = 100_000 * 100_000_000
@@ -103,6 +104,7 @@ SATOSHI = Decimal("100000000")
 WEI_PER_SYS_INT = 10**18
 WEI_PER_SAT_INT = 10**10
 NEVM_STATIC_REWARD_WEI = 10_550_000_000_000_000_000
+UTXO_BLOCK_TARGET_SECONDS = 150
 SENTRY_REWARD_RATIOS = {
     "Base": Decimal("3"),
     "Level 1": Decimal("4.05"),
@@ -763,6 +765,7 @@ def network_masternode_rows_from_rpc(rpc: SyscoinRpcClient) -> list[dict[str, An
                 "removed_at": "",
                 "taken_down_txid": "",
                 "taken_down_time": None,
+                "taken_down_height": None,
                 "moved_to_address": "",
             }
         )
@@ -831,6 +834,7 @@ def load_network_masternodes_csv_rows(
                 "removed_at": row.get("removed_at") or "",
                 "taken_down_txid": row.get("taken_down_txid") or "",
                 "taken_down_time": maybe_int(row.get("taken_down_time")),
+                "taken_down_height": maybe_int(row.get("taken_down_height")),
                 "moved_to_address": row.get("moved_to_address") or "",
             }
         )
@@ -1099,6 +1103,7 @@ class Store:
                 removed_at TEXT,
                 taken_down_txid TEXT,
                 taken_down_time INTEGER,
+                taken_down_height INTEGER,
                 moved_to_address TEXT
             );
 
@@ -1213,6 +1218,7 @@ class Store:
         additions = {
             "taken_down_txid": "taken_down_txid TEXT",
             "taken_down_time": "taken_down_time INTEGER",
+            "taken_down_height": "taken_down_height INTEGER",
             "moved_to_address": "moved_to_address TEXT",
         }
         for name, definition in additions.items():
@@ -1430,9 +1436,9 @@ class Store:
                 collateral_height, collateral_time, registered_height,
                 registered_time, last_paid_time, last_paid_block, first_seen_at,
                 last_seen_at, removed_at, taken_down_txid, taken_down_time,
-                moved_to_address
+                taken_down_height, moved_to_address
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(outpoint) DO UPDATE SET
                 pro_tx_hash=excluded.pro_tx_hash,
                 service=excluded.service,
@@ -1451,6 +1457,7 @@ class Store:
                 removed_at=excluded.removed_at,
                 taken_down_txid=excluded.taken_down_txid,
                 taken_down_time=excluded.taken_down_time,
+                taken_down_height=excluded.taken_down_height,
                 moved_to_address=excluded.moved_to_address
             """,
             (
@@ -1475,6 +1482,7 @@ class Store:
                 row.get("removed_at") or None,
                 row.get("taken_down_txid") or None,
                 row.get("taken_down_time"),
+                row.get("taken_down_height"),
                 row.get("moved_to_address") or None,
             ),
         )
@@ -1486,6 +1494,7 @@ class Store:
         removed_at: str,
         taken_down_txid: str | None = None,
         taken_down_time: int | None = None,
+        taken_down_height: int | None = None,
         moved_to_address: str | None = None,
     ) -> None:
         self.conn.execute(
@@ -1496,6 +1505,7 @@ class Store:
                 last_seen_at = ?,
                 taken_down_txid = COALESCE(?, taken_down_txid),
                 taken_down_time = COALESCE(?, taken_down_time),
+                taken_down_height = COALESCE(?, taken_down_height),
                 moved_to_address = COALESCE(?, moved_to_address)
             WHERE outpoint = ?
             """,
@@ -1505,6 +1515,7 @@ class Store:
                 removed_at,
                 taken_down_txid,
                 taken_down_time,
+                taken_down_height,
                 moved_to_address,
                 outpoint,
             ),
@@ -1712,6 +1723,7 @@ def trace_masternode_collateral_spend(client: BlockbookClient, row: sqlite3.Row 
     return {
         "taken_down_txid": spend.get("txid") or "",
         "taken_down_time": spend.get("blockTime"),
+        "taken_down_height": int_or_none(spend.get("blockHeight") or spend.get("height")),
         "moved_to_address": moved_to_address,
     }
 
@@ -1755,6 +1767,7 @@ def sync_network_masternodes(
             removed_at=removed_at,
             taken_down_txid=trace.get("taken_down_txid"),
             taken_down_time=trace.get("taken_down_time"),
+            taken_down_height=trace.get("taken_down_height"),
             moved_to_address=trace.get("moved_to_address"),
         )
         removed += 1
@@ -6071,12 +6084,18 @@ def masternodes_html(
     ]
     baseline_ts, baseline_iso = min(baseline_seen, default=(0, ""))
 
-    def seniority_for(row: sqlite3.Row) -> dict[str, Any]:
+    def seniority_for(
+        row: sqlite3.Row,
+        *,
+        reference_height: int | None = None,
+        reference_label: str = "current chain height",
+    ) -> dict[str, Any]:
         collateral_height = int_or_none(row["collateral_height"])
-        if not collateral_height or not chain_height:
+        reference_height = reference_height if reference_height is not None else chain_height
+        if not collateral_height or not reference_height:
             return {"label": "-", "sort": -1, "class": "unknown", "title": "Collateral height unavailable"}
 
-        blocks_since_collateral = max(chain_height - collateral_height, 0)
+        blocks_since_collateral = max(reference_height - collateral_height, 0)
         if blocks_since_collateral >= SENIORITY_LEVEL_2_BLOCKS:
             label = "Level 2"
             sort = 2
@@ -6094,7 +6113,7 @@ def masternodes_html(
             "label": label,
             "sort": sort,
             "class": css_class,
-            "title": f"{blocks_since_collateral:,} blocks since collateral height {collateral_height:,}",
+            "title": f"{blocks_since_collateral:,} blocks since collateral height {collateral_height:,} at {reference_label}",
         }
 
     for row in network_rows:
@@ -6107,7 +6126,28 @@ def masternodes_html(
         change_type = "Taken down" if is_removed else "New setup" if is_new else ""
         change_sort = taken_down_sort if is_removed else first_seen_sort
         status = row["status"] or ("Taken down" if row["removed_at"] else "Unknown")
-        seniority = seniority_for(row)
+        seniority_reference_height = None
+        seniority_reference_label = "current chain height"
+        if is_removed:
+            taken_down_height = int_or_none(row["taken_down_height"])
+            if taken_down_height:
+                seniority_reference_height = taken_down_height
+                seniority_reference_label = f"takedown height {taken_down_height:,}"
+            else:
+                collateral_height = int_or_none(row["collateral_height"])
+                collateral_time = int_or_none(row["collateral_time"])
+                if collateral_height and collateral_time and taken_down_sort:
+                    estimated_blocks = max(0, round((int(taken_down_sort) - collateral_time) / UTXO_BLOCK_TARGET_SECONDS))
+                    seniority_reference_height = collateral_height + estimated_blocks
+                    seniority_reference_label = "estimated takedown height"
+                else:
+                    seniority_reference_height = int_or_none(row["last_paid_block"]) or chain_height
+                    seniority_reference_label = "last paid/current height fallback"
+        seniority = seniority_for(
+            row,
+            reference_height=seniority_reference_height,
+            reference_label=seniority_reference_label,
+        )
         moved_to_address = row["moved_to_address"] or ""
         exchange_labels = exchange_labels_for_address(moved_to_address, exchange_tags, exchange_routes) if moved_to_address else set()
         exchange_text = ", ".join(sorted(exchange_labels)) if exchange_labels else "-"
@@ -6166,8 +6206,12 @@ def masternodes_html(
             if item["change_type"] == "Taken down" and item["taken_down_sort"]
             else "-"
         )
-        change_detail_cells = (
+        taken_down_cell = (
             f"<td data-sort='{item['taken_down_sort'] or 0}' title='{html.escape(item['taken_down_text'])}'>{html.escape(taken_down_display)}</td>"
+            if include_change
+            else ""
+        )
+        moved_exchange_cells = (
             f"<td class='address' data-sort='{html.escape(moved_to_address.lower())}'>{moved_to_html}</td>"
             f"<td data-sort='{html.escape(item['exchange_text'].lower())}'>{html.escape(item['exchange_text'])}</td>"
             if include_change
@@ -6178,20 +6222,24 @@ def masternodes_html(
             f"<td data-sort='{item['setup_time'] or 0}' title='{html.escape(fmt_local_datetime(item['setup_time']))}'>"
             f"{html.escape(setup_display)}</td>"
         )
+        seniority = item["seniority"]
+        seniority_cell = (
+            f"<td data-sort='{seniority['sort']}'><span class='seniority {html.escape(seniority['class'])}' "
+            f"title='{html.escape(seniority['title'])}'>{html.escape(seniority['label'])}</span></td>"
+        )
         status_cell = (
             f"<td data-sort='{html.escape(item['status_sort'])}'>"
             f"<span class='status {'active' if item['status'].upper() == 'ENABLED' else 'down'}'>{html.escape(item['status_label'])}</span>"
             f"</td>"
         )
         if include_change:
-            return f"<tr>{change_cell}{setup_cell}{change_detail_cells}{status_cell}</tr>"
+            return f"<tr>{change_cell}{setup_cell}{taken_down_cell}{seniority_cell}{moved_exchange_cells}{status_cell}</tr>"
 
-        seniority = item["seniority"]
         search_terms = html.escape(f"{collateral_address} {service}".lower(), quote=True)
         return (
             f"<tr data-search='{search_terms}'>"
             f"{setup_cell}"
-            f"<td data-sort='{seniority['sort']}'><span class='seniority {html.escape(seniority['class'])}' title='{html.escape(seniority['title'])}'>{html.escape(seniority['label'])}</span></td>"
+            f"{seniority_cell}"
             f"<td class='address' data-sort='{html.escape(collateral_address.lower())}'><a href='{explorer_address_url(collateral_address)}' title='{html.escape(collateral_address)}'>{html.escape(short_address(collateral_address))}</a></td>"
             f"<td class='address' data-sort='{html.escape(tx_outpoint.lower())}'>{tx_html}</td>"
             f"<td data-sort='{html.escape(str(service).lower())}'>{html.escape(str(service))}</td>"
@@ -6215,7 +6263,7 @@ def masternodes_html(
     last_taken_down_date = fmt_local_date(last_taken_down_time)
     change_rows_html = "\n".join(masternode_row_html(item, include_change=True) for item in change_items)
     if not change_rows_html:
-        change_rows_html = "<tr class='mn-empty'><td class='empty' colspan='6'>No new setups or takedowns since the banked snapshot.</td></tr>"
+        change_rows_html = "<tr class='mn-empty'><td class='empty' colspan='7'>No new setups or takedowns since the banked snapshot.</td></tr>"
     current_no_results_html = "<tr class='mn-no-results' hidden><td class='empty' colspan='6'>No matching sentry nodes.</td></tr>"
     since_text = f"{fmt_local_datetime(since_time)} Sydney" if since_time else "all tracked history"
     updated_text = fmt_iso_local_datetime(masternode_meta.get("synced_at") or store.get_meta("last_summary", {}).get("synced_at"))
@@ -6319,7 +6367,7 @@ def masternodes_html(
     .table-wrap {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; max-width: 100%; min-width: 0; overflow-x: auto; width: 100%; }}
     table {{ width: 100%; min-width: 920px; border-collapse: separate; border-spacing: 0; background: #fff; table-layout: fixed; }}
     .mn-current {{ min-width: 935px; }}
-    .mn-changes {{ min-width: 850px; }}
+    .mn-changes {{ min-width: 930px; }}
     th, td {{ padding: 8px 10px; border-bottom: 1px solid #e4e8e2; text-align: left; font-size: 0.88rem; overflow: hidden; text-overflow: ellipsis; }}
     th {{ background: #eaf0ec; position: sticky; top: 0; z-index: 10; box-shadow: 0 1px 0 #d9ded8; }}
     .sort-button {{ appearance: none; border: 0; background: transparent; color: inherit; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; font: inherit; font-weight: 700; padding: 0; text-align: inherit; white-space: nowrap; }}
@@ -6337,9 +6385,10 @@ def masternodes_html(
     .mn-changes th:nth-child(1), .mn-changes td:nth-child(1) {{ width: 125px; }}
     .mn-changes th:nth-child(2), .mn-changes td:nth-child(2) {{ width: 125px; }}
     .mn-changes th:nth-child(3), .mn-changes td:nth-child(3) {{ width: 135px; }}
-    .mn-changes th:nth-child(4), .mn-changes td:nth-child(4) {{ width: 220px; }}
-    .mn-changes th:nth-child(5), .mn-changes td:nth-child(5) {{ width: 130px; }}
-    .mn-changes th:nth-child(6), .mn-changes td:nth-child(6) {{ width: 115px; }}
+    .mn-changes th:nth-child(4), .mn-changes td:nth-child(4) {{ width: 100px; }}
+    .mn-changes th:nth-child(5), .mn-changes td:nth-child(5) {{ width: 220px; }}
+    .mn-changes th:nth-child(6), .mn-changes td:nth-child(6) {{ width: 130px; }}
+    .mn-changes th:nth-child(7), .mn-changes td:nth-child(7) {{ width: 115px; }}
     .address {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; white-space: nowrap; }}
     .empty {{ color: #687177; padding: 18px 14px; text-align: center; }}
     .status {{ border-radius: 999px; display: inline-flex; font-size: 0.78rem; font-weight: 700; padding: 4px 8px; white-space: nowrap; }}
@@ -6461,6 +6510,7 @@ def masternodes_html(
               <th data-sort="number" data-default-dir="desc" aria-sort="descending"><button class="sort-button" type="button">Change<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Date Setup<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Date Taken Down<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Seniority<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">100k Moved To<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Exchange<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Status<span class="sort-icon" aria-hidden="true"></span></button></th>
