@@ -15,6 +15,7 @@ Do not call a deploy done after only a commit, only a push, or only a Vercel com
 ## Live Architecture
 
 - GitHub repo: `bigpoppa-sys/sysWalletTracker`, branch `main`.
+- Vercel project: `syswallettracker`. Do not deploy this repo to the legacy `syswallettracker-sentry` project.
 - Vercel app: serves `api/index.py`, canonical URL `https://syswallettracker.vercel.app`.
 - Vercel install bundle route: `https://syswallettracker.vercel.app/sysWalletTracker-vps.tgz`.
 - VPS publisher: `root@142.93.241.64`, app dir `/root/sysWalletTracker`.
@@ -30,9 +31,16 @@ Do not call a deploy done after only a commit, only a push, or only a Vercel com
 ```sh
 git status --short
 git diff --stat
+cat .vercel/project.json
 ```
 
 Only stage files related to the requested change. Do not stage `reports/`, SQLite files, logs, temp screenshots, or user scratch files unless explicitly requested.
+
+If `.vercel/project.json` is not linked to `projectName: "syswallettracker"`, fix the link before deploying:
+
+```sh
+npx vercel link --yes --scope bigpoppas-projects --project syswallettracker
+```
 
 2. Run local verification.
 
@@ -58,10 +66,11 @@ git push origin main
 4. Deploy Vercel production.
 
 ```sh
-npx vercel --prod --yes
+npx vercel deploy --prod --yes --archive=tgz --no-wait
+npx vercel inspect https://syswallettracker.vercel.app --wait --timeout 90s
 ```
 
-If this finishes cleanly, continue to the VPS publish step.
+If this finishes cleanly and reports `READY`, continue to the VPS publish step.
 
 If the Vercel CLI hangs in `Building...`, becomes silent for more than a few minutes, or returns an unclear status, do not stop the deployment. Inspect the canonical production app and continue with the VPS local publish fallback:
 
@@ -70,7 +79,7 @@ npx vercel inspect https://syswallettracker.vercel.app --timeout 20
 curl -fsSL "https://syswallettracker.vercel.app/sentrynode?force=1&t=$(date +%s)" | head
 ```
 
-If Vercel reports the new deployment as `UNKNOWN`, `BLOCKED`, or refuses `vercel promote` because the deployment is not ready, treat Vercel as checked but not promotable. Continue with the VPS local publish fallback and verify the public pages. Do not keep creating new Vercel deployments unless the user specifically asks to debug Vercel.
+If Vercel reports the new deployment as `UNKNOWN`, `BLOCKED`, or refuses `vercel promote` because the deployment is not ready, first confirm the repo is not accidentally linked to `syswallettracker-sentry`. If the link is correct and Vercel still blocks the deployment, treat Vercel as checked but not promotable. Continue with the VPS local publish fallback and verify the public pages. Do not keep creating new Vercel deployments unless the user specifically asks to debug Vercel.
 
 Do not use random Vercel deployment URLs as the primary verification target; they can return `401` when deployment protection is enabled. Use the canonical production URL.
 
