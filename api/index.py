@@ -92,6 +92,7 @@ INSTALL_BUNDLE_FILES = (
     "scripts/masternode_cron_sync.sh",
     "scripts/static_snapshot_cron.sh",
     "scripts/update_vps_from_vercel_bundle.sh",
+    "scripts/update_vps_from_local.sh",
 )
 
 _lock = threading.Lock()

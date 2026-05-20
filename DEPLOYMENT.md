@@ -1,31 +1,44 @@
 # Deployment Runbook
 
-Use this every time the user says `deploy`.
+Use this exact runbook every time the user says `deploy`, `push live`, or `push it live`.
+
+`deploy` means the full job is complete only when:
+
+- The requested change is committed to `main`.
+- `main` is pushed to GitHub.
+- Vercel production has been deployed or checked.
+- The VPS static pages at `syscoin.dev` have been refreshed.
+- The live site has been verified from the public URL.
+
+Do not call a deploy done after only a commit, only a push, or only a Vercel command.
 
 ## Live Architecture
 
 - GitHub repo: `bigpoppa-sys/sysWalletTracker`, branch `main`.
-- Vercel app: serves `api/index.py` and exposes `/sysWalletTracker-vps.tgz`.
-- VPS static publisher: `root@142.93.241.64`, app dir `/root/sysWalletTracker`.
-- Public static output: `/var/www/html/syswallettracker`, served as `https://syscoin.dev/syswallettracker/`.
-- Vercel pages normally proxy the static `syscoin.dev` HTML/JSON first. Therefore a live deploy is not complete until both Vercel and the VPS static output are updated.
-- The VPS install is not a git checkout. Do not use `git pull` inside `/root/sysWalletTracker`.
+- Vercel app: serves `api/index.py`, canonical URL `https://syswallettracker.vercel.app`.
+- Vercel install bundle route: `https://syswallettracker.vercel.app/sysWalletTracker-vps.tgz`.
+- VPS publisher: `root@142.93.241.64`, app dir `/root/sysWalletTracker`.
+- Static output: `/var/www/html/syswallettracker`.
+- Public static URL: `https://syscoin.dev/syswallettracker/`.
+- Vercel pages normally proxy the static `syscoin.dev` HTML/JSON first.
+- The VPS app dir is a bundle install, not a git checkout. Never use `git pull` inside `/root/sysWalletTracker`.
 
 ## Deploy Checklist
 
-1. Check scope locally.
+1. Check the local scope.
 
 ```sh
 git status --short
 git diff --stat
 ```
 
-Only stage files related to the requested change. Do not stage `reports/`, SQLite files, logs, or user scratch files unless explicitly requested.
+Only stage files related to the requested change. Do not stage `reports/`, SQLite files, logs, temp screenshots, or user scratch files unless explicitly requested.
 
 2. Run local verification.
 
 ```sh
 python3 -m py_compile syscoin_tracker.py api/index.py
+bash -n scripts/*.sh
 ```
 
 For UI changes, run the local server and verify the changed page before deploying:
@@ -48,40 +61,63 @@ git push origin main
 npx vercel --prod --yes
 ```
 
-Wait for the command to finish and record the production URL. Do not continue while the Vercel CLI is still running.
+If this finishes cleanly, continue to the VPS publish step.
 
-5. Update the VPS from the fresh Vercel bundle and publish static pages.
+If the Vercel CLI hangs in `Building...`, becomes silent for more than a few minutes, or returns an unclear status, do not stop the deployment. Inspect the canonical production app and continue with the VPS local publish fallback:
+
+```sh
+npx vercel inspect https://syswallettracker.vercel.app --timeout 20
+curl -fsSL "https://syswallettracker.vercel.app/sentrynode?force=1&t=$(date +%s)" | head
+```
+
+Do not use random Vercel deployment URLs as the primary verification target; they can return `401` when deployment protection is enabled. Use the canonical production URL.
+
+5. Refresh the VPS static pages.
+
+Preferred path, when the fresh Vercel bundle is available:
 
 ```sh
 ./scripts/update_vps_from_vercel_bundle.sh
 ```
 
-This script:
-
-- Uses `~/.ssh/codex_syswallettracker_ed25519`.
-- Waits for the VPS static snapshot lock instead of racing the cron.
-- Downloads `https://syswallettracker.vercel.app/sysWalletTracker-vps.tgz`.
-- Extracts code into `/root/sysWalletTracker` without touching `.env`, the database, or logs.
-- Runs `python3 -m py_compile`.
-- Runs `publish-static` with the current VPS database so `syscoin.dev` updates immediately.
-
-6. Verify live.
-
-Use forced fresh static reads first:
+Fallback path, when Vercel is slow, protected, or the bundle freshness is unclear:
 
 ```sh
-curl -fsSL "https://syscoin.dev/syswallettracker/sentrynode.html?t=$(date +%s)" | rg "expected text"
-curl -fsSL "https://syswallettracker.vercel.app/sentrynode?force=1" | rg "expected text"
+./scripts/update_vps_from_local.sh
 ```
 
-For browser/UI changes, open the relevant live page after the curl check.
+Both scripts:
+
+- Use `~/.ssh/codex_syswallettracker_ed25519`.
+- Wait for `/root/sysWalletTracker/.static-snapshot.lock` instead of racing cron.
+- Preserve `/root/sysWalletTracker/.env`, database files, and logs.
+- Run `python3 -m py_compile`.
+- Run `publish-static` with the current VPS database so `syscoin.dev` updates immediately.
+
+6. Verify the live site.
+
+Use the changed page and expected text from the request. Example for a sentry snapshot table change:
+
+```sh
+curl -fsSL "https://syscoin.dev/syswallettracker/sentrynode.html?t=$(date +%s)" | rg "Seniority|Date Taken Down|100k Moved To"
+curl -fsSL "https://syswallettracker.vercel.app/sentrynode?force=1&t=$(date +%s)" | rg "Seniority|Date Taken Down|100k Moved To"
+```
+
+For browser-visible UI changes, open the relevant live page after the curl check and confirm the page visually.
+
+## Failure Handling
+
+- If the Vercel deploy path fails or hangs, use `scripts/update_vps_from_local.sh` and verify the public pages.
+- If the Vercel bundle publish fails, use `scripts/update_vps_from_local.sh`.
+- If the local VPS publish fails, fix that exact failure and rerun it.
+- Only report a deployment as blocked after both the primary path and documented fallback path fail, or after live verification still fails.
+- Include the exact failed command and the exact live verification result when blocked.
 
 ## Important Rules
 
 - GitHub push alone is not a complete deploy.
 - Vercel deploy alone is not a complete deploy.
-- VPS `git pull` is wrong because the VPS app dir is a bundle install, not a repo.
+- VPS static publish alone is not a complete deploy unless the code is already committed and pushed.
 - Do not kill the static cron unless the user explicitly asks. Wait on the lock.
 - For page-rendering changes, use `publish-static`; do not run the full indexing cron manually.
 - For indexer changes, update the VPS bundle first, then let the cron continue unless an immediate static refresh is needed.
-- If any step fails, stop and report the exact failed step before trying a different path.
