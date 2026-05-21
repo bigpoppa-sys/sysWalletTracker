@@ -4634,7 +4634,7 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
       </div>
       <div class="trend-panel" id="trend-panel" hidden>
         <h3>History Trend</h3>
-        <p>Shown when the selected breakdown has enough periods to compare.</p>
+        <p>Follows the selected year and breakdown. A single yearly selection is shown as one annual point.</p>
         <div class="chart-canvas-wrap"><canvas id="trend-chart" role="img" aria-label="Emission history trend"></canvas></div>
       </div>
     </section>
@@ -4836,20 +4836,20 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
         setText("rate-period", periodLabel(period, year, records));
 
         const trendPanel = document.getElementById("trend-panel");
-        if (trendPanel) trendPanel.hidden = records.length < 2;
+        if (trendPanel) trendPanel.hidden = records.length < 1;
         if (trendChart) {{
           trendChart.destroy();
           trendChart = null;
         }}
-        if (!window.Chart || records.length < 2) return;
+        if (!window.Chart || records.length < 1) return;
         const trendConfig = {{
           type: "line",
           data: {{
             labels,
             datasets: [
-              {{ label: "Issued", data: records.map((item) => (item.miner || 0) + (item.sentry || 0) + (item.governance || 0) + (item.initial || 0)), borderColor: palette.sentry, backgroundColor: "rgba(22,153,80,0.12)", yAxisID: "sys", tension: 0.25, fill: true }},
-              {{ label: "Net issuance", data: records.map((item) => item.netIssued || 0), borderColor: palette.nevm, backgroundColor: "rgba(177,90,43,0.12)", yAxisID: "sys", tension: 0.25 }},
-              {{ label: "Inflation", data: records.map((item) => item.rate), borderColor: palette.rate, backgroundColor: "rgba(177,90,43,0.12)", yAxisID: "rate", tension: 0.25 }}
+              {{ label: "Issued", data: records.map((item) => (item.miner || 0) + (item.sentry || 0) + (item.governance || 0) + (item.initial || 0)), borderColor: palette.sentry, backgroundColor: "rgba(22,153,80,0.12)", yAxisID: "sys", tension: 0.25, fill: true, pointRadius: records.length === 1 ? 5 : 3 }},
+              {{ label: "Net issuance", data: records.map((item) => item.netIssued || 0), borderColor: palette.nevm, backgroundColor: "rgba(177,90,43,0.12)", yAxisID: "sys", tension: 0.25, pointRadius: records.length === 1 ? 5 : 3 }},
+              {{ label: "Inflation", data: records.map((item) => item.rate), borderColor: palette.rate, backgroundColor: "rgba(177,90,43,0.12)", yAxisID: "rate", tension: 0.25, pointRadius: records.length === 1 ? 5 : 3 }}
             ]
           }},
           options: {{
