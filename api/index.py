@@ -478,19 +478,19 @@ class handler(BaseHTTPRequestHandler):
                     store,
                     since_time=since_time,
                     since_label=label,
-                    refresh_seconds=env_int("SYS_TRACKER_SYNC_INTERVAL", 60),
+                    refresh_seconds=env_int("SYS_TRACKER_PAGE_REFRESH_SECONDS", 0),
                 )
             elif parsed.path in TOP_WALLETS_PATHS:
                 html_body = top_wallets_html(
                     store,
-                    refresh_seconds=env_int("SYS_TRACKER_SYNC_INTERVAL", 60),
+                    refresh_seconds=env_int("SYS_TRACKER_PAGE_REFRESH_SECONDS", 0),
                 )
             elif parsed.path == TOP_WALLETS_JSON_PATH:
                 html_body = json.dumps(top_wallets_snapshot(store), indent=2)
             elif parsed.path in EMISSIONS_PATHS:
                 html_body = emissions_html(
                     store,
-                    refresh_seconds=env_int("SYS_TRACKER_SYNC_INTERVAL", 60),
+                    refresh_seconds=env_int("SYS_TRACKER_PAGE_REFRESH_SECONDS", 0),
                 )
             elif parsed.path == EMISSIONS_JSON_PATH:
                 html_body = json.dumps(emissions_snapshot(store), indent=2)
@@ -499,7 +499,7 @@ class handler(BaseHTTPRequestHandler):
                     store,
                     since_time=since_time,
                     since_label=label,
-                    refresh_seconds=env_int("SYS_TRACKER_SYNC_INTERVAL", 60),
+                    refresh_seconds=env_int("SYS_TRACKER_PAGE_REFRESH_SECONDS", 0),
                 )
             body = html_body.encode("utf-8")
             self.send_response(200)

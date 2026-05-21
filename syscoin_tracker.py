@@ -252,6 +252,12 @@ def fmt_iso_local_date(value: str | None, timezone_name: str = DEFAULT_TIMEZONE)
     return parsed.astimezone(ZoneInfo(timezone_name)).strftime("%b %-d, %Y")
 
 
+def refresh_meta_tag(refresh_seconds: int | None) -> str:
+    if not refresh_seconds or refresh_seconds <= 0:
+        return ""
+    return f'  <meta http-equiv="refresh" content="{max(refresh_seconds, 1)}">\n'
+
+
 def short_address(address: str) -> str:
     if len(address) <= 18:
         return address
@@ -4406,8 +4412,7 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="{max(refresh_seconds, 1)}">
-  <title>Syscoin Network Emissions</title>
+{refresh_meta_tag(refresh_seconds)}  <title>Syscoin Network Emissions</title>
   <style>
     :root {{ color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --page-gutter: clamp(24px, 3.8vw, 80px); }}
     *, *::before, *::after {{ box-sizing: border-box; }}
@@ -5089,8 +5094,7 @@ def dashboard_html(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="{max(refresh_seconds, 1)}">
-  <title>Syscoin Hot Wallet Tracker</title>
+{refresh_meta_tag(refresh_seconds)}  <title>Syscoin Hot Wallet Tracker</title>
   <style>
     :root {{ color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --page-gutter: clamp(24px, 3.8vw, 80px); }}
     *, *::before, *::after {{ box-sizing: border-box; }}
@@ -5717,8 +5721,7 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="{max(refresh_seconds, 1)}">
-  <title>Syscoin Top Wallets</title>
+{refresh_meta_tag(refresh_seconds)}  <title>Syscoin Top Wallets</title>
   <style>
     :root {{ color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --page-gutter: clamp(24px, 3.8vw, 80px); }}
     *, *::before, *::after {{ box-sizing: border-box; }}
@@ -6316,8 +6319,7 @@ def masternodes_html(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="{max(refresh_seconds, 1)}">
-  <title>Syscoin Sentry Node Tracker</title>
+{refresh_meta_tag(refresh_seconds)}  <title>Syscoin Sentry Node Tracker</title>
   <style>
     :root {{ color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --page-gutter: clamp(24px, 3.8vw, 80px); }}
     *, *::before, *::after {{ box-sizing: border-box; }}
@@ -7027,7 +7029,7 @@ def build_parser() -> argparse.ArgumentParser:
     static_p.add_argument("--output-dir", type=Path, required=True, help="Directory to publish static HTML/data files")
     static_p.add_argument("--since-date", default="2026-04-14 12:30", help="Only show dashboard movements from this date/time")
     static_p.add_argument("--from-height", type=int, help="Only fetch address transactions from this height")
-    static_p.add_argument("--refresh-seconds", type=int, default=60, help="HTML meta refresh interval")
+    static_p.add_argument("--refresh-seconds", type=int, default=0, help="HTML meta refresh interval; 0 disables auto reload")
     static_p.add_argument("--sync-max-pages", type=int, help="Limit address pages during dashboard sync")
     static_p.add_argument("--next-hop-limit", type=int, default=8, help="Number of first-hop spends to trace per publish")
     static_p.add_argument("--node-spend-limit", type=int, default=12, help="Number of possible node spends to trace per publish")
@@ -7357,14 +7359,13 @@ def main(argv: list[str] | None = None) -> int:
             masternode_thread.start()
         elif args.masternode_sync_interval > 0:
             print("Sentry node live sync disabled: no RPC URL/host supplied.", file=sys.stderr)
-        refresh_candidates = [value for value in (args.sync_interval, args.masternode_sync_interval) if value > 0]
         serve(
             store,
             args.host,
             args.port,
             since_time=since_time,
             since_label=display_label,
-            refresh_seconds=min(refresh_candidates) if refresh_candidates else 60,
+            refresh_seconds=0,
         )
         return 0
 
