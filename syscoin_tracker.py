@@ -4319,14 +4319,17 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
             return f"<tr data-period='{period}'><td class='empty' colspan='12'>No {period} emission rows yet.</td></tr>"
         html_rows = []
         for row in rows:
+            start_time = int(row["start_time"])
+            row_year = dt.datetime.fromtimestamp(start_time, tz=dt.timezone.utc).year
             nevm_burned_wei = int(row.get("nevm_burned_wei", 0))
             combined_miner_wei = int(row.get("combined_miner_wei", 0))
             net_issued_wei = int(row.get("net_issued_wei", 0))
             html_rows.append(
                 "<tr "
                 f"data-period='{html.escape(period)}' "
-                f"data-period-start='{int(row['start_time'])}'>"
-                f"<td data-sort='{int(row['start_time'])}'>{html.escape(row['label'])}</td>"
+                f"data-year='{row_year}' "
+                f"data-period-start='{start_time}'>"
+                f"<td data-sort='{start_time}'>{html.escape(row['label'])}</td>"
                 f"<td class='amount' data-sort='{int(row['blocks'])}'>{int(row['blocks']):,}</td>"
                 f"<td class='amount' data-sort='{int(row.get('nevm_blocks', 0))}'>{int(row.get('nevm_blocks', 0)):,}</td>"
                 f"<td class='amount' data-sort='{combined_miner_wei}' title='{fmt_wei_sys(combined_miner_wei)} SYS'>{fmt_compact_wei_sys(combined_miner_wei)}</td>"
@@ -4343,6 +4346,23 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
         return "\n".join(html_rows)
 
     period_rows_html = "\n".join(period_rows(period) for period in ("monthly", "weekly", "yearly"))
+    period_years = sorted(
+        {
+            dt.datetime.fromtimestamp(int(row["start_time"]), tz=dt.timezone.utc).year
+            for rows in snapshot["periods"].values()
+            for row in rows
+        },
+        reverse=True,
+    )
+    year_options_html = "\n".join(
+        [
+            "<option value=\"all\">All years</option>",
+            *(
+                f"<option value=\"{year}\"{' selected' if index == 0 else ''}>{year}</option>"
+                for index, year in enumerate(period_years)
+            ),
+        ]
+    )
     latest_rows = []
     for row in snapshot.get("latest_blocks", []):
         ts = int_or_none(row.get("block_time"))
@@ -4376,11 +4396,12 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
         )
     latest_nevm_rows_html = "\n".join(latest_nevm_rows) or "<tr><td class='empty' colspan='8'>No recent NEVM emissions yet.</td></tr>"
 
-    def chart_records(period: str, limit: int) -> list[dict[str, Any]]:
-        records = list(reversed(snapshot["periods"].get(period, [])[:limit]))
+    def chart_records(period: str) -> list[dict[str, Any]]:
+        records = list(reversed(snapshot["periods"].get(period, [])))
         return [
             {
                 "label": row["label"],
+                "year": dt.datetime.fromtimestamp(int(row["start_time"]), tz=dt.timezone.utc).year,
                 "miner": round(float(Decimal(int(row["miner_sats"])) / SATOSHI), 4),
                 "combinedMiner": round(float(Decimal(int(row.get("combined_miner_wei", 0))) / Decimal(WEI_PER_SYS_INT)), 4),
                 "nevmMiner": round(float(Decimal(int(row.get("nevm_miner_total_wei", 0))) / Decimal(WEI_PER_SYS_INT)), 4),
@@ -4401,9 +4422,9 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
         ]
 
     chart_data = {
-        "monthly": chart_records("monthly", 18),
-        "weekly": chart_records("weekly", 26),
-        "yearly": chart_records("yearly", 12),
+        "monthly": chart_records("monthly"),
+        "weekly": chart_records("weekly"),
+        "yearly": chart_records("yearly"),
     }
     chart_data_json = json.dumps(chart_data).replace("</", "<\\/")
 
@@ -4465,6 +4486,9 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
     .trend-panel h3 {{ font-size: 1rem; margin: 0 0 4px; }}
     .trend-panel p {{ color: #687177; font-size: 0.82rem; line-height: 1.4; margin: 0 0 10px; }}
     .chart-canvas-wrap {{ height: 260px; min-width: 0; position: relative; }}
+    .filter-strip {{ align-items: end; display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; margin: 12px 0; }}
+    .filter-strip label {{ color: #687177; display: grid; font-size: 0.78rem; font-weight: 700; gap: 4px; min-width: 130px; }}
+    .filter-strip select {{ background: #fff; border: 1px solid #cfd7d1; border-radius: 6px; color: #1c2227; font: inherit; min-height: 36px; padding: 7px 9px; }}
     .table-controls {{ align-items: end; display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; margin: 10px 0; }}
     .pagination-controls {{ align-items: end; display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; margin-left: auto; }}
     .page-size-control {{ color: #687177; display: grid; font-size: 0.78rem; font-weight: 700; gap: 4px; width: 110px; }}
@@ -4493,6 +4517,7 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
       .emissions-overview {{ grid-template-columns: 1fr; }}
       .allocation-block {{ border-left: 0 !important; border-top: 1px solid #d9ded8; padding: 16px 0 8px; }}
       .pagination-controls {{ align-items: stretch; flex-direction: column; margin-left: 0; width: 100%; }}
+      .filter-strip {{ justify-content: flex-start; }}
       .page-size-control {{ width: 100%; }}
       .pager {{ justify-content: space-between; }}
       .topbar {{ align-items: start; flex-direction: column; }}
@@ -4510,14 +4535,14 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
       body {{ background: #121619; color: #f3f4f6; }}
       .section-panel {{ background: rgba(28, 35, 40, 0.62); border-color: #334047; }}
       .metric, .period-summary article, .table-wrap, table {{ background: #1c2328; border-color: #334047; }}
-      .table-controls select, .pager button {{ background: #1c2328; border-color: #46555e; color: #f3f4f6; }}
+      .filter-strip select, .table-controls select, .pager button {{ background: #1c2328; border-color: #46555e; color: #f3f4f6; }}
       th {{ background: #263139; }}
       th, td {{ border-color: #334047; }}
       a {{ color: #67d7ff; }}
       .subtitle {{ color: #b6c3c7; }}
       .emissions-overview, .allocation-block + .allocation-block, .trend-panel, .allocation-block {{ border-color: #334047; }}
       .stack-bar {{ background: #263139; }}
-      .metric span, .metric small, .period-summary span, .allocation-block p, .allocation-row dt, .allocation-row .pct, .rate-facts span, .trend-panel p, .panel-title p, .phase-note, .empty, .table-controls label, .page-size-control, .pager, .page-status {{ color: #a7b0b5; }}
+      .metric span, .metric small, .period-summary span, .allocation-block p, .allocation-row dt, .allocation-row .pct, .rate-facts span, .trend-panel p, .panel-title p, .phase-note, .empty, .filter-strip label, .table-controls label, .page-size-control, .pager, .page-status {{ color: #a7b0b5; }}
     }}
   </style>
 </head>
@@ -4553,7 +4578,13 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
         <p>{html.escape(status_text)} · Updated {html.escape(updated_text)}</p>
       </div>
       <p class="phase-note">UTXO payouts come from coinbase outputs. NEVM adds a static miner reward, priority fees, and burned base fees. Net issuance counts new rewards minus NEVM burns; priority fees are miner income but not new supply.</p>
-      <div class="table-controls">
+      <div class="filter-strip" aria-label="Emission filters">
+        <label for="emission-year-select">
+          <span>Year</span>
+          <select id="emission-year-select">
+            {year_options_html}
+          </select>
+        </label>
         <label for="emission-period-select">
           <span>Breakdown</span>
           <select id="emission-period-select">
@@ -4610,7 +4641,7 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
     <section class="section-panel">
       <div class="panel-title">
         <h2>Period Table</h2>
-        <p>Monthly, weekly, and yearly views</p>
+        <p>Filtered by selected year and breakdown</p>
       </div>
       {table_controls("emission-periods", "Emission period")}
       <div class="table-wrap">
@@ -4651,7 +4682,8 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
   <script src="{CHART_ASSET_ROUTE}"></script>
   <script>
     (() => {{
-      const selector = document.getElementById("emission-period-select");
+      const periodSelector = document.getElementById("emission-period-select");
+      const yearSelector = document.getElementById("emission-year-select");
       const rows = Array.from(document.querySelectorAll("#emission-periods-table tbody tr"));
       const chartData = JSON.parse(document.getElementById("emission-chart-data")?.textContent || "{{}}");
       const palette = {{
@@ -4678,6 +4710,45 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
       const setText = (id, value) => {{
         const node = document.getElementById(id);
         if (node) node.textContent = value;
+      }};
+      const selectedYear = () => yearSelector?.value || "all";
+      const matchesYear = (year, selected) => selected === "all" || String(year) === String(selected);
+      const aggregateRecords = (records) => records.reduce((acc, item) => {{
+        acc.miner += item.miner || 0;
+        acc.combinedMiner += item.combinedMiner || 0;
+        acc.nevmMiner += item.nevmMiner || 0;
+        acc.nevmStatic += item.nevmStatic || 0;
+        acc.nevmPriority += item.nevmPriority || 0;
+        acc.nevmBurned += item.nevmBurned || 0;
+        acc.netIssued += item.netIssued || 0;
+        acc.sentry += item.sentry || 0;
+        acc.governance += item.governance || 0;
+        acc.initial += item.initial || 0;
+        acc.base += item.base || 0;
+        acc.l1 += item.l1 || 0;
+        acc.l2 += item.l2 || 0;
+        acc.fees += item.fees || 0;
+        return acc;
+      }}, {{
+        miner: 0,
+        combinedMiner: 0,
+        nevmMiner: 0,
+        nevmStatic: 0,
+        nevmPriority: 0,
+        nevmBurned: 0,
+        netIssued: 0,
+        sentry: 0,
+        governance: 0,
+        initial: 0,
+        base: 0,
+        l1: 0,
+        l2: 0,
+        fees: 0
+      }});
+      const periodLabel = (period, year, records) => {{
+        if (!records.length) return "-";
+        if (year !== "all") return period === "yearly" ? String(year) : `${{year}} ${{period}}`;
+        return `All indexed ${{period}}`;
       }};
       const renderAllocation = (barId, listId, items) => {{
         const bar = document.getElementById(barId);
@@ -4713,45 +4784,56 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
           }});
         }}
       }};
-      const setRows = (period) => {{
+      const setRows = (period, year) => {{
         rows.forEach((row) => {{
-          row.hidden = row.dataset.period !== period;
-          row.dataset.periodFiltered = row.dataset.period !== period ? "true" : "false";
+          const filtered = row.dataset.period !== period || !matchesYear(row.dataset.year, year);
+          row.hidden = filtered;
+          row.dataset.periodFiltered = filtered ? "true" : "false";
         }});
         window.dispatchEvent(new CustomEvent("emissions:period-change"));
       }};
-      const recordsFor = (period) => chartData[period] || [];
-      const upsertCharts = (period) => {{
-        const records = recordsFor(period);
-        const labels = records.map((item) => item.label);
+      const recordsFor = (period, year = selectedYear()) => (chartData[period] || []).filter((item) => matchesYear(item.year, year));
+      const rateFor = (period, year, records) => {{
+        if (!records.length) return null;
+        if (year !== "all") {{
+          const yearly = recordsFor("yearly", year)[0];
+          if (Number.isFinite(yearly?.rate)) return yearly.rate;
+        }}
         const latest = records[records.length - 1] || {{}};
-        setText("summary-period", latest.label || "-");
-        setText("summary-issued", compactSys(latest.netIssued || 0));
-        setText("summary-miner", compactSys(latest.combinedMiner || 0));
-        setText("summary-sentry", compactSys(latest.sentry || 0));
-        setText("summary-burned", compactSys(latest.nevmBurned || 0));
-        setText("summary-rate", Number.isFinite(latest.rate) ? `${{latest.rate.toFixed(2)}}%` : "-");
+        return Number.isFinite(latest.rate) ? latest.rate : null;
+      }};
+      const upsertCharts = (period, year) => {{
+        const records = recordsFor(period, year);
+        const labels = records.map((item) => item.label);
+        const summary = aggregateRecords(records);
+        const rate = rateFor(period, year, records);
+        setText("summary-period", periodLabel(period, year, records));
+        setText("summary-issued", compactSys(summary.netIssued || 0));
+        setText("summary-miner", compactSys(summary.combinedMiner || 0));
+        setText("summary-sentry", compactSys(summary.sentry || 0));
+        setText("summary-burned", compactSys(summary.nevmBurned || 0));
+        setText("summary-rate", Number.isFinite(rate) ? `${{rate.toFixed(2)}}%` : "-");
         renderAllocation("reward-bar", "reward-list", [
-          {{ label: "UTXO Miner", value: latest.miner || 0, color: palette.miner }},
-          {{ label: "NEVM Miner", value: latest.nevmMiner || 0, color: palette.nevm }},
-          {{ label: "Sentry", value: latest.sentry || 0, color: palette.sentry }},
-          {{ label: "Governance", value: latest.governance || 0, color: palette.governance }},
-          {{ label: "Initial", value: latest.initial || 0, color: palette.initial }}
+          {{ label: "UTXO Miner", value: summary.miner || 0, color: palette.miner }},
+          {{ label: "NEVM Miner", value: summary.nevmMiner || 0, color: palette.nevm }},
+          {{ label: "Sentry", value: summary.sentry || 0, color: palette.sentry }},
+          {{ label: "Governance", value: summary.governance || 0, color: palette.governance }},
+          {{ label: "Initial", value: summary.initial || 0, color: palette.initial }}
         ]);
         renderAllocation("nevm-bar", "nevm-list", [
-          {{ label: "Static Reward", value: latest.nevmStatic || 0, color: palette.nevm }},
-          {{ label: "Priority Fees", value: latest.nevmPriority || 0, color: palette.miner }},
-          {{ label: "Fee Burns", value: latest.nevmBurned || 0, color: palette.burn }}
+          {{ label: "Static Reward", value: summary.nevmStatic || 0, color: palette.nevm }},
+          {{ label: "Priority Fees", value: summary.nevmPriority || 0, color: palette.miner }},
+          {{ label: "Fee Burns", value: summary.nevmBurned || 0, color: palette.burn }}
         ]);
         renderAllocation("seniority-bar", "seniority-list", [
-          {{ label: "Base", value: latest.base || 0, color: palette.base }},
-          {{ label: "Level 1", value: latest.l1 || 0, color: palette.l1 }},
-          {{ label: "Level 2", value: latest.l2 || 0, color: palette.l2 }}
+          {{ label: "Base", value: summary.base || 0, color: palette.base }},
+          {{ label: "Level 1", value: summary.l1 || 0, color: palette.l1 }},
+          {{ label: "Level 2", value: summary.l2 || 0, color: palette.l2 }}
         ]);
-        setText("rate-main", Number.isFinite(latest.rate) ? `${{latest.rate.toFixed(2)}}%` : "-");
-        setText("rate-issued", compactSys(latest.netIssued || 0));
-        setText("rate-fees", compactSys(latest.nevmBurned || 0));
-        setText("rate-period", latest.label || "-");
+        setText("rate-main", Number.isFinite(rate) ? `${{rate.toFixed(2)}}%` : "-");
+        setText("rate-issued", compactSys(summary.netIssued || 0));
+        setText("rate-fees", compactSys(summary.nevmBurned || 0));
+        setText("rate-period", periodLabel(period, year, records));
 
         const trendPanel = document.getElementById("trend-panel");
         if (trendPanel) trendPanel.hidden = records.length < 2;
@@ -4794,11 +4876,13 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
         trendChart = new Chart(document.getElementById("trend-chart"), trendConfig);
       }};
       const update = () => {{
-        const period = selector?.value || "monthly";
-        setRows(period);
-        upsertCharts(period);
+        const period = periodSelector?.value || "monthly";
+        const year = selectedYear();
+        setRows(period, year);
+        upsertCharts(period, year);
       }};
-      selector?.addEventListener("change", update);
+      periodSelector?.addEventListener("change", update);
+      yearSelector?.addEventListener("change", update);
       update();
     }})();
     (() => {{
