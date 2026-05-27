@@ -47,6 +47,18 @@
       "destination": "/api/index.py"
     },
     {
+      "source": "/miners",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/miners.html",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/miners.json",
+      "destination": "/api/index.py"
+    },
+    {
       "source": "/assets/chart.umd.js",
       "destination": "/api/index.py"
     },

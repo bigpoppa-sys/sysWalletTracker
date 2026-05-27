@@ -29,6 +29,9 @@ from syscoin_tracker import (  # noqa: E402
     EMISSIONS_JSON,
     EMISSIONS_JSON_PATH,
     EMISSIONS_PATHS,
+    MINERS_JSON,
+    MINERS_JSON_PATH,
+    MINERS_PATHS,
     LEGACY_MASTERNODE_PATHS,
     SENTRY_COLLATERAL_SATS,
     SENTRY_NODE_PATHS,
@@ -46,6 +49,8 @@ from syscoin_tracker import (  # noqa: E402
     load_network_masternodes_csv,
     load_network_masternodes_csv_rows,
     masternodes_html,
+    miners_html,
+    miners_snapshot,
     parse_since_date,
     refresh_exchange_hot_wallet_balances,
     refresh_node_spends,
@@ -82,10 +87,12 @@ INSTALL_BUNDLE_FILES = (
     "exchange_routes.csv",
     "exchange_tags.csv",
     "wallet_labels.csv",
+    "miner_addresses.csv",
     "network_masternodes.csv",
     "node_outputs.csv",
     "verified_sentries.csv",
     "emissions.json",
+    "miners.json",
     "api/index.py",
     "static/assets/chart.umd.js",
     "scripts/install_vps_cron.sh",
@@ -262,6 +269,10 @@ def fetch_static_page(path: str, *, force: bool = False) -> bytes | None:
         page_name = "emissions.html"
     elif path == EMISSIONS_JSON_PATH:
         page_name = EMISSIONS_JSON
+    elif path in MINERS_PATHS:
+        page_name = "miners.html"
+    elif path == MINERS_JSON_PATH:
+        page_name = MINERS_JSON
     else:
         page_name = "index.html"
     url = f"{base_url}/{page_name}"
@@ -303,9 +314,13 @@ def fetch_static_page(path: str, *, force: bool = False) -> bytes | None:
                 return None
             if path in EMISSIONS_PATHS and b"Syscoin Network Emissions" not in body:
                 return None
+            if path in MINERS_PATHS and b"Syscoin Miners" not in body:
+                return None
             if path == TOP_WALLETS_JSON_PATH and not body.lstrip().startswith(b"{"):
                 return None
             if path == EMISSIONS_JSON_PATH and not body.lstrip().startswith(b"{"):
+                return None
+            if path == MINERS_JSON_PATH and not body.lstrip().startswith(b"{"):
                 return None
             if cache_ttl > 0:
                 _static_page_cache[cache_key] = (now, body)
@@ -444,6 +459,8 @@ class handler(BaseHTTPRequestHandler):
             TOP_WALLETS_JSON_PATH,
             *EMISSIONS_PATHS,
             EMISSIONS_JSON_PATH,
+            *MINERS_PATHS,
+            MINERS_JSON_PATH,
         ):
             self.send_error(404)
             return
@@ -451,7 +468,7 @@ class handler(BaseHTTPRequestHandler):
         force = urllib.parse.parse_qs(parsed.query).get("force", ["0"])[0] == "1"
         content_type = (
             "application/json; charset=utf-8"
-            if parsed.path in (TOP_WALLETS_JSON_PATH, EMISSIONS_JSON_PATH)
+            if parsed.path in (TOP_WALLETS_JSON_PATH, EMISSIONS_JSON_PATH, MINERS_JSON_PATH)
             else "text/html; charset=utf-8"
         )
         try:
@@ -494,6 +511,12 @@ class handler(BaseHTTPRequestHandler):
                 )
             elif parsed.path == EMISSIONS_JSON_PATH:
                 html_body = json.dumps(emissions_snapshot(store), indent=2)
+            elif parsed.path in MINERS_PATHS:
+                html_body = miners_html(
+                    refresh_seconds=env_int("SYS_TRACKER_PAGE_REFRESH_SECONDS", 0),
+                )
+            elif parsed.path == MINERS_JSON_PATH:
+                html_body = json.dumps(miners_snapshot(), indent=2)
             else:
                 html_body = dashboard_html(
                     store,

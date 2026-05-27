@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import csv
 import datetime as dt
 import html
@@ -56,6 +57,7 @@ DEFAULT_EXCHANGE_ROUTES_PATH = Path("exchange_routes.csv")
 DEFAULT_EXCHANGE_HOT_WALLETS_PATH = Path("exchange_hot_wallets.csv")
 DEFAULT_EXCHANGE_COLD_WALLETS_PATH = Path("exchange_cold_wallets.csv")
 DEFAULT_WALLET_LABELS_PATH = Path("wallet_labels.csv")
+DEFAULT_MINER_ADDRESSES_PATH = Path("miner_addresses.csv")
 DEFAULT_NETWORK_MASTERNODES_PATH = Path("network_masternodes.csv")
 DEFAULT_NODE_OUTPUTS_PATH = Path("node_outputs.csv")
 DEFAULT_VERIFIED_SENTRIES_PATH = Path("verified_sentries.csv")
@@ -70,6 +72,12 @@ EMISSIONS_PATHS = ("/emissions", "/emissions.html")
 EMISSIONS_JSON = "emissions.json"
 EMISSIONS_HTML = "emissions.html"
 EMISSIONS_JSON_PATH = f"/{EMISSIONS_JSON}"
+MINERS_PATHS = ("/miners", "/miners.html")
+MINERS_JSON = "miners.json"
+MINERS_HTML = "miners.html"
+MINERS_JSON_PATH = f"/{MINERS_JSON}"
+DEFAULT_STATUS_API_URL = "https://status-api.syscoin.org"
+RECENT_MINER_BLOCK_POOL_IDS = {"f2pool", "viabtc", "binancepool", "antpool"}
 CHART_ASSET_ROUTE = "/assets/chart.umd.js"
 CHART_ASSET_PATH = Path("static/assets/chart.umd.js")
 NETWORK_MASTERNODE_HEADERS = [
@@ -203,6 +211,34 @@ def fmt_percent(part: int, total: int) -> str:
         return "0%"
     value = Decimal(part) * Decimal("100") / Decimal(total)
     return f"{value:.2f}%"
+
+
+def fmt_ratio_percent(part: int | float | Decimal, total: int | float | Decimal) -> str:
+    try:
+        total_decimal = Decimal(str(total))
+        if not total_decimal:
+            return "0%"
+        value = Decimal(str(part)) * Decimal("100") / total_decimal
+    except Exception:
+        return "0%"
+    return f"{value:.2f}%"
+
+
+def fmt_hashrate(value: int | float | Decimal | None) -> str:
+    if value is None:
+        return "-"
+    amount = Decimal(str(value))
+    units = [
+        ("ZH/s", Decimal("1e21")),
+        ("EH/s", Decimal("1e18")),
+        ("PH/s", Decimal("1e15")),
+        ("TH/s", Decimal("1e12")),
+        ("GH/s", Decimal("1e9")),
+    ]
+    for unit, scale in units:
+        if abs(amount) >= scale:
+            return f"{amount / scale:,.2f} {unit}"
+    return f"{amount:,.0f} H/s"
 
 
 def fmt_local_datetime(ts: int | None, timezone_name: str = DEFAULT_TIMEZONE) -> str:
@@ -390,6 +426,27 @@ def load_exchange_cold_wallets(path: Path = DEFAULT_EXCHANGE_COLD_WALLETS_PATH) 
                 }
             )
     return wallets
+
+
+def load_miner_addresses(path: Path = DEFAULT_MINER_ADDRESSES_PATH) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    addresses = []
+    with path.open(newline="") as f:
+        for row in csv.DictReader(f):
+            pool = (row.get("pool") or "").strip()
+            address = (row.get("address") or "").strip()
+            if not pool or not address:
+                continue
+            addresses.append(
+                {
+                    "pool": pool,
+                    "address": address,
+                    "role": (row.get("role") or "").strip(),
+                    "note": (row.get("note") or "").strip(),
+                }
+            )
+    return addresses
 
 
 def root_path(path: str) -> str:
@@ -3527,6 +3584,296 @@ def emissions_snapshot(store: Store, latest_limit: int = 100) -> dict[str, Any]:
     }
 
 
+def miners_snapshot(
+    *,
+    status_base_url: str | None = None,
+    address_path: Path = DEFAULT_MINER_ADDRESSES_PATH,
+    recent_per_pool: int = 4,
+) -> dict[str, Any]:
+    status_base = (status_base_url or os.getenv("SYS_STATUS_API_URL") or DEFAULT_STATUS_API_URL).rstrip("/")
+    status_client = BlockbookClient(status_base, timeout=5, retries=1)
+    blockbook = BlockbookClient(DEFAULT_BLOCKBOOK_URL, timeout=8, retries=1)
+    generated_at = now_iso()
+
+    status_payload: dict[str, Any] = {}
+    mining_payload: dict[str, Any] = {"miners": []}
+    status_error = ""
+    try:
+        status_payload = status_client.get_json("/status")
+        mining_payload = status_client.get_json("/mining")
+    except Exception as exc:
+        status_error = str(exc)
+
+    miners = mining_payload.get("miners") if isinstance(mining_payload, dict) else []
+    if not isinstance(miners, list):
+        miners = []
+
+    known_addresses = load_miner_addresses(address_path)
+    addresses_by_pool: dict[str, list[dict[str, str]]] = {}
+    for item in known_addresses:
+        addresses_by_pool.setdefault(item["pool"], []).append(item)
+
+    hashrate = status_payload.get("hashrate", {}) if isinstance(status_payload, dict) else {}
+    h_sys = int(hashrate.get("h_sys") or 0) if isinstance(hashrate, dict) else 0
+    total_commitments = sum(int(miner.get("syscoin_commitments") or 0) for miner in miners if isinstance(miner, dict))
+    total_blocks = sum(int(miner.get("blocks") or 0) for miner in miners if isinstance(miner, dict))
+    window_blocks = int(hashrate.get("total_blocks") or 0) if isinstance(hashrate, dict) else 0
+    tagged_blocks = int(hashrate.get("tagged_blocks") or 0) if isinstance(hashrate, dict) else 0
+    unknown_blocks = max(0, window_blocks - tagged_blocks)
+
+    def fetch_pool_blocks(miner: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+        name = str(miner.get("name") or miner.get("raw_name") or "Unknown")
+        mempool_id = str(miner.get("mempool_id") or "")
+        if not mempool_id:
+            return mempool_id, []
+        try:
+            block_payload = status_client.get_json(
+                f"/mining/{urllib.parse.quote(mempool_id)}/blocks",
+                {"limit": recent_per_pool},
+            )
+        except Exception:
+            return mempool_id, []
+        raw_blocks = block_payload.get("blocks") if isinstance(block_payload, dict) else []
+        if not isinstance(raw_blocks, list):
+            return mempool_id, []
+        pool_blocks: list[dict[str, Any]] = []
+        for block in raw_blocks:
+            if not isinstance(block, dict):
+                continue
+            height = int_or_none(block.get("height"))
+            block_hash = str(block.get("hash") or "")
+            if not height or not block_hash:
+                continue
+            btc_depths = [
+                int(commitment.get("btc_depth"))
+                for commitment in (block.get("syscoin_commitments") or [])
+                if isinstance(commitment, dict) and int_or_none(commitment.get("btc_depth")) is not None
+            ]
+            pool_blocks.append(
+                {
+                    "height": height,
+                    "hash": block_hash,
+                    "time": int_or_none(block.get("time")),
+                    "timestamp": block.get("timestamp") or "",
+                    "syscoin_commitment_miner": block.get("syscoin_commitment_miner") or name,
+                    "auxpow_miner": block.get("auxpow_miner") or "",
+                    "btc_depth": min(btc_depths) if btc_depths else None,
+                    "transactions": int_or_none(block.get("transactions")),
+                    "chainlock_finality": bool(block.get("chainlock_finality")),
+                }
+            )
+        return mempool_id, pool_blocks
+
+    pool_blocks_by_id: dict[str, list[dict[str, Any]]] = {}
+    miner_dicts = [
+        miner
+        for miner in miners
+        if isinstance(miner, dict) and str(miner.get("mempool_id") or "") in RECENT_MINER_BLOCK_POOL_IDS
+    ]
+    if miner_dicts:
+        workers = min(8, len(miner_dicts))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(fetch_pool_blocks, miner) for miner in miner_dicts]
+            for future in concurrent.futures.as_completed(futures):
+                mempool_id, pool_blocks = future.result()
+                pool_blocks_by_id[mempool_id] = pool_blocks
+
+    pool_rows: list[dict[str, Any]] = []
+    recent_blocks: dict[str, dict[str, Any]] = {}
+    for miner in miners:
+        if not isinstance(miner, dict):
+            continue
+        name = str(miner.get("name") or miner.get("raw_name") or "Unknown")
+        commitments = int(miner.get("syscoin_commitments") or 0)
+        blocks = int(miner.get("blocks") or 0)
+        share = (Decimal(commitments) / Decimal(total_commitments)) if total_commitments else Decimal(0)
+        estimated_hashrate = int(Decimal(h_sys) * share) if h_sys else 0
+        mempool_id = str(miner.get("mempool_id") or "")
+        pool_blocks = pool_blocks_by_id.get(mempool_id, [])
+        for block in pool_blocks:
+            recent_blocks[str(block.get("hash") or "")] = block
+
+        last_seen = max((int(block.get("time") or 0) for block in pool_blocks), default=None)
+        pool_rows.append(
+            {
+                "name": name,
+                "raw_name": miner.get("raw_name") or "",
+                "mempool_id": mempool_id,
+                "blocks": blocks,
+                "blocks_won": commitments,
+                "syscoin_commitments": commitments,
+                "commitment_share": float(share),
+                "commitment_share_text": fmt_ratio_percent(commitments, total_commitments),
+                "estimated_hashrate_hs": estimated_hashrate,
+                "estimated_hashrate": fmt_hashrate(estimated_hashrate),
+                "miner_rewards_earned": "-",
+                "miner_rewards_sats": None,
+                "known_addresses": addresses_by_pool.get(name, []),
+                "known_address_count": len(addresses_by_pool.get(name, [])),
+                "last_seen_time": last_seen,
+                "last_seen": fmt_local_datetime(last_seen) if last_seen else "-",
+            }
+        )
+
+    pool_lookup = {row["name"]: row for row in pool_rows}
+
+    def fetch_address_row(item: dict[str, str]) -> dict[str, Any]:
+        address = item["address"]
+        summary: dict[str, Any] = {}
+        latest_time = None
+        try:
+            summary = blockbook.address(address, details="txs", page_size=1)
+            txs = summary.get("transactions") or []
+            if isinstance(txs, list) and txs:
+                latest_time = int_or_none(txs[0].get("blockTime") or txs[0].get("time"))
+        except Exception:
+            summary = {}
+        balance_sats = sats(summary.get("balance"))
+        total_received_sats = sats(summary.get("totalReceived"))
+        total_sent_sats = sats(summary.get("totalSent"))
+        tx_count = int(summary.get("txs") or 0)
+        first_seen = None
+        total_pages = int(summary.get("totalPages") or 0)
+        if total_pages > 1:
+            try:
+                first_summary = blockbook.address(address, details="txs", page=total_pages, page_size=1)
+                first_txs = first_summary.get("transactions") or []
+                if isinstance(first_txs, list) and first_txs:
+                    first_seen = int_or_none(first_txs[-1].get("blockTime") or first_txs[-1].get("time"))
+            except Exception:
+                first_seen = None
+        elif latest_time:
+            first_seen = latest_time
+        return {
+            "pool": item["pool"],
+            "address": address,
+            "short_address": short_address(address),
+            "role": item.get("role") or "",
+            "note": item.get("note") or "",
+            "balance_sats": balance_sats,
+            "balance_sys": sats_to_sys_string(balance_sats),
+            "balance_compact": fmt_compact_sys(balance_sats),
+            "total_received_sats": total_received_sats,
+            "total_received_compact": fmt_compact_sys(total_received_sats),
+            "total_sent_sats": total_sent_sats,
+            "total_sent_compact": fmt_compact_sys(total_sent_sats),
+            "txs": tx_count,
+            "blocks_paid": tx_count,
+            "first_seen_time": first_seen,
+            "first_seen": fmt_local_datetime(first_seen) if first_seen else "-",
+            "last_seen_time": latest_time,
+            "last_seen": fmt_local_datetime(latest_time) if latest_time else "-",
+        }
+
+    address_rows: list[dict[str, Any]] = []
+    if known_addresses:
+        workers = min(6, len(known_addresses))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            address_rows = list(executor.map(fetch_address_row, known_addresses))
+
+    address_pools = set(addresses_by_pool)
+    for pool in address_pools - set(pool_lookup):
+        pool_rows.append(
+            {
+                "name": pool,
+                "raw_name": "",
+                "mempool_id": "",
+                "blocks": 0,
+                "blocks_won": 0,
+                "syscoin_commitments": 0,
+                "commitment_share": 0,
+                "commitment_share_text": "0%",
+                "estimated_hashrate_hs": 0,
+                "estimated_hashrate": "-",
+                "miner_rewards_earned": "-",
+                "miner_rewards_sats": None,
+                "known_addresses": addresses_by_pool.get(pool, []),
+                "known_address_count": len(addresses_by_pool.get(pool, [])),
+                "last_seen_time": None,
+                "last_seen": "-",
+            }
+        )
+
+    pool_rows.sort(key=lambda row: (-int(row.get("syscoin_commitments") or 0), str(row.get("name") or "")))
+    address_rows.sort(key=lambda row: (str(row.get("pool") or ""), -int(row.get("balance_sats") or 0), str(row.get("address") or "")))
+    address_groups: list[dict[str, Any]] = []
+    rows_by_pool: dict[str, list[dict[str, Any]]] = {}
+    for row in address_rows:
+        rows_by_pool.setdefault(str(row.get("pool") or "-"), []).append(row)
+    for pool, rows in sorted(rows_by_pool.items()):
+        first_seen_values = [int(row["first_seen_time"]) for row in rows if row.get("first_seen_time") is not None]
+        last_seen_values = [int(row["last_seen_time"]) for row in rows if row.get("last_seen_time") is not None]
+        total_received = sum(int(row.get("total_received_sats") or 0) for row in rows)
+        balance = sum(int(row.get("balance_sats") or 0) for row in rows)
+        blocks_paid = sum(int(row.get("blocks_paid") or 0) for row in rows)
+        addresses = [str(row.get("address") or "") for row in rows if row.get("address")]
+        first_seen = min(first_seen_values) if first_seen_values else None
+        last_seen = max(last_seen_values) if last_seen_values else None
+        primary = rows[0] if rows else {}
+        address_count = len(addresses)
+        address_label = short_address(str(primary.get("address") or "")) if address_count == 1 else f"{address_count:,} rotating addresses"
+        note = str(primary.get("note") or primary.get("role") or "")
+        if address_count > 1:
+            note = "grouped rotating payouts"
+        address_groups.append(
+            {
+                "pool": pool,
+                "address": str(primary.get("address") or ""),
+                "addresses": addresses,
+                "address_count": address_count,
+                "address_label": address_label,
+                "role": str(primary.get("role") or ""),
+                "note": note,
+                "balance_sats": balance,
+                "balance_sys": sats_to_sys_string(balance),
+                "balance_compact": fmt_compact_sys(balance),
+                "total_received_sats": total_received,
+                "total_received_compact": fmt_compact_sys(total_received),
+                "txs": blocks_paid,
+                "blocks_paid": blocks_paid,
+                "first_seen_time": first_seen,
+                "first_seen": fmt_local_datetime(first_seen) if first_seen else "-",
+                "last_seen_time": last_seen,
+                "last_seen": fmt_local_datetime(last_seen) if last_seen else "-",
+            }
+        )
+    address_groups.sort(key=lambda row: (str(row.get("pool") or ""), -int(row.get("total_received_sats") or 0)))
+    latest_blocks = sorted(recent_blocks.values(), key=lambda row: (int(row.get("time") or 0), int(row.get("height") or 0)), reverse=True)[:30]
+    return {
+        "generated_at": generated_at,
+        "type": "miners",
+        "status_error": status_error,
+        "status": {
+            "utxo_height": ((status_payload.get("utxo") or {}) if isinstance(status_payload, dict) else {}).get("indexed_height"),
+            "bitcoin_height": ((status_payload.get("bitcoin") or {}) if isinstance(status_payload, dict) else {}).get("indexed_height"),
+            "known_miners": ((status_payload.get("miners") or {}) if isinstance(status_payload, dict) else {}).get("known"),
+            "network_hashrate_hs": h_sys,
+            "network_hashrate": (hashrate.get("formatted") if isinstance(hashrate, dict) else "") or fmt_hashrate(h_sys),
+            "window_size": hashrate.get("window_size") if isinstance(hashrate, dict) else None,
+            "tagged_blocks": tagged_blocks,
+            "total_blocks": window_blocks,
+            "unknown_blocks": unknown_blocks,
+            "unknown_blocks_text": fmt_ratio_percent(unknown_blocks, window_blocks),
+            "participation": hashrate.get("participation") if isinstance(hashrate, dict) else None,
+            "participation_text": fmt_ratio_percent(tagged_blocks, window_blocks) if isinstance(hashrate, dict) else "0%",
+        },
+        "totals": {
+            "pools": len(pool_rows),
+            "pools_with_addresses": len(addresses_by_pool),
+            "known_addresses": len(address_rows),
+            "known_address_groups": len(address_groups),
+            "syscoin_commitments": total_commitments,
+            "btc_blocks": total_blocks,
+            "window_blocks": window_blocks,
+            "unknown_blocks": unknown_blocks,
+        },
+        "pools": pool_rows,
+        "addresses": address_rows,
+        "address_groups": address_groups,
+        "recent_blocks": latest_blocks,
+    }
+
+
 def follow_outputs(
     store: Store,
     client: BlockbookClient,
@@ -4224,14 +4571,18 @@ def publish_static_snapshot(
     top_wallets_page = top_wallets_html(store, refresh_seconds=refresh_seconds)
     emissions = emissions_snapshot(store)
     emissions_page = emissions_html(store, refresh_seconds=refresh_seconds)
+    miners = miners_snapshot()
+    miners_page = miners_html(refresh_seconds=refresh_seconds, snapshot=miners)
     atomic_write_text(output_dir / "index.html", index_html)
     atomic_write_text(output_dir / "wallet-flows.html", index_html)
     atomic_write_text(output_dir / "sentrynode.html", masternode_page)
     atomic_write_text(output_dir / "masternodes.html", masternode_page)
     atomic_write_text(output_dir / TOP_WALLETS_HTML, top_wallets_page)
     atomic_write_text(output_dir / EMISSIONS_HTML, emissions_page)
+    atomic_write_text(output_dir / MINERS_HTML, miners_page)
     atomic_write_json(output_dir / TOP_WALLETS_JSON, top_wallets)
     atomic_write_json(output_dir / EMISSIONS_JSON, emissions)
+    atomic_write_json(output_dir / MINERS_JSON, miners)
     if CHART_ASSET_PATH.exists():
         asset_target = output_dir / CHART_ASSET_ROUTE.lstrip("/")
         asset_target.parent.mkdir(parents=True, exist_ok=True)
@@ -4255,6 +4606,8 @@ def publish_static_snapshot(
                 "top_wallets_json": TOP_WALLETS_JSON,
                 "emissions": EMISSIONS_HTML,
                 "emissions_json": EMISSIONS_JSON,
+                "miners": MINERS_HTML,
+                "miners_json": MINERS_JSON,
                 "network_masternodes": "network_masternodes.csv",
             },
         },
@@ -4441,11 +4794,12 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
     body {{ background: #f7f5f0; color: #1c2227; }}
     header {{ background: #142026; color: #f8fafc; padding: 24px 0 22px; width: 100%; }}
     .header-inner, main {{ margin-left: var(--page-gutter); margin-right: var(--page-gutter); width: auto; }}
-    .topbar {{ display: flex; align-items: end; justify-content: space-between; gap: 16px; }}
+    .topbar {{ align-items: end; display: flex; gap: 16px; justify-content: space-between; width: 100%; }}
+    .topbar > div {{ min-width: 0; }}
     h1 {{ font-size: 1.8rem; margin: 0 0 8px; letter-spacing: 0; }}
-    .subtitle {{ color: #c9d5d8; font-size: 0.98rem; line-height: 1.45; }}
-    .nav {{ display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }}
-    .nav a {{ border: 1px solid rgba(248, 250, 252, 0.28); border-radius: 999px; color: #dbe6e9; font-size: 0.84rem; padding: 7px 11px; text-decoration: none; }}
+    .subtitle {{ color: #c9d5d8; font-size: 0.98rem; line-height: 1.45; max-width: 980px; }}
+    .nav {{ align-items: center; display: flex; flex: 0 0 auto; flex-wrap: nowrap; gap: 8px; justify-content: flex-end; max-width: 100%; overflow-x: auto; padding-bottom: 2px; }}
+    .nav a {{ border: 1px solid rgba(248, 250, 252, 0.28); border-radius: 999px; color: #dbe6e9; font-size: 0.84rem; line-height: 1; padding: 9px 12px; text-decoration: none; white-space: nowrap; }}
     .nav a.active {{ background: #f8fafc; color: #142026; }}
     main {{ display: grid; gap: 22px; margin-top: 22px; margin-bottom: 22px; padding: 0; }}
     main > * {{ min-width: 0; }}
@@ -4552,13 +4906,14 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
       <div class="topbar">
         <div>
           <h1>Syscoin Network Emissions</h1>
-          <div class="subtitle">Experimental view. Reward payouts and issuance estimates from indexed block coinbase data.</div>
+          <div class="subtitle">Experimental view. Not proof of ownership or intent.</div>
         </div>
         <nav class="nav" aria-label="Dashboard pages">
           <a href="/">Wallet Flows</a>
           <a href="/sentrynode">Sentry Nodes</a>
           <a href="/top-wallets">Top Wallets</a>
           <a class="active" href="/emissions">Network Emissions</a>
+          <a href="/miners">Miners</a>
         </nav>
       </div>
     </div>
@@ -4948,6 +5303,270 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
 </html>"""
 
 
+def miners_html(refresh_seconds: int = 60, snapshot: dict[str, Any] | None = None) -> str:
+    snapshot = snapshot or miners_snapshot()
+    status = snapshot.get("status", {})
+    totals = snapshot.get("totals", {})
+    pools = snapshot.get("pools", [])
+    addresses = snapshot.get("addresses", [])
+    address_groups = snapshot.get("address_groups") or addresses
+    recent_blocks = snapshot.get("recent_blocks", [])
+    top_pool = pools[0] if pools else {}
+    updated = fmt_iso_local_datetime(str(snapshot.get("generated_at") or ""))
+
+    def metric(title: str, value: str, detail: str = "") -> str:
+        detail_html = f"<small>{html.escape(detail)}</small>" if detail else ""
+        return f"<div class='metric'><span>{html.escape(title)}</span><b>{html.escape(value)}</b>{detail_html}</div>"
+
+    def status_pool_url(pool: dict[str, Any]) -> str:
+        mempool_id = str(pool.get("mempool_id") or "")
+        return f"https://status.syscoin.org/mining/{urllib.parse.quote(mempool_id)}" if mempool_id else "https://status.syscoin.org/"
+
+    pool_rows = []
+    for index, pool in enumerate(pools, start=1):
+        name = str(pool.get("name") or "Unknown")
+        pool_rows.append(
+            "<tr>"
+            f"<td class='rank'>{index}</td>"
+            f"<td><a href='{status_pool_url(pool)}'>{html.escape(name)}</a></td>"
+            f"<td class='amount'>{int(pool.get('blocks_won') or 0):,}</td>"
+            f"<td><span class='badge neutral'>{html.escape(str(pool.get('commitment_share_text') or '0%'))}</span></td>"
+            f"<td class='amount'>{html.escape(str(pool.get('estimated_hashrate') or '-'))}</td>"
+            f"<td class='amount'>{html.escape(str(pool.get('miner_rewards_earned') or '-'))}</td>"
+            f"<td>{int(pool.get('known_address_count') or 0):,}</td>"
+            f"<td>{html.escape(str(pool.get('last_seen') or '-'))}</td>"
+            "</tr>"
+        )
+    pool_rows_html = "\n".join(pool_rows) or "<tr><td class='empty' colspan='8'>No miner pool data available yet.</td></tr>"
+
+    address_rows = []
+    for item in address_groups:
+        address = str(item.get("address") or "")
+        addresses_for_title = item.get("addresses") if isinstance(item.get("addresses"), list) else [address]
+        address_title = "\n".join(str(value) for value in addresses_for_title if value)
+        if int(item.get("address_count") or 0) > 1:
+            address_cell = f"<span class='mono' title='{html.escape(address_title)}'>{html.escape(str(item.get('address_label') or '-'))}</span>"
+        else:
+            address_cell = f"<a class='mono' href='{explorer_address_url(address)}' title='{html.escape(address)}'>{html.escape(short_address(address))}</a>"
+        address_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(item.get('pool') or '-'))}</td>"
+            f"<td>{address_cell}</td>"
+            f"<td>{int(item.get('blocks_paid') or 0):,}</td>"
+            f"<td class='amount'>{html.escape(str(item.get('total_received_compact') or '0 SYS'))}</td>"
+            f"<td class='amount' title='{html.escape(str(item.get('balance_sys') or '0'))} SYS'>{html.escape(str(item.get('balance_compact') or '0 SYS'))}</td>"
+            f"<td>{html.escape(str(item.get('first_seen') or '-'))}</td>"
+            f"<td>{html.escape(str(item.get('last_seen') or '-'))}</td>"
+            "</tr>"
+        )
+    address_rows_html = "\n".join(address_rows) or "<tr><td class='empty' colspan='7'>No known miner payout addresses recorded yet.</td></tr>"
+
+    block_rows = []
+    for block in recent_blocks:
+        height = int(block.get("height") or 0)
+        block_hash = str(block.get("hash") or "")
+        block_url = f"{DEFAULT_BLOCKBOOK_URL}/block/{urllib.parse.quote(block_hash)}"
+        block_rows.append(
+            "<tr>"
+            f"<td><a href='{block_url}'>{height:,}</a></td>"
+            f"<td>{html.escape(fmt_local_datetime(int_or_none(block.get('time'))))}</td>"
+            f"<td>{html.escape(str(block.get('syscoin_commitment_miner') or '-'))}</td>"
+            f"<td>{html.escape(str(block.get('auxpow_miner') or '-'))}</td>"
+            f"<td>{html.escape(str(block.get('btc_depth') if block.get('btc_depth') is not None else '-'))}</td>"
+            f"<td>{html.escape(str(block.get('transactions') if block.get('transactions') is not None else '-'))}</td>"
+            "</tr>"
+        )
+    block_rows_html = "\n".join(block_rows) or "<tr><td class='empty' colspan='6'>No recent attributed blocks available yet.</td></tr>"
+
+    error_html = ""
+    if snapshot.get("status_error"):
+        error_html = f"<p class='warning'>Status API unavailable: {html.escape(str(snapshot.get('status_error')))}</p>"
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+{refresh_meta_tag(refresh_seconds)}  <title>Syscoin Miners</title>
+  <style>
+    :root {{ color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --page-gutter: clamp(24px, 3.8vw, 80px); --header-bg: #142026; --body-bg: #f7f5f0; --card-bg: #ffffff; --panel-bg: rgba(255, 255, 255, 0.66); --border: #d9ded8; --text: #1c2227; --muted: #687177; --header-text: #f8fafc; --header-sub: #c9d5d8; }}
+    *, *::before, *::after {{ box-sizing: border-box; }}
+    html, body {{ margin: 0; max-width: 100%; overflow-x: hidden; }}
+    body {{ background: var(--body-bg); color: var(--text); font-size: 16px; line-height: 1.4; }}
+    a {{ color: #086788; font-weight: 800; text-decoration: none; }}
+    .site-header {{ background: var(--header-bg); color: var(--header-text); padding: 24px 0 22px; width: 100%; }}
+    .header-inner, main {{ margin-left: var(--page-gutter); margin-right: var(--page-gutter); width: auto; }}
+    .header-inner {{ align-items: end; display: flex; gap: 16px; justify-content: space-between; }}
+    .header-inner > div {{ min-width: 0; }}
+    .topbar {{ align-items: end; display: flex; gap: 16px; justify-content: space-between; width: 100%; }}
+    .topbar > div {{ min-width: 0; }}
+    h1 {{ font-size: 1.8rem; margin: 0 0 8px; }}
+    .subtitle {{ color: var(--header-sub); font-size: 0.98rem; line-height: 1.45; margin: 0; max-width: 980px; }}
+    .nav {{ align-items: center; display: flex; flex: 0 0 auto; flex-wrap: nowrap; gap: 8px; justify-content: flex-end; max-width: 100%; overflow-x: auto; padding-bottom: 2px; }}
+    .nav a {{ border: 1px solid rgba(248, 250, 252, 0.28); border-radius: 999px; color: #dbe6e9; font-size: 0.84rem; line-height: 1; padding: 9px 12px; white-space: nowrap; }}
+    .nav a.active {{ background: #f8fafc; color: #142026; }}
+    main {{ display: grid; gap: 22px; margin-bottom: 22px; margin-top: 22px; padding: 0; }}
+    main > * {{ min-width: 0; }}
+    .metrics {{ display: grid; gap: 12px; grid-template-columns: repeat(5, minmax(120px, 1fr)); }}
+    .metric, .section {{ border: 1px solid var(--border); border-radius: 8px; min-width: 0; }}
+    .metric {{ background: var(--card-bg); padding: 14px 16px; }}
+    .metric span {{ color: var(--muted); display: block; font-size: 0.84rem; font-weight: 700; margin-bottom: 6px; }}
+    .metric b {{ display: block; font-size: clamp(1.2rem, 1.8vw, 1.55rem); line-height: 1.1; overflow-wrap: anywhere; }}
+    .metric small {{ color: var(--muted); display: block; font-size: 0.78rem; font-weight: 700; margin-top: 8px; }}
+    .section {{ background: var(--panel-bg); padding: 16px; }}
+    .section-head {{ align-items: flex-start; display: flex; gap: 18px; justify-content: space-between; margin-bottom: 14px; }}
+    h2 {{ font-size: 1.25rem; line-height: 1.1; margin: 0; }}
+    .section-note {{ color: var(--muted); font-size: 0.9rem; font-weight: 700; margin: 6px 0 0; max-width: 860px; }}
+    .meta {{ color: var(--muted); font-weight: 800; white-space: nowrap; }}
+    .table-controls {{ align-items: end; display: flex; gap: 10px; justify-content: flex-end; margin: 0 0 10px; }}
+    .table-controls label {{ color: var(--muted); display: grid; font-size: 0.78rem; font-weight: 900; gap: 4px; }}
+    select, button {{ background: var(--card-bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font: inherit; font-weight: 800; min-height: 38px; padding: 7px 12px; }}
+    button:disabled {{ color: #9aa3aa; opacity: 0.7; }}
+    .page-info {{ align-self: center; color: var(--muted); font-weight: 800; min-width: 84px; text-align: center; }}
+    .table-wrap {{ background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; overflow-x: auto; }}
+    table {{ background: var(--card-bg); border-collapse: separate; border-spacing: 0; table-layout: fixed; width: 100%; }}
+    th, td {{ border-bottom: 1px solid #e4e8e2; font-size: 0.88rem; overflow: hidden; padding: 8px 10px; text-align: left; text-overflow: ellipsis; vertical-align: middle; }}
+    th {{ background: #eaf0ec; color: #20272d; font-size: 0.88rem; position: sticky; top: 0; z-index: 10; }}
+    .rank, .amount {{ text-align: right; }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }}
+    .badge {{ border-radius: 999px; display: inline-block; font-size: 0.82rem; font-weight: 900; padding: 4px 8px; }}
+    .badge.neutral {{ background: #eaf7f4; color: #12675f; }}
+    .empty {{ color: var(--muted); font-weight: 800; text-align: center; }}
+    .warning {{ background: #fff7ed; border: 1px solid #fed7aa; border-radius: 8px; color: #9a3412; font-weight: 800; padding: 10px 12px; }}
+    @media (max-width: 1000px) {{
+      .header-inner {{ align-items: flex-start; flex-direction: column; margin-left: 12px; margin-right: 12px; }}
+      .topbar {{ align-items: start; flex-direction: column; }}
+      main {{ margin-left: 12px; margin-right: 12px; }}
+      .nav {{ flex-wrap: nowrap; justify-content: flex-start; max-width: 100%; overflow-x: auto; padding-bottom: 2px; }}
+      .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .section-head {{ flex-direction: column; }}
+      table {{ min-width: 860px; }}
+      .section {{ padding: 12px; }}
+    }}
+    @media (max-width: 640px) {{ .metrics {{ grid-template-columns: 1fr; }} }}
+    @media (prefers-color-scheme: dark) {{
+      :root {{ --body-bg: #121619; --card-bg: #1c2328; --panel-bg: rgba(28, 35, 40, 0.62); --border: #334047; --text: #f3f4f6; --muted: #a7b0b5; }}
+      th {{ background: #1d292f; color: #e5edf0; }}
+      th, td {{ border-color: #2d383f; }}
+      a {{ color: #7dd3fc; }}
+      .badge.neutral {{ background: rgba(20, 184, 166, 0.14); color: #7dd3fc; }}
+      .warning {{ background: rgba(154, 52, 18, 0.18); border-color: rgba(251, 146, 60, 0.38); color: #fdba74; }}
+    }}
+  </style>
+</head>
+<body>
+  <header class="site-header">
+    <div class="header-inner">
+      <div class="topbar">
+        <div>
+          <h1>Syscoin Miners</h1>
+          <p class="subtitle">Experimental view. Not proof of ownership or intent.</p>
+        </div>
+        <nav class="nav" aria-label="Dashboard pages">
+          <a href="/">Wallet Flows</a>
+          <a href="/sentrynode">Sentry Nodes</a>
+          <a href="/top-wallets">Top Wallets</a>
+          <a href="/emissions">Network Emissions</a>
+          <a class="active" href="/miners">Miners</a>
+        </nav>
+      </div>
+    </div>
+  </header>
+  <main>
+    {error_html}
+    <div class="metrics">
+      {metric("Network SYS Hashrate", str(status.get("network_hashrate") or "-"), "Estimated from recent Syscoin commitments")}
+      {metric("Known Mining Pools", f"{int(totals.get('pools') or 0):,}", str(top_pool.get("name") or "-") + " leads")}
+      {metric("Blocks Indexed", f"{int(totals.get('window_blocks') or 0):,}", f"Current {status.get('window_size') or '-'} block window")}
+      {metric("Unknown Blocks", f"{int(totals.get('unknown_blocks') or 0):,}", str(status.get("unknown_blocks_text") or "0%"))}
+      {metric("Known Payout Groups", f"{int(totals.get('known_address_groups') or 0):,}", f"{int(totals.get('known_addresses') or 0):,} addresses · Updated {updated}" if updated else f"{int(totals.get('known_addresses') or 0):,} addresses")}
+    </div>
+
+    <section class="section">
+      <div class="section-head">
+        <div>
+          <h2>Mining Pool Share</h2>
+          <p class="section-note">Estimated from Syscoin blocks/commitments attributed to each Bitcoin mining pool. Not proof of dedicated hashrate.</p>
+        </div>
+        <div class="meta">Source: status.syscoin.org</div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th class="rank">Rank</th><th>Pool</th><th class="amount">Blocks Won</th><th>Share %</th><th class="amount">Estimated Hashrate</th><th class="amount">Miner Rewards Earned</th><th>Known Payout Addresses</th><th>Last Block Mined</th></tr></thead>
+          <tbody>{pool_rows_html}</tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <div>
+          <h2>Known Miner Payout Groups</h2>
+          <p class="section-note">Known payout groups by pool. ViaBTC rotates payout addresses, so those addresses are grouped together for the page instead of shown as separate wallets.</p>
+        </div>
+      </div>
+      <div class="table-controls" data-pager="miner-addresses"><label>Rows<select><option>20</option><option>50</option><option>100</option></select></label><button data-first>First</button><button data-prev>Prev</button><span class="page-info"></span><button data-next>Next</button><button data-last>Last</button></div>
+      <div class="table-wrap">
+        <table id="miner-addresses">
+          <thead><tr><th>Pool</th><th>Address / Group</th><th>Blocks Paid</th><th class="amount">Total Miner Rewards</th><th class="amount">Current Balance</th><th>First Seen</th><th>Last Seen</th></tr></thead>
+          <tbody>{address_rows_html}</tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <div>
+          <h2>Recent Attributed Blocks</h2>
+          <p class="section-note">Recent blocks sampled from known pools in the status API. Commitment miner and AuxPoW miner can differ.</p>
+        </div>
+      </div>
+      <div class="table-controls" data-pager="recent-miner-blocks"><label>Rows<select><option>20</option><option>50</option><option>100</option></select></label><button data-first>First</button><button data-prev>Prev</button><span class="page-info"></span><button data-next>Next</button><button data-last>Last</button></div>
+      <div class="table-wrap">
+        <table id="recent-miner-blocks">
+          <thead><tr><th>Block</th><th>Time</th><th>Commitment Miner</th><th>AuxPoW Miner</th><th>BTC Depth</th><th>Txs</th></tr></thead>
+          <tbody>{block_rows_html}</tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+  <script>
+    function setupPager(id) {{
+      const controls = document.querySelector(`[data-pager="${{id}}"]`);
+      const table = document.getElementById(id);
+      if (!controls || !table) return;
+      const rows = Array.from(table.querySelectorAll("tbody tr"));
+      if (!rows.length || rows[0].querySelector(".empty")) return;
+      const select = controls.querySelector("select");
+      const info = controls.querySelector(".page-info");
+      const first = controls.querySelector("[data-first]");
+      const prev = controls.querySelector("[data-prev]");
+      const next = controls.querySelector("[data-next]");
+      const last = controls.querySelector("[data-last]");
+      let page = 0;
+      function render() {{
+        const size = parseInt(select.value, 10) || 20;
+        const pages = Math.max(1, Math.ceil(rows.length / size));
+        page = Math.min(page, pages - 1);
+        rows.forEach((row, index) => {{ row.style.display = index >= page * size && index < (page + 1) * size ? "" : "none"; }});
+        info.textContent = `${{page * size + 1}}-${{Math.min(rows.length, (page + 1) * size)}} of ${{rows.length}}`;
+        first.disabled = prev.disabled = page === 0;
+        next.disabled = last.disabled = page >= pages - 1;
+      }}
+      select.addEventListener("change", () => {{ page = 0; render(); }});
+      first.addEventListener("click", () => {{ page = 0; render(); }});
+      prev.addEventListener("click", () => {{ page = Math.max(0, page - 1); render(); }});
+      next.addEventListener("click", () => {{ page += 1; render(); }});
+      last.addEventListener("click", () => {{ const size = parseInt(select.value, 10) || 20; page = Math.max(0, Math.ceil(rows.length / size) - 1); render(); }});
+      render();
+    }}
+    setupPager("miner-addresses");
+    setupPager("recent-miner-blocks");
+  </script>
+</body>
+</html>"""
+
+
 def dashboard_html(
     store: Store,
     since_time: int | None = None,
@@ -5186,11 +5805,12 @@ def dashboard_html(
     body {{ background: #f7f5f0; color: #1c2227; }}
     header {{ background: #142026; color: #f8fafc; padding: 24px 0 22px; width: 100%; }}
     .header-inner, main {{ margin-left: var(--page-gutter); margin-right: var(--page-gutter); width: auto; }}
-    .topbar {{ display: flex; align-items: end; justify-content: space-between; gap: 16px; }}
+    .topbar {{ align-items: end; display: flex; gap: 16px; justify-content: space-between; width: 100%; }}
+    .topbar > div {{ min-width: 0; }}
     h1 {{ font-size: 1.8rem; margin: 0 0 8px; letter-spacing: 0; }}
-    .subtitle {{ color: #c9d5d8; font-size: 0.98rem; line-height: 1.45; }}
-    .nav {{ display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }}
-    .nav a {{ border: 1px solid rgba(248, 250, 252, 0.28); border-radius: 999px; color: #dbe6e9; font-size: 0.84rem; padding: 7px 11px; }}
+    .subtitle {{ color: #c9d5d8; font-size: 0.98rem; line-height: 1.45; max-width: 980px; }}
+    .nav {{ align-items: center; display: flex; flex: 0 0 auto; flex-wrap: nowrap; gap: 8px; justify-content: flex-end; max-width: 100%; overflow-x: auto; padding-bottom: 2px; }}
+    .nav a {{ border: 1px solid rgba(248, 250, 252, 0.28); border-radius: 999px; color: #dbe6e9; font-size: 0.84rem; line-height: 1; padding: 9px 12px; white-space: nowrap; }}
     .nav a.active {{ background: #f8fafc; color: #142026; }}
     main {{ display: grid; gap: 22px; margin-top: 22px; margin-bottom: 22px; padding: 0; }}
     main > * {{ min-width: 0; }}
@@ -5291,13 +5911,14 @@ def dashboard_html(
       <div class="topbar">
         <div>
           <h1>Syscoin Hot Wallet Tracker</h1>
-          <div class="subtitle">Experimental view. Useful for spotting patterns, not proof of ownership or intent.</div>
+          <div class="subtitle">Experimental view. Not proof of ownership or intent.</div>
         </div>
         <nav class="nav" aria-label="Dashboard pages">
           <a class="active" href="/">Wallet Flows</a>
           <a href="/sentrynode">Sentry Nodes</a>
           <a href="/top-wallets">Top Wallets</a>
           <a href="/emissions">Network Emissions</a>
+          <a href="/miners">Miners</a>
         </nav>
       </div>
     </div>
@@ -5813,11 +6434,12 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     body {{ background: #f7f5f0; color: #1c2227; }}
     header {{ background: #142026; color: #f8fafc; padding: 24px 0 22px; width: 100%; }}
     .header-inner, main {{ margin-left: var(--page-gutter); margin-right: var(--page-gutter); width: auto; }}
-    .topbar {{ display: flex; align-items: end; justify-content: space-between; gap: 16px; }}
+    .topbar {{ align-items: end; display: flex; gap: 16px; justify-content: space-between; width: 100%; }}
+    .topbar > div {{ min-width: 0; }}
     h1 {{ font-size: 1.8rem; margin: 0 0 8px; letter-spacing: 0; }}
-    .subtitle {{ color: #c9d5d8; font-size: 0.98rem; line-height: 1.45; }}
-    .nav {{ display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }}
-    .nav a {{ border: 1px solid rgba(248, 250, 252, 0.28); border-radius: 999px; color: #dbe6e9; font-size: 0.84rem; padding: 7px 11px; text-decoration: none; }}
+    .subtitle {{ color: #c9d5d8; font-size: 0.98rem; line-height: 1.45; max-width: 980px; }}
+    .nav {{ align-items: center; display: flex; flex: 0 0 auto; flex-wrap: nowrap; gap: 8px; justify-content: flex-end; max-width: 100%; overflow-x: auto; padding-bottom: 2px; }}
+    .nav a {{ border: 1px solid rgba(248, 250, 252, 0.28); border-radius: 999px; color: #dbe6e9; font-size: 0.84rem; line-height: 1; padding: 9px 12px; text-decoration: none; white-space: nowrap; }}
     .nav a.active {{ background: #f8fafc; color: #142026; }}
     main {{ display: grid; gap: 22px; margin-top: 22px; margin-bottom: 22px; padding: 0; }}
     main > * {{ min-width: 0; }}
@@ -5923,13 +6545,14 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
       <div class="topbar">
         <div>
           <h1>Syscoin Top Wallets</h1>
-          <div class="subtitle">Experimental on-chain forensics from our own RPC index. Labels and wallet clusters are estimates, not proof of ownership.</div>
+          <div class="subtitle">Experimental view. Not proof of ownership or intent.</div>
         </div>
         <nav class="nav" aria-label="Dashboard pages">
           <a href="/">Wallet Flows</a>
           <a href="/sentrynode">Sentry Nodes</a>
           <a class="active" href="/top-wallets">Top Wallets</a>
           <a href="/emissions">Network Emissions</a>
+          <a href="/miners">Miners</a>
         </nav>
       </div>
     </div>
@@ -6411,11 +7034,12 @@ def masternodes_html(
     body {{ background: #f7f5f0; color: #1c2227; }}
     header {{ background: #142026; color: #f8fafc; padding: 24px 0 22px; width: 100%; }}
     .header-inner, main {{ margin-left: var(--page-gutter); margin-right: var(--page-gutter); width: auto; }}
-    .topbar {{ display: flex; align-items: end; justify-content: space-between; gap: 16px; }}
+    .topbar {{ align-items: end; display: flex; gap: 16px; justify-content: space-between; width: 100%; }}
+    .topbar > div {{ min-width: 0; }}
     h1 {{ font-size: 1.8rem; margin: 0 0 8px; letter-spacing: 0; }}
-    .subtitle {{ color: #c9d5d8; font-size: 0.98rem; line-height: 1.45; }}
-    .nav {{ display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }}
-    .nav a {{ border: 1px solid rgba(248, 250, 252, 0.28); border-radius: 999px; color: #dbe6e9; font-size: 0.84rem; padding: 7px 11px; text-decoration: none; }}
+    .subtitle {{ color: #c9d5d8; font-size: 0.98rem; line-height: 1.45; max-width: 980px; }}
+    .nav {{ align-items: center; display: flex; flex: 0 0 auto; flex-wrap: nowrap; gap: 8px; justify-content: flex-end; max-width: 100%; overflow-x: auto; padding-bottom: 2px; }}
+    .nav a {{ border: 1px solid rgba(248, 250, 252, 0.28); border-radius: 999px; color: #dbe6e9; font-size: 0.84rem; line-height: 1; padding: 9px 12px; text-decoration: none; white-space: nowrap; }}
     .nav a.active {{ background: #f8fafc; color: #142026; }}
     main {{ display: grid; gap: 22px; margin-top: 22px; margin-bottom: 22px; padding: 0; }}
     main > * {{ min-width: 0; }}
@@ -6530,13 +7154,14 @@ def masternodes_html(
       <div class="topbar">
         <div>
           <h1>Syscoin Sentry Node Tracker</h1>
-          <div class="subtitle">Experimental view. Useful for spotting patterns, not proof of ownership or intent.</div>
+          <div class="subtitle">Experimental view. Not proof of ownership or intent.</div>
         </div>
         <nav class="nav" aria-label="Dashboard pages">
           <a href="/">Wallet Flows</a>
           <a class="active" href="/sentrynode">Sentry Nodes</a>
           <a href="/top-wallets">Top Wallets</a>
           <a href="/emissions">Network Emissions</a>
+          <a href="/miners">Miners</a>
         </nav>
       </div>
     </div>
@@ -6986,6 +7611,9 @@ def serve(
                 elif parsed.path == EMISSIONS_JSON_PATH:
                     html_body = json.dumps(emissions_snapshot(store), indent=2)
                     content_type = "application/json; charset=utf-8"
+                elif parsed.path == MINERS_JSON_PATH:
+                    html_body = json.dumps(miners_snapshot(), indent=2)
+                    content_type = "application/json; charset=utf-8"
                 elif parsed.path in ("/", "/index.html"):
                     html_body = dashboard_html(
                         store,
@@ -7004,6 +7632,8 @@ def serve(
                     html_body = top_wallets_html(store, refresh_seconds=refresh_seconds)
                 elif parsed.path in EMISSIONS_PATHS:
                     html_body = emissions_html(store, refresh_seconds=refresh_seconds)
+                elif parsed.path in MINERS_PATHS:
+                    html_body = miners_html(refresh_seconds=refresh_seconds)
                 else:
                     self.send_error(404)
                     return
