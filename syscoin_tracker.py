@@ -4788,74 +4788,74 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
 {refresh_meta_tag(refresh_seconds)}  <title>Syscoin Network Emissions</title>
   <style>
-    :root {{ color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --page-gutter: clamp(24px, 3.8vw, 80px); }}
+    :root {{ color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --page-gutter: clamp(24px, 3.8vw, 80px); --bg: #050b12; --panel: #0b1622; --panel-soft: #102235; --line: #21384f; --ink: #e9f6ff; --muted: #8da8bb; --teal: #00d4ff; --accent: #2f8cff; --gold: #f5b84b; --shadow: 0 18px 48px rgba(0, 10, 24, 0.34); }}
     *, *::before, *::after {{ box-sizing: border-box; }}
     html, body {{ margin: 0; max-width: 100%; overflow-x: hidden; }}
-    body {{ background: #f7f5f0; color: #1c2227; }}
-    header {{ background: #142026; color: #f8fafc; padding: 24px 0 22px; width: 100%; }}
+    body {{ background: radial-gradient(circle at top left, rgba(47, 140, 255, 0.22), transparent 32rem), radial-gradient(circle at top right, rgba(0, 212, 255, 0.13), transparent 30rem), linear-gradient(180deg, #07111d 0%, var(--bg) 48%, #03070c 100%); color: var(--ink); }}
+    header {{ background: linear-gradient(135deg, #06111d 0%, #082944 54%, #0b5476 100%); border-bottom: 1px solid rgba(85, 190, 255, 0.28); box-shadow: var(--shadow); color: #e9f6ff; padding: 24px 0 22px; width: 100%; }}
     .header-inner, main {{ margin-left: var(--page-gutter); margin-right: var(--page-gutter); width: auto; }}
     .topbar {{ align-items: end; display: flex; gap: 16px; justify-content: space-between; width: 100%; }}
     .topbar > div {{ min-width: 0; }}
-    h1 {{ font-size: 1.8rem; margin: 0 0 8px; letter-spacing: 0; }}
-    .subtitle {{ color: #c9d5d8; font-size: 0.98rem; line-height: 1.45; max-width: 980px; }}
+    h1 {{ font-size: 1.8rem; line-height: 1.05; margin: 0 0 8px; letter-spacing: 0; }}
+    .subtitle {{ color: rgba(246, 251, 253, 0.84); font-size: 0.98rem; line-height: 1.35; max-width: 980px; }}
     .nav {{ align-items: center; display: flex; flex: 0 0 auto; flex-wrap: nowrap; gap: 8px; justify-content: flex-end; max-width: 100%; overflow-x: auto; padding-bottom: 2px; }}
-    .nav a {{ border: 1px solid rgba(248, 250, 252, 0.28); border-radius: 999px; color: #dbe6e9; font-size: 0.84rem; line-height: 1; padding: 9px 12px; text-decoration: none; white-space: nowrap; }}
-    .nav a.active {{ background: #f8fafc; color: #142026; }}
+    .nav a {{ background: rgba(85, 190, 255, 0.10); border: 1px solid rgba(112, 205, 255, 0.28); border-radius: 999px; color: #e9f6ff; font-size: 0.84rem; font-weight: 850; line-height: 1; padding: 9px 12px; text-decoration: none; white-space: nowrap; }}
+    .nav a.active {{ background: linear-gradient(135deg, var(--accent), var(--teal)); border-color: rgba(0, 212, 255, 0.72); color: #03111d; }}
     main {{ display: grid; gap: 22px; margin-top: 22px; margin-bottom: 22px; padding: 0; }}
     main > * {{ min-width: 0; }}
-    .section-panel {{ background: rgba(255, 255, 255, 0.66); border: 1px solid #d9ded8; border-radius: 8px; min-width: 0; padding: 16px; }}
+    .section-panel {{ background: var(--panel); border: 1px solid rgba(72, 142, 190, 0.34); border-radius: 8px; box-shadow: var(--shadow); min-width: 0; padding: 16px; }}
     .metrics {{ display: grid; grid-template-columns: repeat(6, minmax(130px, 1fr)); gap: 12px; }}
-    .metric {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; padding: 14px 16px; min-width: 0; }}
-    .metric span {{ display: block; color: #687177; font-size: 0.84rem; margin-bottom: 6px; }}
+    .metric {{ background: var(--panel); border: 1px solid rgba(72, 142, 190, 0.34); border-radius: 8px; box-shadow: 0 12px 30px rgba(0, 10, 24, 0.24); padding: 14px 16px; min-width: 0; }}
+    .metric span {{ display: block; color: var(--muted); font-size: 0.84rem; margin-bottom: 6px; }}
     .metric b {{ display: block; font-size: clamp(1.18rem, 1.8vw, 1.55rem); line-height: 1.1; overflow-wrap: anywhere; }}
-    .metric small {{ color: #687177; display: block; font-size: 0.78rem; font-weight: 700; margin-top: 8px; }}
+    .metric small {{ color: var(--muted); display: block; font-size: 0.78rem; font-weight: 700; margin-top: 8px; }}
     .panel-title {{ display: flex; align-items: end; justify-content: space-between; gap: 16px; }}
     .panel-title h2 {{ margin: 0; font-size: 1.25rem; }}
-    .panel-title p {{ margin: 0; color: #687177; font-size: 0.9rem; }}
-    .phase-note {{ color: #687177; font-size: 0.9rem; line-height: 1.45; margin: 8px 0 10px; max-width: 900px; }}
+    .panel-title p {{ margin: 0; color: var(--muted); font-size: 0.9rem; }}
+    .phase-note {{ color: var(--muted); font-size: 0.9rem; line-height: 1.45; margin: 8px 0 10px; max-width: 900px; }}
     .period-summary {{ display: grid; grid-template-columns: repeat(6, minmax(120px, 1fr)); gap: 10px; margin: 12px 0; }}
-    .period-summary article {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; min-width: 0; padding: 12px; }}
-    .period-summary span {{ color: #687177; display: block; font-size: 0.78rem; font-weight: 700; margin-bottom: 5px; }}
+    .period-summary article {{ background: var(--panel); border: 1px solid rgba(72, 142, 190, 0.34); border-radius: 8px; box-shadow: 0 12px 30px rgba(0, 10, 24, 0.24); min-width: 0; padding: 12px; }}
+    .period-summary span {{ color: var(--muted); display: block; font-size: 0.78rem; font-weight: 700; margin-bottom: 5px; }}
     .period-summary b {{ display: block; font-size: 1.05rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-    .emissions-overview {{ border-top: 1px solid #d9ded8; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 12px; }}
+    .emissions-overview {{ border-top: 1px solid var(--line); display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 12px; }}
     .allocation-block {{ min-width: 0; padding: 18px 18px 10px 0; }}
-    .allocation-block + .allocation-block {{ border-left: 1px solid #d9ded8; padding-left: 18px; }}
+    .allocation-block + .allocation-block {{ border-left: 1px solid var(--line); padding-left: 18px; }}
     .allocation-block h3 {{ font-size: 1rem; margin: 0 0 4px; }}
-    .allocation-block p {{ color: #687177; font-size: 0.82rem; line-height: 1.4; margin: 0 0 12px; }}
+    .allocation-block p {{ color: var(--muted); font-size: 0.82rem; line-height: 1.4; margin: 0 0 12px; }}
     .stack-bar {{ background: #edf1ed; border-radius: 999px; display: flex; height: 18px; margin: 10px 0 14px; min-width: 0; overflow: hidden; }}
     .stack-bar span {{ display: block; min-width: 2px; }}
     .allocation-list {{ display: grid; gap: 7px; margin: 0; }}
     .allocation-row {{ align-items: center; display: grid; gap: 8px; grid-template-columns: 10px minmax(80px, 1fr) auto auto; min-width: 0; }}
     .allocation-row .swatch {{ border-radius: 999px; height: 10px; width: 10px; }}
     .allocation-row dt, .allocation-row dd {{ margin: 0; }}
-    .allocation-row dt {{ color: #687177; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .allocation-row dt {{ color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
     .allocation-row dd {{ font-weight: 800; white-space: nowrap; }}
-    .allocation-row .pct {{ color: #687177; font-size: 0.8rem; min-width: 48px; text-align: right; }}
+    .allocation-row .pct {{ color: var(--muted); font-size: 0.8rem; min-width: 48px; text-align: right; }}
     .rate-block b {{ display: block; font-size: clamp(1.5rem, 3vw, 2.3rem); line-height: 1.05; margin: 8px 0 14px; }}
     .rate-facts {{ display: grid; gap: 8px; }}
     .rate-facts div {{ display: flex; justify-content: space-between; gap: 12px; }}
-    .rate-facts span {{ color: #687177; }}
+    .rate-facts span {{ color: var(--muted); }}
     .rate-facts strong {{ white-space: nowrap; }}
-    .trend-panel {{ border-top: 1px solid #d9ded8; margin-top: 12px; padding-top: 16px; }}
+    .trend-panel {{ border-top: 1px solid var(--line); margin-top: 12px; padding-top: 16px; }}
     .trend-panel h3 {{ font-size: 1rem; margin: 0 0 4px; }}
-    .trend-panel p {{ color: #687177; font-size: 0.82rem; line-height: 1.4; margin: 0 0 10px; }}
+    .trend-panel p {{ color: var(--muted); font-size: 0.82rem; line-height: 1.4; margin: 0 0 10px; }}
     .chart-canvas-wrap {{ height: 260px; min-width: 0; position: relative; }}
     .filter-strip {{ align-items: end; display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; margin: 12px 0; }}
-    .filter-strip label {{ color: #687177; display: grid; font-size: 0.78rem; font-weight: 700; gap: 4px; min-width: 130px; }}
-    .filter-strip select {{ background: #fff; border: 1px solid #cfd7d1; border-radius: 6px; color: #1c2227; font: inherit; min-height: 36px; padding: 7px 9px; }}
+    .filter-strip label {{ color: var(--muted); display: grid; font-size: 0.78rem; font-weight: 700; gap: 4px; min-width: 130px; }}
+    .filter-strip select {{ background: var(--panel-soft); border: 1px solid var(--line); border-radius: 6px; color: var(--ink); font: inherit; min-height: 36px; padding: 7px 9px; }}
     .table-controls {{ align-items: end; display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; margin: 10px 0; }}
     .pagination-controls {{ align-items: end; display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; margin-left: auto; }}
-    .page-size-control {{ color: #687177; display: grid; font-size: 0.78rem; font-weight: 700; gap: 4px; width: 110px; }}
-    .table-controls label {{ color: #687177; display: grid; font-size: 0.78rem; font-weight: 700; gap: 4px; }}
-    .table-controls select {{ background: #fff; border: 1px solid #cfd7d1; border-radius: 6px; color: #1c2227; font: inherit; min-height: 36px; padding: 7px 9px; }}
-    .pager {{ align-items: center; color: #687177; display: flex; gap: 8px; justify-content: flex-end; }}
-    .pager button {{ background: #fff; border: 1px solid #cfd7d1; border-radius: 6px; color: #1c2227; cursor: pointer; font: inherit; min-height: 36px; padding: 7px 10px; }}
+    .page-size-control {{ color: var(--muted); display: grid; font-size: 0.78rem; font-weight: 700; gap: 4px; width: 110px; }}
+    .table-controls label {{ color: var(--muted); display: grid; font-size: 0.78rem; font-weight: 700; gap: 4px; }}
+    .table-controls select {{ background: var(--panel-soft); border: 1px solid var(--line); border-radius: 6px; color: var(--ink); font: inherit; min-height: 36px; padding: 7px 9px; }}
+    .pager {{ align-items: center; color: var(--muted); display: flex; gap: 8px; justify-content: flex-end; }}
+    .pager button {{ background: var(--panel-soft); border: 1px solid var(--line); border-radius: 6px; color: var(--ink); cursor: pointer; font: inherit; min-height: 36px; padding: 7px 10px; }}
     .pager button:disabled {{ cursor: default; opacity: 0.45; }}
-    .page-status {{ color: #687177; font-size: 0.86rem; min-width: 96px; text-align: center; }}
-    .table-wrap {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; max-width: 100%; min-width: 0; overflow-x: auto; width: 100%; }}
-    table {{ width: 100%; min-width: 1120px; border-collapse: separate; border-spacing: 0; background: #fff; table-layout: fixed; }}
-    th, td {{ padding: 8px 10px; border-bottom: 1px solid #e4e8e2; text-align: left; font-size: 0.88rem; overflow: hidden; text-overflow: ellipsis; }}
-    th {{ background: #eaf0ec; position: sticky; top: 0; z-index: 10; box-shadow: 0 1px 0 #d9ded8; }}
+    .page-status {{ color: var(--muted); font-size: 0.86rem; min-width: 96px; text-align: center; }}
+    .table-wrap {{ background: var(--panel); border: 1px solid rgba(72, 142, 190, 0.34); border-radius: 8px; max-width: 100%; min-width: 0; overflow-x: auto; width: 100%; }}
+    table {{ width: 100%; min-width: 1120px; border-collapse: separate; border-spacing: 0; background: var(--panel); table-layout: fixed; }}
+    th, td {{ padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; font-size: 0.88rem; overflow: hidden; text-overflow: ellipsis; }}
+    th {{ background: var(--panel-soft); color: var(--muted); font-size: 0.72rem; font-weight: 900; letter-spacing: 0.08em; position: sticky; text-transform: uppercase; top: 0; z-index: 10; box-shadow: 0 1px 0 var(--line); }}
     th:nth-child(n+2), td:nth-child(n+2) {{ text-align: right; white-space: nowrap; }}
     .latest-blocks th:nth-child(2), .latest-blocks td:nth-child(2),
     .latest-blocks th:nth-child(7), .latest-blocks td:nth-child(7),
@@ -4863,13 +4863,13 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
     .latest-nevm-blocks th:nth-child(8), .latest-nevm-blocks td:nth-child(8) {{ text-align: left; }}
     .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }}
     .amount {{ font-weight: 800; white-space: nowrap; }}
-    .empty {{ color: #687177; padding: 18px 14px; text-align: center; }}
-    a {{ color: #086788; text-decoration: none; }}
+    .empty {{ color: var(--muted); padding: 18px 14px; text-align: center; }}
+    a {{ color: #56c9ff; text-decoration: none; }}
     @media(max-width: 1080px) {{
       .metrics {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
       .period-summary {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .emissions-overview {{ grid-template-columns: 1fr; }}
-      .allocation-block {{ border-left: 0 !important; border-top: 1px solid #d9ded8; padding: 16px 0 8px; }}
+      .allocation-block {{ border-left: 0 !important; border-top: 1px solid var(--line); padding: 16px 0 8px; }}
       .pagination-controls {{ align-items: stretch; flex-direction: column; margin-left: 0; width: 100%; }}
       .filter-strip {{ justify-content: flex-start; }}
       .page-size-control {{ width: 100%; }}
@@ -4886,17 +4886,18 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
       .section-panel {{ padding: 12px; }}
     }}
     @media (prefers-color-scheme: dark) {{
-      body {{ background: #121619; color: #f3f4f6; }}
-      .section-panel {{ background: rgba(28, 35, 40, 0.62); border-color: #334047; }}
-      .metric, .period-summary article, .table-wrap, table {{ background: #1c2328; border-color: #334047; }}
-      .filter-strip select, .table-controls select, .pager button {{ background: #1c2328; border-color: #46555e; color: #f3f4f6; }}
-      th {{ background: #263139; }}
-      th, td {{ border-color: #334047; }}
-      a {{ color: #67d7ff; }}
+      :root {{ --bg: #050b12; --panel: #0b1622; --panel-soft: #102235; --line: #21384f; --ink: #e9f6ff; --muted: #8da8bb; --shadow: 0 18px 48px rgba(0, 10, 24, 0.34); }}
+      body {{ background: radial-gradient(circle at top left, rgba(47, 140, 255, 0.22), transparent 32rem), radial-gradient(circle at top right, rgba(0, 212, 255, 0.13), transparent 30rem), linear-gradient(180deg, #07111d 0%, var(--bg) 48%, #03070c 100%); color: var(--ink); }}
+      .section-panel {{ background: var(--panel); border-color: var(--line); }}
+      .metric, .period-summary article, .table-wrap, table {{ background: var(--panel); border-color: var(--line); }}
+      .filter-strip select, .table-controls select, .pager button {{ background: var(--panel); border-color: var(--line); color: var(--ink); }}
+      th {{ background: var(--panel-soft); }}
+      th, td {{ border-color: var(--line); }}
+      a {{ color: #56c9ff; }}
       .subtitle {{ color: #b6c3c7; }}
-      .emissions-overview, .allocation-block + .allocation-block, .trend-panel, .allocation-block {{ border-color: #334047; }}
-      .stack-bar {{ background: #263139; }}
-      .metric span, .metric small, .period-summary span, .allocation-block p, .allocation-row dt, .allocation-row .pct, .rate-facts span, .trend-panel p, .panel-title p, .phase-note, .empty, .filter-strip label, .table-controls label, .page-size-control, .pager, .page-status {{ color: #a7b0b5; }}
+      .emissions-overview, .allocation-block + .allocation-block, .trend-panel, .allocation-block {{ border-color: var(--line); }}
+      .stack-bar {{ background: var(--panel-soft); }}
+      .metric span, .metric small, .period-summary span, .allocation-block p, .allocation-row dt, .allocation-row .pct, .rate-facts span, .trend-panel p, .panel-title p, .phase-note, .empty, .filter-strip label, .table-controls label, .page-size-control, .pager, .page-status {{ color: var(--muted); }}
     }}
   </style>
 </head>
@@ -5389,31 +5390,31 @@ def miners_html(refresh_seconds: int = 60, snapshot: dict[str, Any] | None = Non
   <meta name="viewport" content="width=device-width, initial-scale=1">
 {refresh_meta_tag(refresh_seconds)}  <title>Syscoin Miners</title>
   <style>
-    :root {{ color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --page-gutter: clamp(24px, 3.8vw, 80px); --header-bg: #142026; --body-bg: #f7f5f0; --card-bg: #ffffff; --panel-bg: rgba(255, 255, 255, 0.66); --border: #d9ded8; --text: #1c2227; --muted: #687177; --header-text: #f8fafc; --header-sub: #c9d5d8; }}
+    :root {{ color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --page-gutter: clamp(24px, 3.8vw, 80px); --bg: #050b12; --panel: #0b1622; --panel-soft: #102235; --line: #21384f; --ink: #e9f6ff; --muted: #8da8bb; --teal: #00d4ff; --accent: #2f8cff; --gold: #f5b84b; --shadow: 0 18px 48px rgba(0, 10, 24, 0.34); --body-bg: var(--bg); --card-bg: var(--panel); --panel-bg: var(--panel); --border: var(--line); --text: var(--ink); --header-text: #e9f6ff; --header-sub: #a9c9dc; }}
     *, *::before, *::after {{ box-sizing: border-box; }}
     html, body {{ margin: 0; max-width: 100%; overflow-x: hidden; }}
-    body {{ background: var(--body-bg); color: var(--text); font-size: 16px; line-height: 1.4; }}
-    a {{ color: #086788; font-weight: 800; text-decoration: none; }}
-    .site-header {{ background: var(--header-bg); color: var(--header-text); padding: 24px 0 22px; width: 100%; }}
+    body {{ background: radial-gradient(circle at top left, rgba(47, 140, 255, 0.22), transparent 32rem), radial-gradient(circle at top right, rgba(0, 212, 255, 0.13), transparent 30rem), linear-gradient(180deg, #07111d 0%, var(--bg) 48%, #03070c 100%); color: var(--ink); font-size: 16px; line-height: 1.4; }}
+    a {{ color: #56c9ff; font-weight: 800; text-decoration: none; }}
+    header {{ background: linear-gradient(135deg, #06111d 0%, #082944 54%, #0b5476 100%); border-bottom: 1px solid rgba(85, 190, 255, 0.28); box-shadow: var(--shadow); color: #e9f6ff; padding: 24px 0 22px; width: 100%; }}
     .header-inner, main {{ margin-left: var(--page-gutter); margin-right: var(--page-gutter); width: auto; }}
     .header-inner {{ align-items: end; display: flex; gap: 16px; justify-content: space-between; }}
     .header-inner > div {{ min-width: 0; }}
     .topbar {{ align-items: end; display: flex; gap: 16px; justify-content: space-between; width: 100%; }}
     .topbar > div {{ min-width: 0; }}
-    h1 {{ font-size: 1.8rem; margin: 0 0 8px; }}
-    .subtitle {{ color: var(--header-sub); font-size: 0.98rem; line-height: 1.45; margin: 0; max-width: 980px; }}
+    h1 {{ font-size: 1.8rem; line-height: 1.05; margin: 0 0 8px; }}
+    .subtitle {{ color: rgba(246, 251, 253, 0.84); font-size: 0.98rem; line-height: 1.35; margin: 0; max-width: 980px; }}
     .nav {{ align-items: center; display: flex; flex: 0 0 auto; flex-wrap: nowrap; gap: 8px; justify-content: flex-end; max-width: 100%; overflow-x: auto; padding-bottom: 2px; }}
-    .nav a {{ border: 1px solid rgba(248, 250, 252, 0.28); border-radius: 999px; color: #dbe6e9; font-size: 0.84rem; line-height: 1; padding: 9px 12px; white-space: nowrap; }}
-    .nav a.active {{ background: #f8fafc; color: #142026; }}
+    .nav a {{ background: rgba(85, 190, 255, 0.10); border: 1px solid rgba(112, 205, 255, 0.28); border-radius: 999px; color: #e9f6ff; font-size: 0.84rem; font-weight: 850; line-height: 1; padding: 9px 12px; white-space: nowrap; }}
+    .nav a.active {{ background: linear-gradient(135deg, var(--accent), var(--teal)); border-color: rgba(0, 212, 255, 0.72); color: #03111d; }}
     main {{ display: grid; gap: 22px; margin-bottom: 22px; margin-top: 22px; padding: 0; }}
     main > * {{ min-width: 0; }}
     .metrics {{ display: grid; gap: 12px; grid-template-columns: repeat(5, minmax(120px, 1fr)); }}
-    .metric, .section {{ border: 1px solid var(--border); border-radius: 8px; min-width: 0; }}
-    .metric {{ background: var(--card-bg); padding: 14px 16px; }}
+    .metric, .section-panel {{ border: 1px solid var(--border); border-radius: 8px; min-width: 0; }}
+    .metric {{ background: var(--panel); box-shadow: 0 12px 30px rgba(0, 10, 24, 0.24); padding: 14px 16px; }}
     .metric span {{ color: var(--muted); display: block; font-size: 0.84rem; font-weight: 700; margin-bottom: 6px; }}
     .metric b {{ display: block; font-size: clamp(1.2rem, 1.8vw, 1.55rem); line-height: 1.1; overflow-wrap: anywhere; }}
     .metric small {{ color: var(--muted); display: block; font-size: 0.78rem; font-weight: 700; margin-top: 8px; }}
-    .section {{ background: var(--panel-bg); padding: 16px; }}
+    .section-panel {{ background: var(--panel); box-shadow: var(--shadow); padding: 16px; }}
     .section-head {{ align-items: flex-start; display: flex; gap: 18px; justify-content: space-between; margin-bottom: 14px; }}
     h2 {{ font-size: 1.25rem; line-height: 1.1; margin: 0; }}
     .section-note {{ color: var(--muted); font-size: 0.9rem; font-weight: 700; margin: 6px 0 0; max-width: 860px; }}
@@ -5423,10 +5424,10 @@ def miners_html(refresh_seconds: int = 60, snapshot: dict[str, Any] | None = Non
     select, button {{ background: var(--card-bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font: inherit; font-weight: 800; min-height: 38px; padding: 7px 12px; }}
     button:disabled {{ color: #9aa3aa; opacity: 0.7; }}
     .page-info {{ align-self: center; color: var(--muted); font-weight: 800; min-width: 84px; text-align: center; }}
-    .table-wrap {{ background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; overflow-x: auto; }}
-    table {{ background: var(--card-bg); border-collapse: separate; border-spacing: 0; table-layout: fixed; width: 100%; }}
-    th, td {{ border-bottom: 1px solid #e4e8e2; font-size: 0.88rem; overflow: hidden; padding: 8px 10px; text-align: left; text-overflow: ellipsis; vertical-align: middle; }}
-    th {{ background: #eaf0ec; color: #20272d; font-size: 0.88rem; position: sticky; top: 0; z-index: 10; }}
+    .table-wrap {{ background: var(--panel); border: 1px solid rgba(72, 142, 190, 0.34); border-radius: 8px; overflow-x: auto; }}
+    table {{ background: var(--panel); border-collapse: separate; border-spacing: 0; table-layout: fixed; width: 100%; }}
+    th, td {{ border-bottom: 1px solid var(--line); font-size: 0.88rem; overflow: hidden; padding: 8px 10px; text-align: left; text-overflow: ellipsis; vertical-align: middle; }}
+    th {{ background: var(--panel-soft); color: var(--muted); font-size: 0.72rem; font-weight: 900; letter-spacing: 0.08em; position: sticky; text-transform: uppercase; top: 0; z-index: 10; }}
     .rank, .amount {{ text-align: right; }}
     .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }}
     .badge {{ border-radius: 999px; display: inline-block; font-size: 0.82rem; font-weight: 900; padding: 4px 8px; }}
@@ -5441,11 +5442,11 @@ def miners_html(refresh_seconds: int = 60, snapshot: dict[str, Any] | None = Non
       .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .section-head {{ flex-direction: column; }}
       table {{ min-width: 860px; }}
-      .section {{ padding: 12px; }}
+      .section-panel {{ padding: 12px; }}
     }}
     @media (max-width: 640px) {{ .metrics {{ grid-template-columns: 1fr; }} }}
     @media (prefers-color-scheme: dark) {{
-      :root {{ --body-bg: #121619; --card-bg: #1c2328; --panel-bg: rgba(28, 35, 40, 0.62); --border: #334047; --text: #f3f4f6; --muted: #a7b0b5; }}
+      :root {{ --bg: #050b12; --panel: #0b1622; --panel-soft: #102235; --line: #21384f; --ink: #e9f6ff; --muted: #8da8bb; --shadow: 0 18px 48px rgba(0, 10, 24, 0.34); --body-bg: var(--bg); --card-bg: var(--panel); --panel-bg: var(--panel); --border: var(--line); --text: var(--ink); }}
       th {{ background: #1d292f; color: #e5edf0; }}
       th, td {{ border-color: #2d383f; }}
       a {{ color: #7dd3fc; }}
@@ -5455,7 +5456,7 @@ def miners_html(refresh_seconds: int = 60, snapshot: dict[str, Any] | None = Non
   </style>
 </head>
 <body>
-  <header class="site-header">
+  <header>
     <div class="header-inner">
       <div class="topbar">
         <div>
@@ -5474,15 +5475,15 @@ def miners_html(refresh_seconds: int = 60, snapshot: dict[str, Any] | None = Non
   </header>
   <main>
     {error_html}
-    <div class="metrics">
+    <section class="section-panel metrics">
       {metric("Network SYS Hashrate", str(status.get("network_hashrate") or "-"), "Estimated from recent Syscoin commitments")}
       {metric("Known Mining Pools", f"{int(totals.get('pools') or 0):,}", str(top_pool.get("name") or "-") + " leads")}
       {metric("Blocks Indexed", f"{int(totals.get('window_blocks') or 0):,}", f"Current {status.get('window_size') or '-'} block window")}
       {metric("Unknown Blocks", f"{int(totals.get('unknown_blocks') or 0):,}", str(status.get("unknown_blocks_text") or "0%"))}
       {metric("Known Payout Groups", f"{int(totals.get('known_address_groups') or 0):,}", f"{int(totals.get('known_addresses') or 0):,} addresses · Updated {updated}" if updated else f"{int(totals.get('known_addresses') or 0):,} addresses")}
-    </div>
+    </section>
 
-    <section class="section">
+    <section class="section-panel">
       <div class="section-head">
         <div>
           <h2>Mining Pool Share</h2>
@@ -5498,7 +5499,7 @@ def miners_html(refresh_seconds: int = 60, snapshot: dict[str, Any] | None = Non
       </div>
     </section>
 
-    <section class="section">
+    <section class="section-panel">
       <div class="section-head">
         <div>
           <h2>Known Miner Payout Groups</h2>
@@ -5514,7 +5515,7 @@ def miners_html(refresh_seconds: int = 60, snapshot: dict[str, Any] | None = Non
       </div>
     </section>
 
-    <section class="section">
+    <section class="section-panel">
       <div class="section-head">
         <div>
           <h2>Recent Attributed Blocks</h2>
@@ -5799,61 +5800,61 @@ def dashboard_html(
   <meta name="viewport" content="width=device-width, initial-scale=1">
 {refresh_meta_tag(refresh_seconds)}  <title>Syscoin Hot Wallet Tracker</title>
   <style>
-    :root {{ color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --page-gutter: clamp(24px, 3.8vw, 80px); }}
+    :root {{ color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --page-gutter: clamp(24px, 3.8vw, 80px); --bg: #050b12; --panel: #0b1622; --panel-soft: #102235; --line: #21384f; --ink: #e9f6ff; --muted: #8da8bb; --teal: #00d4ff; --accent: #2f8cff; --gold: #f5b84b; --shadow: 0 18px 48px rgba(0, 10, 24, 0.34); }}
     *, *::before, *::after {{ box-sizing: border-box; }}
     html, body {{ margin: 0; max-width: 100%; overflow-x: hidden; }}
-    body {{ background: #f7f5f0; color: #1c2227; }}
-    header {{ background: #142026; color: #f8fafc; padding: 24px 0 22px; width: 100%; }}
+    body {{ background: radial-gradient(circle at top left, rgba(47, 140, 255, 0.22), transparent 32rem), radial-gradient(circle at top right, rgba(0, 212, 255, 0.13), transparent 30rem), linear-gradient(180deg, #07111d 0%, var(--bg) 48%, #03070c 100%); color: var(--ink); }}
+    header {{ background: linear-gradient(135deg, #06111d 0%, #082944 54%, #0b5476 100%); border-bottom: 1px solid rgba(85, 190, 255, 0.28); box-shadow: var(--shadow); color: #e9f6ff; padding: 24px 0 22px; width: 100%; }}
     .header-inner, main {{ margin-left: var(--page-gutter); margin-right: var(--page-gutter); width: auto; }}
     .topbar {{ align-items: end; display: flex; gap: 16px; justify-content: space-between; width: 100%; }}
     .topbar > div {{ min-width: 0; }}
-    h1 {{ font-size: 1.8rem; margin: 0 0 8px; letter-spacing: 0; }}
-    .subtitle {{ color: #c9d5d8; font-size: 0.98rem; line-height: 1.45; max-width: 980px; }}
+    h1 {{ font-size: 1.8rem; line-height: 1.05; margin: 0 0 8px; letter-spacing: 0; }}
+    .subtitle {{ color: rgba(246, 251, 253, 0.84); font-size: 0.98rem; line-height: 1.35; max-width: 980px; }}
     .nav {{ align-items: center; display: flex; flex: 0 0 auto; flex-wrap: nowrap; gap: 8px; justify-content: flex-end; max-width: 100%; overflow-x: auto; padding-bottom: 2px; }}
-    .nav a {{ border: 1px solid rgba(248, 250, 252, 0.28); border-radius: 999px; color: #dbe6e9; font-size: 0.84rem; line-height: 1; padding: 9px 12px; white-space: nowrap; }}
-    .nav a.active {{ background: #f8fafc; color: #142026; }}
+    .nav a {{ background: rgba(85, 190, 255, 0.10); border: 1px solid rgba(112, 205, 255, 0.28); border-radius: 999px; color: #e9f6ff; font-size: 0.84rem; font-weight: 850; line-height: 1; padding: 9px 12px; white-space: nowrap; }}
+    .nav a.active {{ background: linear-gradient(135deg, var(--accent), var(--teal)); border-color: rgba(0, 212, 255, 0.72); color: #03111d; }}
     main {{ display: grid; gap: 22px; margin-top: 22px; margin-bottom: 22px; padding: 0; }}
     main > * {{ min-width: 0; }}
-    .section-panel {{ background: rgba(255, 255, 255, 0.66); border: 1px solid #d9ded8; border-radius: 8px; min-width: 0; padding: 16px; }}
+    .section-panel {{ background: var(--panel); border: 1px solid rgba(72, 142, 190, 0.34); border-radius: 8px; box-shadow: var(--shadow); min-width: 0; padding: 16px; }}
     .metrics {{ display: grid; grid-template-columns: repeat(5, minmax(150px, 1fr)); gap: 12px; }}
-    .metric {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; padding: 14px 16px; min-width: 0; }}
-    .metric span {{ display: block; color: #687177; font-size: 0.84rem; margin-bottom: 6px; }}
+    .metric {{ background: var(--panel); border: 1px solid rgba(72, 142, 190, 0.34); border-radius: 8px; box-shadow: 0 12px 30px rgba(0, 10, 24, 0.24); padding: 14px 16px; min-width: 0; }}
+    .metric span {{ display: block; color: var(--muted); font-size: 0.84rem; margin-bottom: 6px; }}
     .metric b {{ display: block; font-size: clamp(1.25rem, 2vw, 1.65rem); line-height: 1.1; overflow-wrap: anywhere; }}
     .metric .metric-address {{ display: block; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 0.72rem; margin-top: 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
     .panel-title {{ display: flex; align-items: end; justify-content: space-between; gap: 16px; }}
     .panel-title h2 {{ margin: 0; font-size: 1.25rem; }}
-    .panel-title p {{ margin: 0; color: #687177; font-size: 0.9rem; }}
+    .panel-title p {{ margin: 0; color: var(--muted); font-size: 0.9rem; }}
     .table-controls {{ align-items: end; display: flex; justify-content: flex-end; margin: 10px 0; }}
     .pagination-controls {{ align-items: end; display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; margin-left: auto; }}
-    .page-size-control {{ color: #687177; display: grid; font-size: 0.78rem; font-weight: 700; gap: 4px; width: 110px; }}
-    .page-size-control select {{ background: #fff; border: 1px solid #cfd7d1; border-radius: 6px; color: #1c2227; font: inherit; min-height: 36px; padding: 7px 9px; }}
-    .pager {{ align-items: center; color: #687177; display: flex; gap: 8px; justify-content: flex-end; }}
-    .pager button {{ background: #fff; border: 1px solid #cfd7d1; border-radius: 6px; color: #1c2227; cursor: pointer; font: inherit; min-height: 36px; padding: 7px 10px; }}
+    .page-size-control {{ color: var(--muted); display: grid; font-size: 0.78rem; font-weight: 700; gap: 4px; width: 110px; }}
+    .page-size-control select {{ background: var(--panel-soft); border: 1px solid var(--line); border-radius: 6px; color: var(--ink); font: inherit; min-height: 36px; padding: 7px 9px; }}
+    .pager {{ align-items: center; color: var(--muted); display: flex; gap: 8px; justify-content: flex-end; }}
+    .pager button {{ background: var(--panel-soft); border: 1px solid var(--line); border-radius: 6px; color: var(--ink); cursor: pointer; font: inherit; min-height: 36px; padding: 7px 10px; }}
     .pager button:disabled {{ cursor: default; opacity: 0.45; }}
-    .page-status {{ color: #687177; font-size: 0.86rem; min-width: 96px; text-align: center; }}
+    .page-status {{ color: var(--muted); font-size: 0.86rem; min-width: 96px; text-align: center; }}
     .wallet-list {{ display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }}
-    .wallet-card {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; padding: 12px 12px; min-width: 0; display: grid; gap: 5px; }}
+    .wallet-card {{ background: var(--panel); border: 1px solid rgba(72, 142, 190, 0.34); border-radius: 8px; box-shadow: 0 12px 30px rgba(0, 10, 24, 0.24); padding: 12px 12px; min-width: 0; display: grid; gap: 5px; }}
     .wallet-card strong {{ font-size: 0.95rem; }}
-    .wallet-card span {{ color: #687177; font-size: 0.82rem; }}
+    .wallet-card span {{ color: var(--muted); font-size: 0.82rem; }}
     .wallet-card a {{ display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 0.72rem; }}
-    .wallet-card .wallet-balance, .wallet-card .wallet-flow {{ color: #1c2227; font-size: 0.82rem; }}
+    .wallet-card .wallet-balance, .wallet-card .wallet-flow {{ color: var(--ink); font-size: 0.82rem; }}
     .wallet-card .wallet-balance b, .wallet-card .wallet-flow b {{ font-weight: 800; }}
     .wallet-card .muted {{ color: #7b858a; }}
-    .table-wrap {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; max-width: 100%; min-width: 0; overflow-x: auto; width: 100%; }}
-    table {{ width: 100%; min-width: 1100px; border-collapse: separate; border-spacing: 0; background: #fff; table-layout: fixed; }}
-    th, td {{ padding: 8px 10px; border-bottom: 1px solid #e4e8e2; text-align: left; font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; }}
+    .table-wrap {{ background: var(--panel); border: 1px solid rgba(72, 142, 190, 0.34); border-radius: 8px; max-width: 100%; min-width: 0; overflow-x: auto; width: 100%; }}
+    table {{ width: 100%; min-width: 1100px; border-collapse: separate; border-spacing: 0; background: var(--panel); table-layout: fixed; }}
+    th, td {{ padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; }}
     thead {{ position: sticky; top: 0; z-index: 10; }}
-    th {{ background: #eaf0ec; position: sticky; top: 0; z-index: 11; box-shadow: 0 1px 0 #d9ded8; }}
+    th {{ background: var(--panel-soft); color: var(--muted); font-size: 0.72rem; font-weight: 900; letter-spacing: 0.08em; position: sticky; text-transform: uppercase; top: 0; z-index: 11; box-shadow: 0 1px 0 var(--line); }}
     .sort-button {{ appearance: none; border: 0; background: transparent; color: inherit; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; font: inherit; font-weight: 700; padding: 0; text-align: inherit; white-space: nowrap; }}
-    .sort-button:hover, .sort-button:focus-visible {{ color: #086788; outline: none; }}
-    .sort-icon {{ color: #687177; display: inline-block; font-size: 0.75rem; min-width: 1ch; }}
+    .sort-button:hover, .sort-button:focus-visible {{ color: #56c9ff; outline: none; }}
+    .sort-icon {{ color: var(--muted); display: inline-block; font-size: 0.75rem; min-width: 1ch; }}
     th[aria-sort="ascending"] .sort-icon::before {{ content: "^"; }}
     th[aria-sort="descending"] .sort-icon::before {{ content: "v"; }}
     th[aria-sort="none"] .sort-icon::before {{ content: ""; }}
-    .floating-table-header {{ background: #fff; border: 1px solid #d9ded8; border-top: 0; box-shadow: 0 5px 14px rgba(20, 32, 38, 0.12); display: none; left: 0; position: fixed; top: 0; z-index: 1000; }}
+    .floating-table-header {{ background: var(--panel); border: 1px solid var(--line); border-top: 0; box-shadow: 0 5px 14px rgba(20, 32, 38, 0.12); display: none; left: 0; position: fixed; top: 0; z-index: 1000; }}
     .floating-table-header table {{ border-collapse: separate; border-spacing: 0; table-layout: fixed; width: 100%; }}
     .floating-table-header th {{ position: static; top: auto; }}
-    th:nth-child(1), td:nth-child(1) {{ width: 58px; text-align: right; color: #687177; }}
+    th:nth-child(1), td:nth-child(1) {{ width: 58px; text-align: right; color: var(--muted); }}
     th:nth-child(2), td:nth-child(2) {{ width: 250px; }}
     th:nth-child(3), td:nth-child(3) {{ width: 112px; }}
     th:nth-child(4), td:nth-child(4) {{ width: 82px; }}
@@ -5871,8 +5872,8 @@ def dashboard_html(
     th:nth-child(9), td:nth-child(9) {{ white-space: nowrap; }}
     .address {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; white-space: nowrap; }}
     .amount {{ font-weight: 700; }}
-    .subtle {{ color: #687177; font-weight: 600; }}
-    a {{ color: #086788; text-decoration: none; }}
+    .subtle {{ color: var(--muted); font-weight: 600; }}
+    a {{ color: #56c9ff; text-decoration: none; }}
     code {{ overflow-wrap: anywhere; }}
     @media(max-width: 820px) {{
       .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
@@ -5892,16 +5893,17 @@ def dashboard_html(
       .metrics, .wallet-list {{ grid-template-columns: 1fr; }}
     }}
     @media (prefers-color-scheme: dark) {{
-      body {{ background: #121619; color: #f3f4f6; }}
-      .section-panel {{ background: rgba(28, 35, 40, 0.62); border-color: #334047; }}
-      .metric, .wallet-card, .table-wrap, table, .floating-table-header {{ background: #1c2328; border-color: #334047; }}
-      th {{ background: #263139; }}
-      th, td {{ border-color: #334047; }}
-      .page-size-control select, .pager button {{ background: #1c2328; border-color: #46555e; color: #f3f4f6; }}
-      a {{ color: #67d7ff; }}
+      :root {{ --bg: #050b12; --panel: #0b1622; --panel-soft: #102235; --line: #21384f; --ink: #e9f6ff; --muted: #8da8bb; --shadow: 0 18px 48px rgba(0, 10, 24, 0.34); }}
+      body {{ background: radial-gradient(circle at top left, rgba(47, 140, 255, 0.22), transparent 32rem), radial-gradient(circle at top right, rgba(0, 212, 255, 0.13), transparent 30rem), linear-gradient(180deg, #07111d 0%, var(--bg) 48%, #03070c 100%); color: var(--ink); }}
+      .section-panel {{ background: var(--panel); border-color: var(--line); }}
+      .metric, .wallet-card, .table-wrap, table, .floating-table-header {{ background: var(--panel); border-color: var(--line); }}
+      th {{ background: var(--panel-soft); }}
+      th, td {{ border-color: var(--line); }}
+      .page-size-control select, .pager button {{ background: var(--panel); border-color: var(--line); color: var(--ink); }}
+      a {{ color: #56c9ff; }}
       .subtitle {{ color: #b6c3c7; }}
-      .metric span, .wallet-card span, .panel-title p, th:nth-child(1), td:nth-child(1), .subtle, .sort-icon, .page-size-control, .pager, .page-status {{ color: #a7b0b5; }}
-      .sort-button:hover, .sort-button:focus-visible {{ color: #67d7ff; }}
+      .metric span, .wallet-card span, .panel-title p, th:nth-child(1), td:nth-child(1), .subtle, .sort-icon, .page-size-control, .pager, .page-status {{ color: var(--muted); }}
+      .sort-button:hover, .sort-button:focus-visible {{ color: #56c9ff; }}
     }}
   </style>
 </head>
@@ -6428,49 +6430,49 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
   <meta name="viewport" content="width=device-width, initial-scale=1">
 {refresh_meta_tag(refresh_seconds)}  <title>Syscoin Top Wallets</title>
   <style>
-    :root {{ color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --page-gutter: clamp(24px, 3.8vw, 80px); }}
+    :root {{ color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --page-gutter: clamp(24px, 3.8vw, 80px); --bg: #050b12; --panel: #0b1622; --panel-soft: #102235; --line: #21384f; --ink: #e9f6ff; --muted: #8da8bb; --teal: #00d4ff; --accent: #2f8cff; --gold: #f5b84b; --shadow: 0 18px 48px rgba(0, 10, 24, 0.34); }}
     *, *::before, *::after {{ box-sizing: border-box; }}
     html, body {{ margin: 0; max-width: 100%; overflow-x: hidden; }}
-    body {{ background: #f7f5f0; color: #1c2227; }}
-    header {{ background: #142026; color: #f8fafc; padding: 24px 0 22px; width: 100%; }}
+    body {{ background: radial-gradient(circle at top left, rgba(47, 140, 255, 0.22), transparent 32rem), radial-gradient(circle at top right, rgba(0, 212, 255, 0.13), transparent 30rem), linear-gradient(180deg, #07111d 0%, var(--bg) 48%, #03070c 100%); color: var(--ink); }}
+    header {{ background: linear-gradient(135deg, #06111d 0%, #082944 54%, #0b5476 100%); border-bottom: 1px solid rgba(85, 190, 255, 0.28); box-shadow: var(--shadow); color: #e9f6ff; padding: 24px 0 22px; width: 100%; }}
     .header-inner, main {{ margin-left: var(--page-gutter); margin-right: var(--page-gutter); width: auto; }}
     .topbar {{ align-items: end; display: flex; gap: 16px; justify-content: space-between; width: 100%; }}
     .topbar > div {{ min-width: 0; }}
-    h1 {{ font-size: 1.8rem; margin: 0 0 8px; letter-spacing: 0; }}
-    .subtitle {{ color: #c9d5d8; font-size: 0.98rem; line-height: 1.45; max-width: 980px; }}
+    h1 {{ font-size: 1.8rem; line-height: 1.05; margin: 0 0 8px; letter-spacing: 0; }}
+    .subtitle {{ color: rgba(246, 251, 253, 0.84); font-size: 0.98rem; line-height: 1.35; max-width: 980px; }}
     .nav {{ align-items: center; display: flex; flex: 0 0 auto; flex-wrap: nowrap; gap: 8px; justify-content: flex-end; max-width: 100%; overflow-x: auto; padding-bottom: 2px; }}
-    .nav a {{ border: 1px solid rgba(248, 250, 252, 0.28); border-radius: 999px; color: #dbe6e9; font-size: 0.84rem; line-height: 1; padding: 9px 12px; text-decoration: none; white-space: nowrap; }}
-    .nav a.active {{ background: #f8fafc; color: #142026; }}
+    .nav a {{ background: rgba(85, 190, 255, 0.10); border: 1px solid rgba(112, 205, 255, 0.28); border-radius: 999px; color: #e9f6ff; font-size: 0.84rem; font-weight: 850; line-height: 1; padding: 9px 12px; text-decoration: none; white-space: nowrap; }}
+    .nav a.active {{ background: linear-gradient(135deg, var(--accent), var(--teal)); border-color: rgba(0, 212, 255, 0.72); color: #03111d; }}
     main {{ display: grid; gap: 22px; margin-top: 22px; margin-bottom: 22px; padding: 0; }}
     main > * {{ min-width: 0; }}
-    .section-panel {{ background: rgba(255, 255, 255, 0.66); border: 1px solid #d9ded8; border-radius: 8px; min-width: 0; padding: 16px; }}
+    .section-panel {{ background: var(--panel); border: 1px solid rgba(72, 142, 190, 0.34); border-radius: 8px; box-shadow: var(--shadow); min-width: 0; padding: 16px; }}
     .metrics {{ display: grid; grid-template-columns: repeat(5, minmax(140px, 1fr)); gap: 12px; }}
-    .metric {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; padding: 14px 16px; min-width: 0; }}
-    .metric span {{ display: block; color: #687177; font-size: 0.84rem; margin-bottom: 6px; }}
+    .metric {{ background: var(--panel); border: 1px solid rgba(72, 142, 190, 0.34); border-radius: 8px; box-shadow: 0 12px 30px rgba(0, 10, 24, 0.24); padding: 14px 16px; min-width: 0; }}
+    .metric span {{ display: block; color: var(--muted); font-size: 0.84rem; margin-bottom: 6px; }}
     .metric b {{ display: block; font-size: clamp(1.2rem, 1.8vw, 1.55rem); line-height: 1.1; overflow-wrap: anywhere; }}
     .panel-title {{ display: flex; align-items: end; justify-content: space-between; gap: 16px; }}
     .panel-title h2 {{ margin: 0; font-size: 1.25rem; }}
-    .panel-title p {{ margin: 0; color: #687177; font-size: 0.9rem; }}
-    .phase-note {{ color: #687177; font-size: 0.9rem; line-height: 1.45; margin: 8px 0 10px; max-width: 880px; }}
+    .panel-title p {{ margin: 0; color: var(--muted); font-size: 0.9rem; }}
+    .phase-note {{ color: var(--muted); font-size: 0.9rem; line-height: 1.45; margin: 8px 0 10px; max-width: 880px; }}
     .table-controls {{ align-items: end; display: flex; justify-content: flex-end; margin: 10px 0; }}
     .pagination-controls {{ align-items: end; display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; margin-left: auto; }}
-    .page-size-control {{ color: #687177; display: grid; font-size: 0.78rem; font-weight: 700; gap: 4px; width: 110px; }}
-    .page-size-control select {{ background: #fff; border: 1px solid #cfd7d1; border-radius: 6px; color: #1c2227; font: inherit; min-height: 36px; padding: 7px 9px; }}
-    .pager {{ align-items: center; color: #687177; display: flex; gap: 8px; justify-content: flex-end; }}
-    .pager button {{ background: #fff; border: 1px solid #cfd7d1; border-radius: 6px; color: #1c2227; cursor: pointer; font: inherit; min-height: 36px; padding: 7px 10px; }}
+    .page-size-control {{ color: var(--muted); display: grid; font-size: 0.78rem; font-weight: 700; gap: 4px; width: 110px; }}
+    .page-size-control select {{ background: var(--panel-soft); border: 1px solid var(--line); border-radius: 6px; color: var(--ink); font: inherit; min-height: 36px; padding: 7px 9px; }}
+    .pager {{ align-items: center; color: var(--muted); display: flex; gap: 8px; justify-content: flex-end; }}
+    .pager button {{ background: var(--panel-soft); border: 1px solid var(--line); border-radius: 6px; color: var(--ink); cursor: pointer; font: inherit; min-height: 36px; padding: 7px 10px; }}
     .pager button:disabled {{ cursor: default; opacity: 0.45; }}
-    .page-status {{ color: #687177; font-size: 0.86rem; min-width: 96px; text-align: center; }}
-    .table-wrap {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; max-width: 100%; min-width: 0; overflow-x: auto; width: 100%; }}
-    table {{ width: 100%; min-width: 980px; border-collapse: separate; border-spacing: 0; background: #fff; table-layout: fixed; }}
-    th, td {{ padding: 8px 10px; border-bottom: 1px solid #e4e8e2; text-align: left; font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; }}
-    th {{ background: #eaf0ec; position: sticky; top: 0; z-index: 10; box-shadow: 0 1px 0 #d9ded8; }}
+    .page-status {{ color: var(--muted); font-size: 0.86rem; min-width: 96px; text-align: center; }}
+    .table-wrap {{ background: var(--panel); border: 1px solid rgba(72, 142, 190, 0.34); border-radius: 8px; max-width: 100%; min-width: 0; overflow-x: auto; width: 100%; }}
+    table {{ width: 100%; min-width: 980px; border-collapse: separate; border-spacing: 0; background: var(--panel); table-layout: fixed; }}
+    th, td {{ padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; }}
+    th {{ background: var(--panel-soft); color: var(--muted); font-size: 0.72rem; font-weight: 900; letter-spacing: 0.08em; position: sticky; text-transform: uppercase; top: 0; z-index: 10; box-shadow: 0 1px 0 var(--line); }}
     .sort-button {{ appearance: none; border: 0; background: transparent; color: inherit; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; font: inherit; font-weight: 700; padding: 0; text-align: inherit; white-space: nowrap; }}
-    .sort-button:hover, .sort-button:focus-visible {{ color: #086788; outline: none; }}
-    .sort-icon {{ color: #687177; display: inline-block; font-size: 0.75rem; min-width: 1ch; }}
+    .sort-button:hover, .sort-button:focus-visible {{ color: #56c9ff; outline: none; }}
+    .sort-icon {{ color: var(--muted); display: inline-block; font-size: 0.75rem; min-width: 1ch; }}
     th[aria-sort="ascending"] .sort-icon::before {{ content: "^"; }}
     th[aria-sort="descending"] .sort-icon::before {{ content: "v"; }}
     th[aria-sort="none"] .sort-icon::before {{ content: ""; }}
-    th:nth-child(1), td:nth-child(1) {{ width: 70px; text-align: right; color: #687177; }}
+    th:nth-child(1), td:nth-child(1) {{ width: 70px; text-align: right; color: var(--muted); }}
     th:nth-child(2), td:nth-child(2) {{ width: 220px; }}
     th:nth-child(3), td:nth-child(3) {{ width: 130px; }}
     th:nth-child(4), td:nth-child(4) {{ width: 220px; }}
@@ -6480,7 +6482,7 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     .wallet-name {{ font-weight: 800; }}
     .address-list {{ white-space: nowrap; }}
     .address-list a {{ font-weight: 700; }}
-    .address-list span {{ color: #687177; display: block; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 0.78rem; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; }}
+    .address-list span {{ color: var(--muted); display: block; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 0.78rem; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; }}
     .label-pill {{ border-radius: 999px; display: inline-flex; font-size: 0.78rem; font-weight: 800; line-height: 1; padding: 5px 9px; white-space: nowrap; }}
     .label-pill.exchange {{ background: #e8f3ff; color: #14589c; }}
     .label-pill.operator {{ background: #fff4dd; color: #805313; }}
@@ -6500,8 +6502,8 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     .operator-table th:nth-child(6), .operator-table td:nth-child(6) {{ width: 145px; text-align: right; }}
     .operator-table th:nth-child(7), .operator-table td:nth-child(7) {{ width: 210px; }}
     .operator-table th:nth-child(8), .operator-table td:nth-child(8) {{ width: 160px; }}
-    .empty {{ color: #687177; padding: 18px 14px; text-align: center; }}
-    a {{ color: #086788; text-decoration: none; }}
+    .empty {{ color: var(--muted); padding: 18px 14px; text-align: center; }}
+    a {{ color: #56c9ff; text-decoration: none; }}
     @media(max-width: 820px) {{
       .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .panel-title {{ align-items: start; flex-direction: column; }}
@@ -6518,15 +6520,16 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
       .metrics {{ grid-template-columns: 1fr; }}
     }}
     @media (prefers-color-scheme: dark) {{
-      body {{ background: #121619; color: #f3f4f6; }}
-      .section-panel {{ background: rgba(28, 35, 40, 0.62); border-color: #334047; }}
-      .metric, .table-wrap, table {{ background: #1c2328; border-color: #334047; }}
-      .page-size-control select, .pager button {{ background: #1c2328; border-color: #46555e; color: #f3f4f6; }}
-      th {{ background: #263139; }}
-      th, td {{ border-color: #334047; }}
-      a {{ color: #67d7ff; }}
+      :root {{ --bg: #050b12; --panel: #0b1622; --panel-soft: #102235; --line: #21384f; --ink: #e9f6ff; --muted: #8da8bb; --shadow: 0 18px 48px rgba(0, 10, 24, 0.34); }}
+      body {{ background: radial-gradient(circle at top left, rgba(47, 140, 255, 0.22), transparent 32rem), radial-gradient(circle at top right, rgba(0, 212, 255, 0.13), transparent 30rem), linear-gradient(180deg, #07111d 0%, var(--bg) 48%, #03070c 100%); color: var(--ink); }}
+      .section-panel {{ background: var(--panel); border-color: var(--line); }}
+      .metric, .table-wrap, table {{ background: var(--panel); border-color: var(--line); }}
+      .page-size-control select, .pager button {{ background: var(--panel); border-color: var(--line); color: var(--ink); }}
+      th {{ background: var(--panel-soft); }}
+      th, td {{ border-color: var(--line); }}
+      a {{ color: #56c9ff; }}
       .subtitle {{ color: #b6c3c7; }}
-      .metric span, .panel-title p, .phase-note, th:nth-child(1), td:nth-child(1), .address-list span, .sort-icon, .empty, .page-size-control, .pager, .page-status {{ color: #a7b0b5; }}
+      .metric span, .panel-title p, .phase-note, th:nth-child(1), td:nth-child(1), .address-list span, .sort-icon, .empty, .page-size-control, .pager, .page-status {{ color: var(--muted); }}
       .label-pill.exchange {{ background: #173754; color: #9ed2ff; }}
       .label-pill.operator {{ background: #443111; color: #ffd98a; }}
       .label-pill.private {{ background: #352451; color: #d6bcff; }}
@@ -6535,7 +6538,7 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
       .label-pill.operator-label.large {{ background: #173754; color: #9ed2ff; }}
       .label-pill.operator-label.operator {{ background: #443111; color: #ffd98a; }}
       .label-pill.operator-label.solo {{ background: #332652; color: #d8c7ff; }}
-      .sort-button:hover, .sort-button:focus-visible {{ color: #67d7ff; }}
+      .sort-button:hover, .sort-button:focus-visible {{ color: #56c9ff; }}
     }}
   </style>
 </head>
@@ -7028,30 +7031,30 @@ def masternodes_html(
   <meta name="viewport" content="width=device-width, initial-scale=1">
 {refresh_meta_tag(refresh_seconds)}  <title>Syscoin Sentry Node Tracker</title>
   <style>
-    :root {{ color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --page-gutter: clamp(24px, 3.8vw, 80px); }}
+    :root {{ color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --page-gutter: clamp(24px, 3.8vw, 80px); --bg: #050b12; --panel: #0b1622; --panel-soft: #102235; --line: #21384f; --ink: #e9f6ff; --muted: #8da8bb; --teal: #00d4ff; --accent: #2f8cff; --gold: #f5b84b; --shadow: 0 18px 48px rgba(0, 10, 24, 0.34); }}
     *, *::before, *::after {{ box-sizing: border-box; }}
     html, body {{ margin: 0; max-width: 100%; overflow-x: hidden; }}
-    body {{ background: #f7f5f0; color: #1c2227; }}
-    header {{ background: #142026; color: #f8fafc; padding: 24px 0 22px; width: 100%; }}
+    body {{ background: radial-gradient(circle at top left, rgba(47, 140, 255, 0.22), transparent 32rem), radial-gradient(circle at top right, rgba(0, 212, 255, 0.13), transparent 30rem), linear-gradient(180deg, #07111d 0%, var(--bg) 48%, #03070c 100%); color: var(--ink); }}
+    header {{ background: linear-gradient(135deg, #06111d 0%, #082944 54%, #0b5476 100%); border-bottom: 1px solid rgba(85, 190, 255, 0.28); box-shadow: var(--shadow); color: #e9f6ff; padding: 24px 0 22px; width: 100%; }}
     .header-inner, main {{ margin-left: var(--page-gutter); margin-right: var(--page-gutter); width: auto; }}
     .topbar {{ align-items: end; display: flex; gap: 16px; justify-content: space-between; width: 100%; }}
     .topbar > div {{ min-width: 0; }}
-    h1 {{ font-size: 1.8rem; margin: 0 0 8px; letter-spacing: 0; }}
-    .subtitle {{ color: #c9d5d8; font-size: 0.98rem; line-height: 1.45; max-width: 980px; }}
+    h1 {{ font-size: 1.8rem; line-height: 1.05; margin: 0 0 8px; letter-spacing: 0; }}
+    .subtitle {{ color: rgba(246, 251, 253, 0.84); font-size: 0.98rem; line-height: 1.35; max-width: 980px; }}
     .nav {{ align-items: center; display: flex; flex: 0 0 auto; flex-wrap: nowrap; gap: 8px; justify-content: flex-end; max-width: 100%; overflow-x: auto; padding-bottom: 2px; }}
-    .nav a {{ border: 1px solid rgba(248, 250, 252, 0.28); border-radius: 999px; color: #dbe6e9; font-size: 0.84rem; line-height: 1; padding: 9px 12px; text-decoration: none; white-space: nowrap; }}
-    .nav a.active {{ background: #f8fafc; color: #142026; }}
+    .nav a {{ background: rgba(85, 190, 255, 0.10); border: 1px solid rgba(112, 205, 255, 0.28); border-radius: 999px; color: #e9f6ff; font-size: 0.84rem; font-weight: 850; line-height: 1; padding: 9px 12px; text-decoration: none; white-space: nowrap; }}
+    .nav a.active {{ background: linear-gradient(135deg, var(--accent), var(--teal)); border-color: rgba(0, 212, 255, 0.72); color: #03111d; }}
     main {{ display: grid; gap: 22px; margin-top: 22px; margin-bottom: 22px; padding: 0; }}
     main > * {{ min-width: 0; }}
-    .section-panel {{ background: rgba(255, 255, 255, 0.66); border: 1px solid #d9ded8; border-radius: 8px; min-width: 0; padding: 16px; }}
+    .section-panel {{ background: var(--panel); border: 1px solid rgba(72, 142, 190, 0.34); border-radius: 8px; box-shadow: var(--shadow); min-width: 0; padding: 16px; }}
     .metrics {{ display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 12px; }}
-    .metric {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; padding: 14px 16px; min-width: 0; }}
-    .metric span {{ display: block; color: #687177; font-size: 0.84rem; margin-bottom: 6px; }}
+    .metric {{ background: var(--panel); border: 1px solid rgba(72, 142, 190, 0.34); border-radius: 8px; box-shadow: 0 12px 30px rgba(0, 10, 24, 0.24); padding: 14px 16px; min-width: 0; }}
+    .metric span {{ display: block; color: var(--muted); font-size: 0.84rem; margin-bottom: 6px; }}
     .metric b {{ display: block; font-size: clamp(1.25rem, 2vw, 1.65rem); line-height: 1.1; overflow-wrap: anywhere; }}
-    .metric small {{ color: #687177; display: block; font-size: 0.78rem; font-weight: 700; margin-top: 8px; }}
-    .metric small strong {{ color: #1c2227; font-weight: 800; }}
+    .metric small {{ color: var(--muted); display: block; font-size: 0.78rem; font-weight: 700; margin-top: 8px; }}
+    .metric small strong {{ color: var(--ink); font-weight: 800; }}
     .chart-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }}
-    .chart-card {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; display: grid; gap: 12px; min-width: 0; padding: 18px; }}
+    .chart-card {{ background: var(--panel); border: 1px solid rgba(72, 142, 190, 0.34); border-radius: 8px; box-shadow: 0 12px 30px rgba(0, 10, 24, 0.24); display: grid; gap: 12px; min-width: 0; padding: 18px; }}
     .chart-card h2 {{ font-size: 1rem; margin: 0; }}
     .chart-body {{ align-items: center; display: grid; gap: 20px; grid-template-columns: minmax(220px, 280px) minmax(0, 1fr); min-width: 0; }}
     .chart-canvas-wrap {{ align-items: center; display: flex; height: 280px; justify-content: center; min-width: 0; overflow: visible; }}
@@ -7059,30 +7062,30 @@ def masternodes_html(
     .chart-legend {{ display: grid; flex: 1 1 auto; gap: 8px; list-style: none; margin: 0; min-width: 0; padding: 0; }}
     .chart-legend li {{ align-items: center; display: grid; gap: 8px; grid-template-columns: 12px minmax(80px, 1fr) auto auto; }}
     .legend-swatch {{ border-radius: 999px; display: inline-block; height: 12px; width: 12px; }}
-    .chart-legend span, .chart-legend em {{ color: #687177; font-size: 0.84rem; font-style: normal; }}
+    .chart-legend span, .chart-legend em {{ color: var(--muted); font-size: 0.84rem; font-style: normal; }}
     .chart-legend strong {{ font-size: 0.92rem; }}
     .panel-title {{ display: flex; align-items: end; justify-content: space-between; gap: 16px; }}
     .panel-title h2 {{ margin: 0; font-size: 1.25rem; }}
-    .panel-title p {{ margin: 0; color: #687177; font-size: 0.9rem; }}
+    .panel-title p {{ margin: 0; color: var(--muted); font-size: 0.9rem; }}
     .table-controls {{ align-items: end; display: flex; flex-wrap: wrap; gap: 10px; justify-content: space-between; margin: 10px 0; }}
-    .table-controls label {{ color: #687177; display: grid; font-size: 0.78rem; font-weight: 700; gap: 4px; }}
-    .table-controls input, .table-controls select {{ background: #fff; border: 1px solid #cfd7d1; border-radius: 6px; color: #1c2227; font: inherit; min-height: 36px; padding: 7px 9px; }}
+    .table-controls label {{ color: var(--muted); display: grid; font-size: 0.78rem; font-weight: 700; gap: 4px; }}
+    .table-controls input, .table-controls select {{ background: var(--panel-soft); border: 1px solid var(--line); border-radius: 6px; color: var(--ink); font: inherit; min-height: 36px; padding: 7px 9px; }}
     .search-control {{ flex: 1 1 300px; max-width: 520px; }}
     .page-size-control {{ width: 110px; }}
     .pagination-controls {{ align-items: end; display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; margin-left: auto; }}
-    .pager {{ align-items: center; color: #687177; display: flex; gap: 8px; }}
-    .pager button {{ background: #fff; border: 1px solid #cfd7d1; border-radius: 6px; color: #1c2227; cursor: pointer; font: inherit; min-height: 36px; padding: 7px 10px; }}
+    .pager {{ align-items: center; color: var(--muted); display: flex; gap: 8px; }}
+    .pager button {{ background: var(--panel-soft); border: 1px solid var(--line); border-radius: 6px; color: var(--ink); cursor: pointer; font: inherit; min-height: 36px; padding: 7px 10px; }}
     .pager button:disabled {{ cursor: default; opacity: 0.45; }}
-    .page-status {{ color: #687177; font-size: 0.86rem; min-width: 96px; text-align: center; }}
-    .table-wrap {{ background: #fff; border: 1px solid #d9ded8; border-radius: 8px; max-width: 100%; min-width: 0; overflow-x: auto; width: 100%; }}
-    table {{ width: 100%; min-width: 920px; border-collapse: separate; border-spacing: 0; background: #fff; table-layout: fixed; }}
+    .page-status {{ color: var(--muted); font-size: 0.86rem; min-width: 96px; text-align: center; }}
+    .table-wrap {{ background: var(--panel); border: 1px solid rgba(72, 142, 190, 0.34); border-radius: 8px; max-width: 100%; min-width: 0; overflow-x: auto; width: 100%; }}
+    table {{ width: 100%; min-width: 920px; border-collapse: separate; border-spacing: 0; background: var(--panel); table-layout: fixed; }}
     .mn-current {{ min-width: 935px; }}
     .mn-changes {{ min-width: 930px; }}
-    th, td {{ padding: 8px 10px; border-bottom: 1px solid #e4e8e2; text-align: left; font-size: 0.88rem; overflow: hidden; text-overflow: ellipsis; }}
-    th {{ background: #eaf0ec; position: sticky; top: 0; z-index: 10; box-shadow: 0 1px 0 #d9ded8; }}
+    th, td {{ padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; font-size: 0.88rem; overflow: hidden; text-overflow: ellipsis; }}
+    th {{ background: var(--panel-soft); color: var(--muted); font-size: 0.72rem; font-weight: 900; letter-spacing: 0.08em; position: sticky; text-transform: uppercase; top: 0; z-index: 10; box-shadow: 0 1px 0 var(--line); }}
     .sort-button {{ appearance: none; border: 0; background: transparent; color: inherit; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; font: inherit; font-weight: 700; padding: 0; text-align: inherit; white-space: nowrap; }}
-    .sort-button:hover, .sort-button:focus-visible {{ color: #086788; outline: none; }}
-    .sort-icon {{ color: #687177; display: inline-block; font-size: 0.75rem; min-width: 1ch; }}
+    .sort-button:hover, .sort-button:focus-visible {{ color: #56c9ff; outline: none; }}
+    .sort-icon {{ color: var(--muted); display: inline-block; font-size: 0.75rem; min-width: 1ch; }}
     th[aria-sort="ascending"] .sort-icon::before {{ content: "^"; }}
     th[aria-sort="descending"] .sort-icon::before {{ content: "v"; }}
     th[aria-sort="none"] .sort-icon::before {{ content: ""; }}
@@ -7100,7 +7103,7 @@ def masternodes_html(
     .mn-changes th:nth-child(6), .mn-changes td:nth-child(6) {{ width: 130px; }}
     .mn-changes th:nth-child(7), .mn-changes td:nth-child(7) {{ width: 115px; }}
     .address {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; white-space: nowrap; }}
-    .empty {{ color: #687177; padding: 18px 14px; text-align: center; }}
+    .empty {{ color: var(--muted); padding: 18px 14px; text-align: center; }}
     .status {{ border-radius: 999px; display: inline-flex; font-size: 0.78rem; font-weight: 700; padding: 4px 8px; white-space: nowrap; }}
     .status.active {{ background: #e7f2ff; color: #095c9f; }}
     .status.down {{ background: #fff0df; color: #8a4c00; }}
@@ -7108,8 +7111,8 @@ def masternodes_html(
     .seniority.base {{ background: #edf1ed; color: #405045; }}
     .seniority.level-1 {{ background: #e7f2ff; color: #095c9f; }}
     .seniority.level-2 {{ background: #e8f6ed; color: #1f6d3a; }}
-    .seniority.unknown {{ background: #f2f3f3; color: #687177; }}
-    a {{ color: #086788; text-decoration: none; }}
+    .seniority.unknown {{ background: #f2f3f3; color: var(--muted); }}
+    a {{ color: #56c9ff; text-decoration: none; }}
     @media(max-width: 920px) {{
       .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .chart-grid {{ grid-template-columns: 1fr; }}
@@ -7127,24 +7130,25 @@ def masternodes_html(
       .section-panel {{ padding: 12px; }}
     }}
     @media (prefers-color-scheme: dark) {{
-      body {{ background: #121619; color: #f3f4f6; }}
-      .section-panel {{ background: rgba(28, 35, 40, 0.62); border-color: #334047; }}
-      .metric, .table-wrap, table {{ background: #1c2328; border-color: #334047; }}
-      .chart-card {{ background: #1c2328; border-color: #334047; }}
-      .table-controls input, .table-controls select, .pager button {{ background: #1c2328; border-color: #46555e; color: #f3f4f6; }}
-      th {{ background: #263139; }}
-      th, td {{ border-color: #334047; }}
-      a {{ color: #67d7ff; }}
+      :root {{ --bg: #050b12; --panel: #0b1622; --panel-soft: #102235; --line: #21384f; --ink: #e9f6ff; --muted: #8da8bb; --shadow: 0 18px 48px rgba(0, 10, 24, 0.34); }}
+      body {{ background: radial-gradient(circle at top left, rgba(47, 140, 255, 0.22), transparent 32rem), radial-gradient(circle at top right, rgba(0, 212, 255, 0.13), transparent 30rem), linear-gradient(180deg, #07111d 0%, var(--bg) 48%, #03070c 100%); color: var(--ink); }}
+      .section-panel {{ background: var(--panel); border-color: var(--line); }}
+      .metric, .table-wrap, table {{ background: var(--panel); border-color: var(--line); }}
+      .chart-card {{ background: var(--panel); border-color: var(--line); }}
+      .table-controls input, .table-controls select, .pager button {{ background: var(--panel); border-color: var(--line); color: var(--ink); }}
+      th {{ background: var(--panel-soft); }}
+      th, td {{ border-color: var(--line); }}
+      a {{ color: #56c9ff; }}
       .subtitle {{ color: #b6c3c7; }}
-      .metric span, .metric small, .panel-title p, .sort-icon, .empty, .table-controls label, .pager, .page-status, .chart-legend span, .chart-legend em {{ color: #a7b0b5; }}
-      .metric small strong {{ color: #f3f4f6; }}
-      .sort-button:hover, .sort-button:focus-visible {{ color: #67d7ff; }}
+      .metric span, .metric small, .panel-title p, .sort-icon, .empty, .table-controls label, .pager, .page-status, .chart-legend span, .chart-legend em {{ color: var(--muted); }}
+      .metric small strong {{ color: var(--ink); }}
+      .sort-button:hover, .sort-button:focus-visible {{ color: #56c9ff; }}
       .status.active {{ background: #15304a; color: #b9dcff; }}
       .status.down {{ background: #442d13; color: #ffd9a8; }}
       .seniority.base {{ background: #273234; color: #d7e1dd; }}
       .seniority.level-1 {{ background: #15304a; color: #b9dcff; }}
       .seniority.level-2 {{ background: #173823; color: #b7efc7; }}
-      .seniority.unknown {{ background: #2d3337; color: #a7b0b5; }}
+      .seniority.unknown {{ background: #2d3337; color: var(--muted); }}
     }}
   </style>
 </head>
