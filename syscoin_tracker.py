@@ -77,7 +77,7 @@ MINERS_JSON = "miners.json"
 MINERS_HTML = "miners.html"
 MINERS_JSON_PATH = f"/{MINERS_JSON}"
 DEFAULT_STATUS_API_URL = "https://status-api.syscoin.org"
-RECENT_MINER_BLOCK_POOL_IDS = {"f2pool", "viabtc", "binancepool", "antpool"}
+RECENT_MINER_BLOCK_COUNT = 50
 CHART_ASSET_ROUTE = "/assets/chart.umd.js"
 CHART_ASSET_PATH = Path("static/assets/chart.umd.js")
 NETWORK_MASTERNODE_HEADERS = [
@@ -3588,7 +3588,7 @@ def miners_snapshot(
     *,
     status_base_url: str | None = None,
     address_path: Path = DEFAULT_MINER_ADDRESSES_PATH,
-    recent_per_pool: int = 4,
+    recent_block_count: int = RECENT_MINER_BLOCK_COUNT,
 ) -> dict[str, Any]:
     status_base = (status_base_url or os.getenv("SYS_STATUS_API_URL") or DEFAULT_STATUS_API_URL).rstrip("/")
     status_client = BlockbookClient(status_base, timeout=5, retries=1)
@@ -3597,12 +3597,18 @@ def miners_snapshot(
 
     status_payload: dict[str, Any] = {}
     mining_payload: dict[str, Any] = {"miners": []}
+    recent_blocks_payload: dict[str, Any] = {"blocks": []}
     status_error = ""
+    recent_blocks_error = ""
     try:
         status_payload = status_client.get_json("/status")
         mining_payload = status_client.get_json("/mining")
     except Exception as exc:
         status_error = str(exc)
+    try:
+        recent_blocks_payload = status_client.get_json("/utxo/blocks/recent", {"count": recent_block_count})
+    except Exception as exc:
+        recent_blocks_error = str(exc)
 
     miners = mining_payload.get("miners") if isinstance(mining_payload, dict) else []
     if not isinstance(miners, list):
@@ -3621,88 +3627,86 @@ def miners_snapshot(
     tagged_blocks = int(hashrate.get("tagged_blocks") or 0) if isinstance(hashrate, dict) else 0
     unknown_blocks = max(0, window_blocks - tagged_blocks)
 
-    def fetch_pool_blocks(miner: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
-        name = str(miner.get("name") or miner.get("raw_name") or "Unknown")
-        mempool_id = str(miner.get("mempool_id") or "")
-        if not mempool_id:
-            return mempool_id, []
-        try:
-            block_payload = status_client.get_json(
-                f"/mining/{urllib.parse.quote(mempool_id)}/blocks",
-                {"limit": recent_per_pool},
-            )
-        except Exception:
-            return mempool_id, []
-        raw_blocks = block_payload.get("blocks") if isinstance(block_payload, dict) else []
-        if not isinstance(raw_blocks, list):
-            return mempool_id, []
-        pool_blocks: list[dict[str, Any]] = []
-        for block in raw_blocks:
-            if not isinstance(block, dict):
-                continue
-            height = int_or_none(block.get("height"))
-            block_hash = str(block.get("hash") or "")
-            if not height or not block_hash:
-                continue
-            btc_depths = [
-                int(commitment.get("btc_depth"))
-                for commitment in (block.get("syscoin_commitments") or [])
-                if isinstance(commitment, dict) and int_or_none(commitment.get("btc_depth")) is not None
-            ]
-            pool_blocks.append(
-                {
-                    "height": height,
-                    "hash": block_hash,
-                    "time": int_or_none(block.get("time")),
-                    "timestamp": block.get("timestamp") or "",
-                    "syscoin_commitment_miner": block.get("syscoin_commitment_miner") or name,
-                    "auxpow_miner": block.get("auxpow_miner") or "",
-                    "btc_depth": min(btc_depths) if btc_depths else None,
-                    "transactions": int_or_none(block.get("transactions")),
-                    "chainlock_finality": bool(block.get("chainlock_finality")),
-                }
-            )
-        return mempool_id, pool_blocks
+    def pool_key(value: str) -> str:
+        return "".join(ch for ch in value.lower() if ch.isalnum())
 
-    pool_blocks_by_id: dict[str, list[dict[str, Any]]] = {}
-    miner_dicts = [
-        miner
-        for miner in miners
-        if isinstance(miner, dict) and str(miner.get("mempool_id") or "") in RECENT_MINER_BLOCK_POOL_IDS
+    def parse_recent_block(block: dict[str, Any]) -> dict[str, Any] | None:
+        height = int_or_none(block.get("height"))
+        block_hash = str(block.get("hash") or "")
+        if not height or not block_hash:
+            return None
+        commitments = block.get("syscoin_commitments") if isinstance(block.get("syscoin_commitments"), list) else []
+        commitment_miners = []
+        btc_depths = []
+        for commitment in commitments:
+            if not isinstance(commitment, dict):
+                continue
+            miner_name = str(commitment.get("miner") or "")
+            if miner_name and miner_name not in commitment_miners:
+                commitment_miners.append(miner_name)
+            btc_depth = int_or_none(commitment.get("btc_depth"))
+            if btc_depth is not None:
+                btc_depths.append(btc_depth)
+        syscoin_commitment_miner = str(block.get("syscoin_commitment_miner") or "")
+        if not syscoin_commitment_miner and commitment_miners:
+            syscoin_commitment_miner = ", ".join(commitment_miners)
+        return {
+            "height": height,
+            "hash": block_hash,
+            "time": int_or_none(block.get("time")),
+            "timestamp": block.get("timestamp") or "",
+            "syscoin_commitment_miner": syscoin_commitment_miner,
+            "auxpow_miner": block.get("auxpow_miner") or "",
+            "btc_depth": min(btc_depths) if btc_depths else None,
+            "confirmations": int_or_none(block.get("confirmations")),
+            "transactions": int_or_none(block.get("transactions")),
+            "block_time_delta": int_or_none(block.get("block_time_delta")),
+            "chainlock_finality": bool(block.get("chainlock_finality")),
+        }
+
+    raw_recent_blocks = recent_blocks_payload.get("blocks") if isinstance(recent_blocks_payload, dict) else []
+    if not isinstance(raw_recent_blocks, list):
+        raw_recent_blocks = []
+    latest_blocks = [
+        parsed
+        for parsed in (parse_recent_block(block) for block in raw_recent_blocks if isinstance(block, dict))
+        if parsed is not None
     ]
-    if miner_dicts:
-        workers = min(8, len(miner_dicts))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(fetch_pool_blocks, miner) for miner in miner_dicts]
-            for future in concurrent.futures.as_completed(futures):
-                mempool_id, pool_blocks = future.result()
-                pool_blocks_by_id[mempool_id] = pool_blocks
+    latest_blocks.sort(key=lambda row: (int(row.get("time") or 0), int(row.get("height") or 0)), reverse=True)
+    recent_auxpow_by_pool: dict[str, int] = {}
+    for block in latest_blocks:
+        auxpow_miner = str(block.get("auxpow_miner") or "")
+        block_time = int_or_none(block.get("time"))
+        if not auxpow_miner or block_time is None:
+            continue
+        key = pool_key(auxpow_miner)
+        recent_auxpow_by_pool[key] = max(recent_auxpow_by_pool.get(key, 0), block_time)
 
     pool_rows: list[dict[str, Any]] = []
-    recent_blocks: dict[str, dict[str, Any]] = {}
     for miner in miners:
         if not isinstance(miner, dict):
             continue
         name = str(miner.get("name") or miner.get("raw_name") or "Unknown")
         commitments = int(miner.get("syscoin_commitments") or 0)
         blocks = int(miner.get("blocks") or 0)
-        share = (Decimal(commitments) / Decimal(total_commitments)) if total_commitments else Decimal(0)
-        estimated_hashrate = int(Decimal(h_sys) * share) if h_sys else 0
+        block_share = (Decimal(blocks) / Decimal(total_blocks)) if total_blocks else Decimal(0)
+        commitment_share = (Decimal(commitments) / Decimal(total_commitments)) if total_commitments else Decimal(0)
+        estimated_hashrate = int(Decimal(h_sys) * block_share) if h_sys else 0
         mempool_id = str(miner.get("mempool_id") or "")
-        pool_blocks = pool_blocks_by_id.get(mempool_id, [])
-        for block in pool_blocks:
-            recent_blocks[str(block.get("hash") or "")] = block
-
-        last_seen = max((int(block.get("time") or 0) for block in pool_blocks), default=None)
+        latest_keys = [pool_key(name), pool_key(str(miner.get("raw_name") or ""))]
+        last_seen = max((recent_auxpow_by_pool.get(key, 0) for key in latest_keys if key), default=0)
+        last_seen_text = fmt_local_datetime(last_seen) if last_seen else f"Not in latest {len(latest_blocks):,}"
         pool_rows.append(
             {
                 "name": name,
                 "raw_name": miner.get("raw_name") or "",
                 "mempool_id": mempool_id,
                 "blocks": blocks,
-                "blocks_won": commitments,
+                "blocks_won": blocks,
                 "syscoin_commitments": commitments,
-                "commitment_share": float(share),
+                "block_share": float(block_share),
+                "block_share_text": fmt_ratio_percent(blocks, total_blocks),
+                "commitment_share": float(commitment_share),
                 "commitment_share_text": fmt_ratio_percent(commitments, total_commitments),
                 "estimated_hashrate_hs": estimated_hashrate,
                 "estimated_hashrate": fmt_hashrate(estimated_hashrate),
@@ -3710,8 +3714,8 @@ def miners_snapshot(
                 "miner_rewards_sats": None,
                 "known_addresses": addresses_by_pool.get(name, []),
                 "known_address_count": len(addresses_by_pool.get(name, [])),
-                "last_seen_time": last_seen,
-                "last_seen": fmt_local_datetime(last_seen) if last_seen else "-",
+                "last_seen_time": last_seen or None,
+                "last_seen": last_seen_text,
             }
         )
 
@@ -3794,7 +3798,7 @@ def miners_snapshot(
             }
         )
 
-    pool_rows.sort(key=lambda row: (-int(row.get("syscoin_commitments") or 0), str(row.get("name") or "")))
+    pool_rows.sort(key=lambda row: (-int(row.get("blocks") or 0), str(row.get("name") or "")))
     address_rows.sort(key=lambda row: (str(row.get("pool") or ""), -int(row.get("balance_sats") or 0), str(row.get("address") or "")))
     address_groups: list[dict[str, Any]] = []
     rows_by_pool: dict[str, list[dict[str, Any]]] = {}
@@ -3838,11 +3842,17 @@ def miners_snapshot(
             }
         )
     address_groups.sort(key=lambda row: (str(row.get("pool") or ""), -int(row.get("total_received_sats") or 0)))
-    latest_blocks = sorted(recent_blocks.values(), key=lambda row: (int(row.get("time") or 0), int(row.get("height") or 0)), reverse=True)[:30]
+    known_rewards_by_pool = {str(row.get("pool") or ""): row for row in address_groups}
+    for row in pool_rows:
+        known_rewards = known_rewards_by_pool.get(str(row.get("name") or ""))
+        if known_rewards:
+            row["miner_rewards_sats"] = int(known_rewards.get("total_received_sats") or 0)
+            row["miner_rewards_earned"] = str(known_rewards.get("total_received_compact") or "-")
     return {
         "generated_at": generated_at,
         "type": "miners",
         "status_error": status_error,
+        "recent_blocks_error": recent_blocks_error,
         "status": {
             "utxo_height": ((status_payload.get("utxo") or {}) if isinstance(status_payload, dict) else {}).get("indexed_height"),
             "bitcoin_height": ((status_payload.get("bitcoin") or {}) if isinstance(status_payload, dict) else {}).get("indexed_height"),
@@ -3856,6 +3866,7 @@ def miners_snapshot(
             "unknown_blocks_text": fmt_ratio_percent(unknown_blocks, window_blocks),
             "participation": hashrate.get("participation") if isinstance(hashrate, dict) else None,
             "participation_text": fmt_ratio_percent(tagged_blocks, window_blocks) if isinstance(hashrate, dict) else "0%",
+            "recent_blocks_sample": len(latest_blocks),
         },
         "totals": {
             "pools": len(pool_rows),
@@ -3866,11 +3877,13 @@ def miners_snapshot(
             "btc_blocks": total_blocks,
             "window_blocks": window_blocks,
             "unknown_blocks": unknown_blocks,
+            "latest_utxo_height": recent_blocks_payload.get("latest_height") if isinstance(recent_blocks_payload, dict) else None,
+            "recent_blocks_sample": len(latest_blocks),
         },
         "pools": pool_rows,
         "addresses": address_rows,
         "address_groups": address_groups,
-        "recent_blocks": latest_blocks,
+        "recent_blocks": latest_blocks[:30],
     }
 
 
@@ -5321,7 +5334,7 @@ def miners_html(refresh_seconds: int = 60, snapshot: dict[str, Any] | None = Non
 
     def status_pool_url(pool: dict[str, Any]) -> str:
         mempool_id = str(pool.get("mempool_id") or "")
-        return f"https://status.syscoin.org/mining/{urllib.parse.quote(mempool_id)}" if mempool_id else "https://status.syscoin.org/"
+        return f"https://status.syscoin.org/mining/pool/{urllib.parse.quote(mempool_id)}" if mempool_id else "https://status.syscoin.org/"
 
     pool_rows = []
     for index, pool in enumerate(pools, start=1):
@@ -5331,14 +5344,15 @@ def miners_html(refresh_seconds: int = 60, snapshot: dict[str, Any] | None = Non
             f"<td class='rank'>{index}</td>"
             f"<td><a href='{status_pool_url(pool)}'>{html.escape(name)}</a></td>"
             f"<td class='amount'>{int(pool.get('blocks_won') or 0):,}</td>"
-            f"<td><span class='badge neutral'>{html.escape(str(pool.get('commitment_share_text') or '0%'))}</span></td>"
+            f"<td class='amount'>{int(pool.get('syscoin_commitments') or 0):,}</td>"
+            f"<td><span class='badge neutral'>{html.escape(str(pool.get('block_share_text') or '0%'))}</span></td>"
             f"<td class='amount'>{html.escape(str(pool.get('estimated_hashrate') or '-'))}</td>"
             f"<td class='amount'>{html.escape(str(pool.get('miner_rewards_earned') or '-'))}</td>"
             f"<td>{int(pool.get('known_address_count') or 0):,}</td>"
             f"<td>{html.escape(str(pool.get('last_seen') or '-'))}</td>"
             "</tr>"
         )
-    pool_rows_html = "\n".join(pool_rows) or "<tr><td class='empty' colspan='8'>No miner pool data available yet.</td></tr>"
+    pool_rows_html = "\n".join(pool_rows) or "<tr><td class='empty' colspan='9'>No miner pool data available yet.</td></tr>"
 
     address_rows = []
     for item in address_groups:
@@ -5371,9 +5385,9 @@ def miners_html(refresh_seconds: int = 60, snapshot: dict[str, Any] | None = Non
             "<tr>"
             f"<td><a href='{block_url}'>{height:,}</a></td>"
             f"<td>{html.escape(fmt_local_datetime(int_or_none(block.get('time'))))}</td>"
-            f"<td>{html.escape(str(block.get('syscoin_commitment_miner') or '-'))}</td>"
             f"<td>{html.escape(str(block.get('auxpow_miner') or '-'))}</td>"
-            f"<td>{html.escape(str(block.get('btc_depth') if block.get('btc_depth') is not None else '-'))}</td>"
+            f"<td>{html.escape(str(block.get('syscoin_commitment_miner') or '-'))}</td>"
+            f"<td>{html.escape(str(block.get('confirmations') if block.get('confirmations') is not None else '-'))}</td>"
             f"<td>{html.escape(str(block.get('transactions') if block.get('transactions') is not None else '-'))}</td>"
             "</tr>"
         )
@@ -5382,6 +5396,8 @@ def miners_html(refresh_seconds: int = 60, snapshot: dict[str, Any] | None = Non
     error_html = ""
     if snapshot.get("status_error"):
         error_html = f"<p class='warning'>Status API unavailable: {html.escape(str(snapshot.get('status_error')))}</p>"
+    if snapshot.get("recent_blocks_error"):
+        error_html += f"<p class='warning'>Recent block feed unavailable: {html.escape(str(snapshot.get('recent_blocks_error')))}</p>"
 
     return f"""<!doctype html>
 <html lang="en">
@@ -5476,9 +5492,9 @@ def miners_html(refresh_seconds: int = 60, snapshot: dict[str, Any] | None = Non
   <main>
     {error_html}
     <section class="section-panel metrics">
-      {metric("Network SYS Hashrate", str(status.get("network_hashrate") or "-"), "Estimated from recent Syscoin commitments")}
-      {metric("Known Mining Pools", f"{int(totals.get('pools') or 0):,}", str(top_pool.get("name") or "-") + " leads")}
-      {metric("Blocks Indexed", f"{int(totals.get('window_blocks') or 0):,}", f"Current {status.get('window_size') or '-'} block window")}
+      {metric("Network SYS Hashrate", str(status.get("network_hashrate") or "-"), f"Current {status.get('window_size') or '-'} block window")}
+      {metric("Known Mining Pools", f"{int(totals.get('pools') or 0):,}", str(top_pool.get("name") or "-") + " leads by indexed blocks")}
+      {metric("Latest UTXO Block", f"{int(totals.get('latest_utxo_height') or status.get('utxo_height') or 0):,}", f"{int(totals.get('recent_blocks_sample') or 0):,} latest blocks sampled")}
       {metric("Unknown Blocks", f"{int(totals.get('unknown_blocks') or 0):,}", str(status.get("unknown_blocks_text") or "0%"))}
       {metric("Known Payout Groups", f"{int(totals.get('known_address_groups') or 0):,}", f"{int(totals.get('known_addresses') or 0):,} addresses · Updated {updated}" if updated else f"{int(totals.get('known_addresses') or 0):,} addresses")}
     </section>
@@ -5487,13 +5503,13 @@ def miners_html(refresh_seconds: int = 60, snapshot: dict[str, Any] | None = Non
       <div class="section-head">
         <div>
           <h2>Mining Pool Share</h2>
-          <p class="section-note">Estimated from Syscoin blocks/commitments attributed to each Bitcoin mining pool. Not proof of dedicated hashrate.</p>
+          <p class="section-note">Pool totals come from indexed Syscoin blocks. Latest block mined is sampled from the current recent-block feed. Known rewards use recorded payout groups only.</p>
         </div>
         <div class="meta">Source: status.syscoin.org</div>
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th class="rank">Rank</th><th>Pool</th><th class="amount">Blocks Won</th><th>Share %</th><th class="amount">Estimated Hashrate</th><th class="amount">Miner Rewards Earned</th><th>Known Payout Addresses</th><th>Last Block Mined</th></tr></thead>
+          <thead><tr><th class="rank">Rank</th><th>Pool</th><th class="amount">Syscoin Blocks</th><th class="amount">Commitments</th><th>Share %</th><th class="amount">Estimated Hashrate</th><th class="amount">Known Rewards</th><th>Known Payout Addresses</th><th>Latest UTXO Block</th></tr></thead>
           <tbody>{pool_rows_html}</tbody>
         </table>
       </div>
@@ -5518,14 +5534,14 @@ def miners_html(refresh_seconds: int = 60, snapshot: dict[str, Any] | None = Non
     <section class="section-panel">
       <div class="section-head">
         <div>
-          <h2>Recent Attributed Blocks</h2>
-          <p class="section-note">Recent blocks sampled from known pools in the status API. Commitment miner and AuxPoW miner can differ.</p>
+          <h2>Latest UTXO Blocks</h2>
+          <p class="section-note">Current recent Syscoin blocks from the status API. AuxPoW miner is the Bitcoin pool credited on the Syscoin block.</p>
         </div>
       </div>
       <div class="table-controls" data-pager="recent-miner-blocks"><label>Rows<select><option>20</option><option>50</option><option>100</option></select></label><button data-first>First</button><button data-prev>Prev</button><span class="page-info"></span><button data-next>Next</button><button data-last>Last</button></div>
       <div class="table-wrap">
         <table id="recent-miner-blocks">
-          <thead><tr><th>Block</th><th>Time</th><th>Commitment Miner</th><th>AuxPoW Miner</th><th>BTC Depth</th><th>Txs</th></tr></thead>
+          <thead><tr><th>Block</th><th>Time</th><th>AuxPoW Miner</th><th>Commitment Miner</th><th>Confirmations</th><th>Txs</th></tr></thead>
           <tbody>{block_rows_html}</tbody>
         </table>
       </div>
