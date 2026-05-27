@@ -78,6 +78,7 @@ MINERS_HTML = "miners.html"
 MINERS_JSON_PATH = f"/{MINERS_JSON}"
 DEFAULT_STATUS_API_URL = "https://status-api.syscoin.org"
 RECENT_MINER_BLOCK_COUNT = 50
+ROTATING_MINER_PAYOUT_POOLS = {"ViaBTC"}
 CHART_ASSET_ROUTE = "/assets/chart.umd.js"
 CHART_ASSET_PATH = Path("static/assets/chart.umd.js")
 NETWORK_MASTERNODE_HEADERS = [
@@ -1250,6 +1251,20 @@ class Store:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS miner_payout_events (
+                pool TEXT NOT NULL,
+                height INTEGER NOT NULL,
+                block_hash TEXT NOT NULL,
+                block_time INTEGER,
+                coinbase_txid TEXT NOT NULL,
+                vout INTEGER NOT NULL,
+                address TEXT NOT NULL,
+                value_sats INTEGER NOT NULL,
+                discovered_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (height, coinbase_txid, vout)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_movements_block
                 ON movements(block_height, block_time);
             CREATE INDEX IF NOT EXISTS idx_tracked_outputs_address
@@ -1270,6 +1285,10 @@ class Store:
                 ON emission_blocks(block_time);
             CREATE INDEX IF NOT EXISTS idx_nevm_emission_blocks_time
                 ON nevm_emission_blocks(block_time);
+            CREATE INDEX IF NOT EXISTS idx_miner_payout_events_pool
+                ON miner_payout_events(pool, block_time);
+            CREATE INDEX IF NOT EXISTS idx_miner_payout_events_address
+                ON miner_payout_events(address);
             """
         )
         self.ensure_network_masternode_columns()
@@ -3584,7 +3603,196 @@ def emissions_snapshot(store: Store, latest_limit: int = 100) -> dict[str, Any]:
     }
 
 
+def coinbase_miner_payout_from_block(block_payload: dict[str, Any]) -> dict[str, Any] | None:
+    txs = block_payload.get("txs") or []
+    if not isinstance(txs, list) or not txs:
+        return None
+    coinbase = txs[0]
+    if not isinstance(coinbase, dict):
+        return None
+    for vout in sorted((coinbase.get("vout") or []), key=lambda item: int(item.get("n", 0) or 0)):
+        if not isinstance(vout, dict):
+            continue
+        value_sats = sats(vout.get("value"))
+        if value_sats <= 0:
+            continue
+        if vout.get("isAddress") is False:
+            continue
+        addresses = [address for address in addresses_from(vout) if not address.startswith("OP_RETURN")]
+        if not addresses:
+            continue
+        return {
+            "coinbase_txid": str(coinbase.get("txid") or ""),
+            "vout": int(vout.get("n", 0) or 0),
+            "address": addresses[0],
+            "value_sats": value_sats,
+        }
+    return None
+
+
+def sync_recent_miner_payout_events(
+    store: Store,
+    blockbook: BlockbookClient,
+    recent_blocks: list[dict[str, Any]],
+) -> dict[str, int]:
+    stats = {"examined": 0, "created": 0, "updated": 0, "skipped": 0}
+    now = now_iso()
+    for block in recent_blocks:
+        pool = str(block.get("auxpow_miner") or "").strip()
+        height = int_or_none(block.get("height"))
+        block_hash = str(block.get("hash") or "")
+        if not pool or pool not in ROTATING_MINER_PAYOUT_POOLS or not height or not block_hash:
+            stats["skipped"] += 1
+            continue
+        stats["examined"] += 1
+        try:
+            block_payload = blockbook.block(height)
+        except Exception:
+            stats["skipped"] += 1
+            continue
+        payout = coinbase_miner_payout_from_block(block_payload)
+        if not payout or not payout.get("coinbase_txid") or not payout.get("address"):
+            stats["skipped"] += 1
+            continue
+        existing = store.conn.execute(
+            "SELECT 1 FROM miner_payout_events WHERE height = ? AND coinbase_txid = ? AND vout = ?",
+            (height, payout["coinbase_txid"], payout["vout"]),
+        ).fetchone()
+        store.conn.execute(
+            """
+            INSERT INTO miner_payout_events(
+                pool, height, block_hash, block_time, coinbase_txid, vout,
+                address, value_sats, discovered_at, updated_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(height, coinbase_txid, vout) DO UPDATE SET
+                pool=excluded.pool,
+                block_hash=excluded.block_hash,
+                block_time=excluded.block_time,
+                address=excluded.address,
+                value_sats=excluded.value_sats,
+                updated_at=excluded.updated_at
+            """,
+            (
+                pool,
+                height,
+                block_hash,
+                int_or_none(block.get("time")),
+                payout["coinbase_txid"],
+                payout["vout"],
+                payout["address"],
+                payout["value_sats"],
+                now,
+                now,
+            ),
+        )
+        stats["updated" if existing else "created"] += 1
+    store.set_meta("miner_payout_events", {"synced_at": now, **stats})
+    return stats
+
+
+def miner_payout_groups_from_store(store: Store, recent_address_limit: int = 40) -> list[dict[str, Any]]:
+    groups = []
+    rows = store.conn.execute(
+        """
+        SELECT pool,
+               COUNT(*) AS blocks_paid,
+               COUNT(DISTINCT address) AS address_count,
+               COALESCE(SUM(value_sats), 0) AS total_received_sats,
+               MIN(block_time) AS first_seen_time,
+               MAX(block_time) AS last_seen_time
+        FROM miner_payout_events
+        GROUP BY pool
+        ORDER BY pool
+        """
+    ).fetchall()
+    for row in rows:
+        pool = str(row["pool"] or "")
+        recent_rows = store.conn.execute(
+            """
+            SELECT address
+            FROM miner_payout_events
+            WHERE pool = ?
+            GROUP BY address
+            ORDER BY MAX(block_time) DESC, MAX(height) DESC
+            LIMIT ?
+            """,
+            (pool, recent_address_limit),
+        ).fetchall()
+        addresses = [str(address_row["address"]) for address_row in recent_rows if address_row["address"]]
+        address_count = int(row["address_count"] or 0)
+        primary_address = addresses[0] if addresses else ""
+        total_received = int(row["total_received_sats"] or 0)
+        first_seen = int_or_none(row["first_seen_time"])
+        last_seen = int_or_none(row["last_seen_time"])
+        groups.append(
+            {
+                "pool": pool,
+                "address": primary_address,
+                "addresses": addresses,
+                "address_count": address_count,
+                "address_label": f"{address_count:,} rotating coinbase addresses" if address_count != 1 else short_address(primary_address),
+                "role": "coinbase payout log",
+                "note": "auto-discovered coinbase miner payouts",
+                "balance_sats": None,
+                "balance_sys": "",
+                "balance_compact": "-",
+                "total_received_sats": total_received,
+                "total_received_compact": fmt_compact_sys(total_received),
+                "txs": int(row["blocks_paid"] or 0),
+                "blocks_paid": int(row["blocks_paid"] or 0),
+                "first_seen_time": first_seen,
+                "first_seen": fmt_local_datetime(first_seen) if first_seen else "-",
+                "last_seen_time": last_seen,
+                "last_seen": fmt_local_datetime(last_seen) if last_seen else "-",
+            }
+        )
+    return groups
+
+
+def merge_miner_payout_groups(
+    address_groups: list[dict[str, Any]],
+    discovered_groups: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged = [dict(group) for group in address_groups]
+    group_by_pool = {str(group.get("pool") or ""): group for group in merged}
+    for discovered in discovered_groups:
+        pool = str(discovered.get("pool") or "")
+        existing = group_by_pool.get(pool)
+        if not existing:
+            merged.append(dict(discovered))
+            group_by_pool[pool] = merged[-1]
+            continue
+        existing_addresses = list(existing.get("addresses") or [])
+        discovered_addresses = list(discovered.get("addresses") or [])
+        combined_addresses = list(dict.fromkeys(existing_addresses + discovered_addresses))
+        existing["addresses"] = combined_addresses
+        existing["address"] = str(discovered.get("address") or existing.get("address") or "")
+        existing["address_count"] = int(existing.get("address_count") or 0) + int(discovered.get("address_count") or 0)
+        existing["address_label"] = f"{int(existing.get('address_count') or 0):,} rotating coinbase addresses"
+        existing["note"] = "manual examples plus auto-discovered coinbase payouts"
+        existing["role"] = "coinbase payout log"
+        existing["balance_sats"] = None
+        existing["balance_sys"] = ""
+        existing["balance_compact"] = "-"
+        existing["total_received_sats"] = int(existing.get("total_received_sats") or 0) + int(discovered.get("total_received_sats") or 0)
+        existing["total_received_compact"] = fmt_compact_sys(int(existing["total_received_sats"]))
+        existing["txs"] = int(existing.get("txs") or 0) + int(discovered.get("txs") or 0)
+        existing["blocks_paid"] = int(existing.get("blocks_paid") or 0) + int(discovered.get("blocks_paid") or 0)
+        first_values = [int(value) for value in (existing.get("first_seen_time"), discovered.get("first_seen_time")) if value is not None]
+        last_values = [int(value) for value in (existing.get("last_seen_time"), discovered.get("last_seen_time")) if value is not None]
+        first_seen = min(first_values) if first_values else None
+        last_seen = max(last_values) if last_values else None
+        existing["first_seen_time"] = first_seen
+        existing["first_seen"] = fmt_local_datetime(first_seen) if first_seen else "-"
+        existing["last_seen_time"] = last_seen
+        existing["last_seen"] = fmt_local_datetime(last_seen) if last_seen else "-"
+    merged.sort(key=lambda row: (str(row.get("pool") or ""), -int(row.get("total_received_sats") or 0)))
+    return merged
+
+
 def miners_snapshot(
+    store: Store | None = None,
     *,
     status_base_url: str | None = None,
     address_path: Path = DEFAULT_MINER_ADDRESSES_PATH,
@@ -3673,6 +3881,11 @@ def miners_snapshot(
         if parsed is not None
     ]
     latest_blocks.sort(key=lambda row: (int(row.get("time") or 0), int(row.get("height") or 0)), reverse=True)
+    payout_sync: dict[str, int] = {"examined": 0, "created": 0, "updated": 0, "skipped": 0}
+    if store is not None and latest_blocks:
+        payout_sync = sync_recent_miner_payout_events(store, blockbook, latest_blocks)
+    discovered_groups = miner_payout_groups_from_store(store) if store is not None else []
+    discovered_pools = {str(group.get("pool") or "") for group in discovered_groups}
     recent_auxpow_by_pool: dict[str, int] = {}
     for block in latest_blocks:
         auxpow_miner = str(block.get("auxpow_miner") or "")
@@ -3770,10 +3983,11 @@ def miners_snapshot(
         }
 
     address_rows: list[dict[str, Any]] = []
-    if known_addresses:
-        workers = min(6, len(known_addresses))
+    known_addresses_for_lookup = [item for item in known_addresses if item["pool"] not in discovered_pools]
+    if known_addresses_for_lookup:
+        workers = min(6, len(known_addresses_for_lookup))
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            address_rows = list(executor.map(fetch_address_row, known_addresses))
+            address_rows = list(executor.map(fetch_address_row, known_addresses_for_lookup))
 
     address_pools = set(addresses_by_pool)
     for pool in address_pools - set(pool_lookup):
@@ -3842,12 +4056,16 @@ def miners_snapshot(
             }
         )
     address_groups.sort(key=lambda row: (str(row.get("pool") or ""), -int(row.get("total_received_sats") or 0)))
+    if discovered_groups:
+        address_groups = merge_miner_payout_groups(address_groups, discovered_groups)
     known_rewards_by_pool = {str(row.get("pool") or ""): row for row in address_groups}
     for row in pool_rows:
         known_rewards = known_rewards_by_pool.get(str(row.get("name") or ""))
         if known_rewards:
             row["miner_rewards_sats"] = int(known_rewards.get("total_received_sats") or 0)
             row["miner_rewards_earned"] = str(known_rewards.get("total_received_compact") or "-")
+            row["known_address_count"] = int(known_rewards.get("address_count") or row.get("known_address_count") or 0)
+    known_address_total = sum(int(row.get("address_count") or 0) for row in address_groups)
     return {
         "generated_at": generated_at,
         "type": "miners",
@@ -3867,11 +4085,12 @@ def miners_snapshot(
             "participation": hashrate.get("participation") if isinstance(hashrate, dict) else None,
             "participation_text": fmt_ratio_percent(tagged_blocks, window_blocks) if isinstance(hashrate, dict) else "0%",
             "recent_blocks_sample": len(latest_blocks),
+            "payout_sync": payout_sync,
         },
         "totals": {
             "pools": len(pool_rows),
             "pools_with_addresses": len(addresses_by_pool),
-            "known_addresses": len(address_rows),
+            "known_addresses": known_address_total,
             "known_address_groups": len(address_groups),
             "syscoin_commitments": total_commitments,
             "btc_blocks": total_blocks,
@@ -4584,7 +4803,7 @@ def publish_static_snapshot(
     top_wallets_page = top_wallets_html(store, refresh_seconds=refresh_seconds)
     emissions = emissions_snapshot(store)
     emissions_page = emissions_html(store, refresh_seconds=refresh_seconds)
-    miners = miners_snapshot()
+    miners = miners_snapshot(store)
     miners_page = miners_html(refresh_seconds=refresh_seconds, snapshot=miners)
     atomic_write_text(output_dir / "index.html", index_html)
     atomic_write_text(output_dir / "wallet-flows.html", index_html)
@@ -5363,13 +5582,17 @@ def miners_html(refresh_seconds: int = 60, snapshot: dict[str, Any] | None = Non
             address_cell = f"<span class='mono' title='{html.escape(address_title)}'>{html.escape(str(item.get('address_label') or '-'))}</span>"
         else:
             address_cell = f"<a class='mono' href='{explorer_address_url(address)}' title='{html.escape(address)}'>{html.escape(short_address(address))}</a>"
+        balance_title = str(item.get("balance_sys") or "")
+        balance_text = str(item.get("balance_compact") or "0 SYS")
+        if item.get("balance_sats") is None:
+            balance_title = "Synthetic rotating-address group; current balance is not summed"
         address_rows.append(
             "<tr>"
             f"<td>{html.escape(str(item.get('pool') or '-'))}</td>"
             f"<td>{address_cell}</td>"
             f"<td>{int(item.get('blocks_paid') or 0):,}</td>"
             f"<td class='amount'>{html.escape(str(item.get('total_received_compact') or '0 SYS'))}</td>"
-            f"<td class='amount' title='{html.escape(str(item.get('balance_sys') or '0'))} SYS'>{html.escape(str(item.get('balance_compact') or '0 SYS'))}</td>"
+            f"<td class='amount' title='{html.escape(balance_title)}'>{html.escape(balance_text)}</td>"
             f"<td>{html.escape(str(item.get('first_seen') or '-'))}</td>"
             f"<td>{html.escape(str(item.get('last_seen') or '-'))}</td>"
             "</tr>"
@@ -5519,7 +5742,7 @@ def miners_html(refresh_seconds: int = 60, snapshot: dict[str, Any] | None = Non
       <div class="section-head">
         <div>
           <h2>Known Miner Payout Groups</h2>
-          <p class="section-note">Known payout groups by pool. ViaBTC rotates payout addresses, so those addresses are grouped together for the page instead of shown as separate wallets.</p>
+          <p class="section-note">Known and auto-logged coinbase payout groups by pool. ViaBTC rotates payout addresses, so those addresses are grouped into one synthetic wallet.</p>
         </div>
       </div>
       <div class="table-controls" data-pager="miner-addresses"><label>Rows<select><option>20</option><option>50</option><option>100</option></select></label><button data-first>First</button><button data-prev>Prev</button><span class="page-info"></span><button data-next>Next</button><button data-last>Last</button></div>
@@ -7632,7 +7855,7 @@ def serve(
                     html_body = json.dumps(emissions_snapshot(store), indent=2)
                     content_type = "application/json; charset=utf-8"
                 elif parsed.path == MINERS_JSON_PATH:
-                    html_body = json.dumps(miners_snapshot(), indent=2)
+                    html_body = json.dumps(miners_snapshot(store), indent=2)
                     content_type = "application/json; charset=utf-8"
                 elif parsed.path in ("/", "/index.html"):
                     html_body = dashboard_html(
@@ -7653,7 +7876,7 @@ def serve(
                 elif parsed.path in EMISSIONS_PATHS:
                     html_body = emissions_html(store, refresh_seconds=refresh_seconds)
                 elif parsed.path in MINERS_PATHS:
-                    html_body = miners_html(refresh_seconds=refresh_seconds)
+                    html_body = miners_html(refresh_seconds=refresh_seconds, snapshot=miners_snapshot(store))
                 else:
                     self.send_error(404)
                     return
