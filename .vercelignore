@@ -9,6 +9,8 @@ node_modules/
 *.sqlite-shm
 *.sqlite-wal
 *.log
+handoff.md
+reports/
 destinations*.csv
 pyproject.toml
 uv.lock

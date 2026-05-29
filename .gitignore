@@ -7,6 +7,10 @@ node_modules/
 *.log
 .vercel/
 .ssh/
+handoff.md
+reports/
+pyproject.toml
+uv.lock
 destinations*.csv
 
 .vercel
