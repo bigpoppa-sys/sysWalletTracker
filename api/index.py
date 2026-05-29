@@ -32,6 +32,8 @@ from syscoin_tracker import (  # noqa: E402
     MINERS_JSON,
     MINERS_JSON_PATH,
     MINERS_PATHS,
+    SN_COMP_HTML,
+    SN_COMP_PATHS,
     LEGACY_MASTERNODE_PATHS,
     SENTRY_COLLATERAL_SATS,
     SENTRY_NODE_PATHS,
@@ -58,6 +60,7 @@ from syscoin_tracker import (  # noqa: E402
     sync_address,
     sync_network_masternodes,
     sys_to_sats,
+    sn_comp_html,
     top_wallets_snapshot,
     top_wallets_html,
 )
@@ -273,6 +276,8 @@ def fetch_static_page(path: str, *, force: bool = False) -> bytes | None:
         page_name = "miners.html"
     elif path == MINERS_JSON_PATH:
         page_name = MINERS_JSON
+    elif path in SN_COMP_PATHS:
+        page_name = SN_COMP_HTML
     else:
         page_name = "index.html"
     url = f"{base_url}/{page_name}"
@@ -315,6 +320,8 @@ def fetch_static_page(path: str, *, force: bool = False) -> bytes | None:
             if path in EMISSIONS_PATHS and b"Syscoin Network Emissions" not in body:
                 return None
             if path in MINERS_PATHS and b"Syscoin Miners" not in body:
+                return None
+            if path in SN_COMP_PATHS and b"Syscoin SN Comp" not in body:
                 return None
             if path == TOP_WALLETS_JSON_PATH and not body.lstrip().startswith(b"{"):
                 return None
@@ -461,6 +468,7 @@ class handler(BaseHTTPRequestHandler):
             EMISSIONS_JSON_PATH,
             *MINERS_PATHS,
             MINERS_JSON_PATH,
+            *SN_COMP_PATHS,
         ):
             self.send_error(404)
             return
@@ -517,6 +525,8 @@ class handler(BaseHTTPRequestHandler):
                 )
             elif parsed.path == MINERS_JSON_PATH:
                 html_body = json.dumps(miners_snapshot(), indent=2)
+            elif parsed.path in SN_COMP_PATHS:
+                html_body = sn_comp_html(refresh_seconds=env_int("SYS_TRACKER_PAGE_REFRESH_SECONDS", 0))
             else:
                 html_body = dashboard_html(
                     store,

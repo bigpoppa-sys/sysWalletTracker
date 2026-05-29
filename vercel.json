@@ -59,6 +59,14 @@
       "destination": "/api/index.py"
     },
     {
+      "source": "/sn-comp",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/sn-comp.html",
+      "destination": "/api/index.py"
+    },
+    {
       "source": "/assets/chart.umd.js",
       "destination": "/api/index.py"
     },

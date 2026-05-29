@@ -76,6 +76,14 @@ MINERS_PATHS = ("/miners", "/miners.html")
 MINERS_JSON = "miners.json"
 MINERS_HTML = "miners.html"
 MINERS_JSON_PATH = f"/{MINERS_JSON}"
+SN_COMP_PATHS = ("/sn-comp", "/sn-comp.html")
+SN_COMP_HTML = "sn-comp.html"
+SN_COMP_START_TS = 1_780_056_062
+SN_COMP_END_TS = 1_785_121_200
+SN_COMP_NODEHUB_POST_URL = "https://x.com/nodehubio/status/2060388388818063650?s=20"
+SN_COMP_NODEHUB_SYSCOIN_URL = "https://nodehub.io/dashboard/view_coin?coin=syscoin"
+SN_COMP_NODEHUB_IMAGE_URL = "https://pbs.twimg.com/media/HJf4A8DWgAUjod5.jpg?name=orig"
+NEW_TAB_ATTRS = ' target="_blank" rel="noopener noreferrer"'
 DEFAULT_STATUS_API_URL = "https://status-api.syscoin.org"
 RECENT_MINER_BLOCK_COUNT = 50
 ROTATING_MINER_PAYOUT_POOLS = {"ViaBTC"}
@@ -4805,6 +4813,7 @@ def publish_static_snapshot(
     emissions_page = emissions_html(store, refresh_seconds=refresh_seconds)
     miners = miners_snapshot(store)
     miners_page = miners_html(refresh_seconds=refresh_seconds, snapshot=miners)
+    sn_comp_page = sn_comp_html(refresh_seconds=refresh_seconds)
     atomic_write_text(output_dir / "index.html", index_html)
     atomic_write_text(output_dir / "wallet-flows.html", index_html)
     atomic_write_text(output_dir / "sentrynode.html", masternode_page)
@@ -4812,6 +4821,7 @@ def publish_static_snapshot(
     atomic_write_text(output_dir / TOP_WALLETS_HTML, top_wallets_page)
     atomic_write_text(output_dir / EMISSIONS_HTML, emissions_page)
     atomic_write_text(output_dir / MINERS_HTML, miners_page)
+    atomic_write_text(output_dir / SN_COMP_HTML, sn_comp_page)
     atomic_write_json(output_dir / TOP_WALLETS_JSON, top_wallets)
     atomic_write_json(output_dir / EMISSIONS_JSON, emissions)
     atomic_write_json(output_dir / MINERS_JSON, miners)
@@ -4840,6 +4850,7 @@ def publish_static_snapshot(
                 "emissions_json": EMISSIONS_JSON,
                 "miners": MINERS_HTML,
                 "miners_json": MINERS_JSON,
+                "sn_comp": SN_COMP_HTML,
                 "network_masternodes": "network_masternodes.csv",
             },
         },
@@ -5144,6 +5155,7 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
         <nav class="nav" aria-label="Dashboard pages">
           <a href="/">Wallet Flows</a>
           <a href="/sentrynode">Sentry Nodes</a>
+          <a href="/sn-comp">SN Comp</a>
           <a href="/top-wallets">Top Wallets</a>
           <a class="active" href="/emissions">Network Emissions</a>
           <a href="/miners">Miners</a>
@@ -5561,7 +5573,7 @@ def miners_html(refresh_seconds: int = 60, snapshot: dict[str, Any] | None = Non
         pool_rows.append(
             "<tr>"
             f"<td class='rank'>{index}</td>"
-            f"<td><a href='{status_pool_url(pool)}'>{html.escape(name)}</a></td>"
+            f"<td><a href='{status_pool_url(pool)}'{NEW_TAB_ATTRS}>{html.escape(name)}</a></td>"
             f"<td class='amount'>{int(pool.get('blocks_won') or 0):,}</td>"
             f"<td class='amount'>{int(pool.get('syscoin_commitments') or 0):,}</td>"
             f"<td><span class='badge neutral'>{html.escape(str(pool.get('block_share_text') or '0%'))}</span></td>"
@@ -5581,7 +5593,7 @@ def miners_html(refresh_seconds: int = 60, snapshot: dict[str, Any] | None = Non
         if int(item.get("address_count") or 0) > 1:
             address_cell = f"<span class='mono' title='{html.escape(address_title)}'>{html.escape(str(item.get('address_label') or '-'))}</span>"
         else:
-            address_cell = f"<a class='mono' href='{explorer_address_url(address)}' title='{html.escape(address)}'>{html.escape(short_address(address))}</a>"
+            address_cell = f"<a class='mono' href='{explorer_address_url(address)}' title='{html.escape(address)}'{NEW_TAB_ATTRS}>{html.escape(short_address(address))}</a>"
         balance_title = str(item.get("balance_sys") or "")
         balance_text = str(item.get("balance_compact") or "0 SYS")
         if item.get("balance_sats") is None:
@@ -5606,7 +5618,7 @@ def miners_html(refresh_seconds: int = 60, snapshot: dict[str, Any] | None = Non
         block_url = f"{DEFAULT_BLOCKBOOK_URL}/block/{urllib.parse.quote(block_hash)}"
         block_rows.append(
             "<tr>"
-            f"<td><a href='{block_url}'>{height:,}</a></td>"
+            f"<td><a href='{block_url}'{NEW_TAB_ATTRS}>{height:,}</a></td>"
             f"<td>{html.escape(fmt_local_datetime(int_or_none(block.get('time'))))}</td>"
             f"<td>{html.escape(str(block.get('auxpow_miner') or '-'))}</td>"
             f"<td>{html.escape(str(block.get('syscoin_commitment_miner') or '-'))}</td>"
@@ -5705,6 +5717,7 @@ def miners_html(refresh_seconds: int = 60, snapshot: dict[str, Any] | None = Non
         <nav class="nav" aria-label="Dashboard pages">
           <a href="/">Wallet Flows</a>
           <a href="/sentrynode">Sentry Nodes</a>
+          <a href="/sn-comp">SN Comp</a>
           <a href="/top-wallets">Top Wallets</a>
           <a href="/emissions">Network Emissions</a>
           <a class="active" href="/miners">Miners</a>
@@ -5961,7 +5974,7 @@ def dashboard_html(
                 f"<article class='wallet-card'>"
                 f"<strong>{html.escape(wallet['label'])}</strong>"
                 f"{note_html}"
-                f"<a href='{explorer_addr(wallet['address'])}' title='{html.escape(wallet['address'])}'>"
+                f"<a href='{explorer_addr(wallet['address'])}' title='{html.escape(wallet['address'])}'{NEW_TAB_ATTRS}>"
                 f"{html.escape(short_address(wallet['address']))}</a>"
                 f"{sent_html}"
                 f"{balance_html}"
@@ -6015,7 +6028,7 @@ def dashboard_html(
 
         html_rows.append(
             f"<tr><td class='rank' data-sort='{rank}'>{rank}</td>"
-            f"<td class='address' data-sort='{html.escape(full_address.lower())}'><a href='{explorer_addr(full_address)}' title='{html.escape(full_address)}'>{html.escape(display_address)}</a></td>"
+            f"<td class='address' data-sort='{html.escape(full_address.lower())}'><a href='{explorer_addr(full_address)}' title='{html.escape(full_address)}'{NEW_TAB_ATTRS}>{html.escape(display_address)}</a></td>"
             f"<td class='amount' data-sort='{row['total_sats']}'>{fmt_compact_sys(row['total_sats'])}</td>"
             f"<td data-sort='{row['total_sats']}'>{fmt_percent(row['total_sats'], window_summary['external_sats'])}</td>"
             f"<td data-sort='{row['outputs']}'>{row['outputs']}</td>"
@@ -6157,6 +6170,7 @@ def dashboard_html(
         <nav class="nav" aria-label="Dashboard pages">
           <a class="active" href="/">Wallet Flows</a>
           <a href="/sentrynode">Sentry Nodes</a>
+          <a href="/sn-comp">SN Comp</a>
           <a href="/top-wallets">Top Wallets</a>
           <a href="/emissions">Network Emissions</a>
           <a href="/miners">Miners</a>
@@ -6167,7 +6181,7 @@ def dashboard_html(
   <main>
     <section class="section-panel metrics">
       <div class="metric"><span>SYS Sent</span><b title="{html.escape(total_sent_full)} SYS">{fmt_compact_sys(window_summary["external_sats"])}</b></div>
-      <div class="metric"><span>Binance Hot Wallet</span><b title="{html.escape(wallet_balance_full)} SYS">{fmt_compact_sys(wallet_balance_sats)}</b><a class="metric-address" href="{explorer_addr(hot_wallet_address)}" title="{html.escape(hot_wallet_address)}">{html.escape(short_address(hot_wallet_address))}</a></div>
+      <div class="metric"><span>Binance Hot Wallet</span><b title="{html.escape(wallet_balance_full)} SYS">{fmt_compact_sys(wallet_balance_sats)}</b><a class="metric-address" href="{explorer_addr(hot_wallet_address)}" title="{html.escape(hot_wallet_address)}"{NEW_TAB_ATTRS}>{html.escape(short_address(hot_wallet_address))}</a></div>
       <div class="metric"><span>Transfers</span><b>{window_summary["txs"]}</b></div>
       <div class="metric"><span>Recipients</span><b>{destination_count}</b></div>
       <div class="metric"><span>Updated</span><b>{html.escape(updated_text)}</b></div>
@@ -6421,7 +6435,7 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
             f"<td class='rank' data-sort='{row['rank']}'>{row['rank']}</td>"
             f"<td class='wallet-name' data-sort='{html.escape(name.lower())}'>{html.escape(name)}</td>"
             f"<td data-sort='{html.escape(label.lower())}'><span class='label-pill {label_class}'>{html.escape(label)}</span></td>"
-            f"<td class='address-list' data-sort='{address_count}'><a href='{explorer_addr(address)}' title='{html.escape(address)}'>{address_count:,} {address_word}</a><span>{html.escape(short_address(address))}</span></td>"
+            f"<td class='address-list' data-sort='{address_count}'><a href='{explorer_addr(address)}' title='{html.escape(address)}'{NEW_TAB_ATTRS}>{address_count:,} {address_word}</a><span>{html.escape(short_address(address))}</span></td>"
             f"<td class='amount' data-sort='{balance_sats}' title='{html.escape(row['balance_sys'])} SYS'>{fmt_compact_sys(balance_sats)}</td>"
             f"<td data-sort='{balance_sats}'>{row.get('percent_text') or fmt_percent(balance_sats, indexed_total_sats)}</td>"
             f"<td data-sort='{row['last_seen_time'] or 0}' title='{html.escape(last_seen_full)}'>{html.escape(last_seen)}</td>"
@@ -6792,6 +6806,7 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
         <nav class="nav" aria-label="Dashboard pages">
           <a href="/">Wallet Flows</a>
           <a href="/sentrynode">Sentry Nodes</a>
+          <a href="/sn-comp">SN Comp</a>
           <a class="active" href="/top-wallets">Top Wallets</a>
           <a href="/emissions">Network Emissions</a>
           <a href="/miners">Miners</a>
@@ -7137,7 +7152,7 @@ def masternodes_html(
         tx_outpoint = f"{source_txid}:{source_vout}"
         tx_label = f"{short_txid(source_txid)}:{source_vout}" if source_txid else "-"
         tx_html = (
-            f"<a href='{explorer_tx_url(source_txid)}' title='{html.escape(tx_outpoint)}'>{html.escape(tx_label)}</a>"
+            f"<a href='{explorer_tx_url(source_txid)}' title='{html.escape(tx_outpoint)}'{NEW_TAB_ATTRS}>{html.escape(tx_label)}</a>"
             if source_txid
             else "-"
         )
@@ -7149,7 +7164,7 @@ def masternodes_html(
         )
         moved_to_address = item["moved_to_address"]
         moved_to_html = (
-            f"<a href='{explorer_address_url(moved_to_address)}' title='{html.escape(moved_to_address)}'>{html.escape(short_address(moved_to_address))}</a>"
+            f"<a href='{explorer_address_url(moved_to_address)}' title='{html.escape(moved_to_address)}'{NEW_TAB_ATTRS}>{html.escape(short_address(moved_to_address))}</a>"
             if moved_to_address
             else "-"
         )
@@ -7192,7 +7207,7 @@ def masternodes_html(
             f"<tr data-search='{search_terms}'>"
             f"{setup_cell}"
             f"{seniority_cell}"
-            f"<td class='address' data-sort='{html.escape(collateral_address.lower())}'><a href='{explorer_address_url(collateral_address)}' title='{html.escape(collateral_address)}'>{html.escape(short_address(collateral_address))}</a></td>"
+            f"<td class='address' data-sort='{html.escape(collateral_address.lower())}'><a href='{explorer_address_url(collateral_address)}' title='{html.escape(collateral_address)}'{NEW_TAB_ATTRS}>{html.escape(short_address(collateral_address))}</a></td>"
             f"<td class='address' data-sort='{html.escape(tx_outpoint.lower())}'>{tx_html}</td>"
             f"<td data-sort='{html.escape(str(service).lower())}'>{html.escape(str(service))}</td>"
             f"{status_cell}"
@@ -7402,6 +7417,7 @@ def masternodes_html(
         <nav class="nav" aria-label="Dashboard pages">
           <a href="/">Wallet Flows</a>
           <a class="active" href="/sentrynode">Sentry Nodes</a>
+          <a href="/sn-comp">SN Comp</a>
           <a href="/top-wallets">Top Wallets</a>
           <a href="/emissions">Network Emissions</a>
           <a href="/miners">Miners</a>
@@ -7722,6 +7738,411 @@ def masternodes_html(
 </html>"""
 
 
+def sn_comp_html(refresh_seconds: int = 60) -> str:
+    mock_rows = [
+        {
+            "setup_time": 1_780_071_240,
+            "taken_down_time": None,
+            "seniority": {"label": "Level 2", "sort": 2, "class": "level-2"},
+            "collateral_address": "SUprcf5ez1jMC4mEyDRg6XTFGQRYCsp",
+            "source_txid": "2cc4b9c7594d1bf684190f9f906aee5f2504190f85a66a00d1a6557d72c7cf3e",
+            "source_vout": 0,
+            "service": "31.77.108.142:8369",
+            "status": "ENABLED",
+        },
+        {
+            "setup_time": 1_780_069_860,
+            "taken_down_time": None,
+            "seniority": {"label": "Base", "sort": 0, "class": "base"},
+            "collateral_address": "sys1q2ednqv9jkz6d7473j9emwzk8fl",
+            "source_txid": "cbd5c8a0c8d916bdf8c6d0662a73de35c90108a8e75e6a69e634fb2d94690194",
+            "source_vout": 0,
+            "service": "31.77.108.254:8369",
+            "status": "ENABLED",
+        },
+        {
+            "setup_time": 1_780_069_860,
+            "taken_down_time": None,
+            "seniority": {"label": "Base", "sort": 0, "class": "base"},
+            "collateral_address": "sys1qcwg5aav4z4w5zkk9h247uxcn",
+            "source_txid": "2b86486f3a62f61d69f70f0474488f9c465220e5f1518de163fd404169397e2c9",
+            "source_vout": 0,
+            "service": "31.77.108.30:8369",
+            "status": "ENABLED",
+        },
+        {
+            "setup_time": 1_780_069_860,
+            "taken_down_time": None,
+            "seniority": {"label": "Base", "sort": 0, "class": "base"},
+            "collateral_address": "sys1qg4gpm4gm0r0u2v3jw0zvqzhf",
+            "source_txid": "9ff07af9bcb64e69ea4dd17ba8d741d6e7e5b9f7d05b3d4c1351e42e59d3baf6",
+            "source_vout": 1,
+            "service": "31.77.108.15:8369",
+            "status": "ENABLED",
+        },
+        {
+            "setup_time": 1_780_104_960,
+            "taken_down_time": None,
+            "seniority": {"label": "Level 1", "sort": 1, "class": "level-1"},
+            "collateral_address": "sys1q4x9dz0tzjzupq8t0amr2x3j8jlj",
+            "source_txid": "c3b0a33fb48681f68d13f0085c5cc344eaa7fc4830c1ef89d41f78efbe6078d1",
+            "source_vout": 0,
+            "service": "45.91.12.44:8369",
+            "status": "POSE_BANNED",
+        },
+        {
+            "setup_time": 1_780_359_120,
+            "taken_down_time": 1_780_615_800,
+            "seniority": {"label": "Base", "sort": 0, "class": "base"},
+            "collateral_address": "sys1q8kq80g6t9g2pg4ymr6xt4zxn2um",
+            "source_txid": "acb196ef14a52d7de094097bd35a042b4ff7719c729b24a1f5859f305f65c789",
+            "source_vout": 0,
+            "service": "31.77.109.11:8369",
+            "status": "TAKEN_DOWN",
+        },
+    ]
+    entries_count = len(mock_rows)
+    taken_down_count = sum(1 for row in mock_rows if row["taken_down_time"] or row["status"] == "TAKEN_DOWN")
+    enabled_count = sum(1 for row in mock_rows if row["status"] == "ENABLED" and not row["taken_down_time"])
+    banned_count = sum(1 for row in mock_rows if row["status"] == "POSE_BANNED")
+    active_count = entries_count - taken_down_count
+    days_remaining = max(0, int((SN_COMP_END_TS - int(time.time()) + 86_399) / 86_400))
+    updated_text = fmt_local_datetime(max(int(row["taken_down_time"] or row["setup_time"] or 0) for row in mock_rows))
+
+    def comp_status_label(status: str) -> str:
+        if status == "TAKEN_DOWN":
+            return "Taken Down"
+        return sentry_status_label(status)
+
+    def status_class(row: dict[str, Any]) -> str:
+        if row["status"] == "ENABLED" and not row["taken_down_time"]:
+            return "active"
+        return "down"
+
+    def row_html(row: dict[str, Any]) -> str:
+        source_txid = str(row["source_txid"])
+        source_vout = int(row["source_vout"])
+        outpoint = f"{source_txid}:{source_vout}"
+        setup_time = int(row["setup_time"] or 0)
+        taken_down_time = int(row["taken_down_time"] or 0)
+        seniority = row["seniority"]
+        collateral_address = str(row["collateral_address"])
+        service = str(row["service"])
+        status = comp_status_label(str(row["status"]))
+        search_terms = html.escape(f"{collateral_address} {source_txid} {service} {status}".lower(), quote=True)
+        taken_down_text = fmt_table_datetime(taken_down_time) if taken_down_time else "-"
+        return (
+            f"<tr data-search='{search_terms}'>"
+            f"<td data-sort='{setup_time}' title='{html.escape(fmt_local_datetime(setup_time))}'>{html.escape(fmt_table_datetime(setup_time))}</td>"
+            f"<td data-sort='{taken_down_time}' title='{html.escape(fmt_local_datetime(taken_down_time))}'>{html.escape(taken_down_text)}</td>"
+            f"<td data-sort='{seniority['sort']}'><span class='seniority {html.escape(seniority['class'])}'>{html.escape(seniority['label'])}</span></td>"
+            f"<td class='address' data-sort='{html.escape(collateral_address.lower())}'><a href='{explorer_address_url(collateral_address)}' title='{html.escape(collateral_address)}'{NEW_TAB_ATTRS}>{html.escape(short_address(collateral_address))}</a></td>"
+            f"<td class='address' data-sort='{html.escape(outpoint.lower())}'><a href='{explorer_tx_url(source_txid)}' title='{html.escape(outpoint)}'{NEW_TAB_ATTRS}>{html.escape(short_txid(source_txid))}:{source_vout}</a></td>"
+            f"<td data-sort='{html.escape(service.lower())}'>{html.escape(service)}</td>"
+            f"<td data-sort='{html.escape(status.lower())}'><span class='status {status_class(row)}'>{html.escape(status)}</span></td>"
+            f"</tr>"
+        )
+
+    rows_html = "\n".join(row_html(row) for row in sorted(mock_rows, key=lambda item: int(item["setup_time"]), reverse=True))
+    no_results_html = "<tr class='sn-no-results' hidden><td class='empty' colspan='7'>No matching comp entries.</td></tr>"
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+{refresh_meta_tag(refresh_seconds)}  <title>Syscoin SN Comp</title>
+  <style>
+    :root {{ color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --page-gutter: clamp(24px, 3.8vw, 80px); --bg: #050b12; --panel: #0b1622; --panel-soft: #102235; --line: #21384f; --ink: #e9f6ff; --muted: #8da8bb; --teal: #00d4ff; --accent: #2f8cff; --gold: #f5b84b; --shadow: 0 18px 48px rgba(0, 10, 24, 0.34); }}
+    *, *::before, *::after {{ box-sizing: border-box; }}
+    html, body {{ margin: 0; max-width: 100%; overflow-x: hidden; }}
+    body {{ background: radial-gradient(circle at top left, rgba(47, 140, 255, 0.22), transparent 32rem), radial-gradient(circle at top right, rgba(0, 212, 255, 0.13), transparent 30rem), linear-gradient(180deg, #07111d 0%, var(--bg) 48%, #03070c 100%); color: var(--ink); }}
+    header {{ background: linear-gradient(135deg, #06111d 0%, #082944 54%, #0b5476 100%); border-bottom: 1px solid rgba(85, 190, 255, 0.28); box-shadow: var(--shadow); color: #e9f6ff; padding: 24px 0 22px; width: 100%; }}
+    .header-inner, main {{ margin-left: var(--page-gutter); margin-right: var(--page-gutter); width: auto; }}
+    .topbar {{ align-items: end; display: flex; gap: 16px; justify-content: space-between; width: 100%; }}
+    .topbar > div {{ min-width: 0; }}
+    h1 {{ font-size: 1.8rem; line-height: 1.05; margin: 0 0 8px; letter-spacing: 0; }}
+    .subtitle {{ color: rgba(246, 251, 253, 0.84); font-size: 0.98rem; line-height: 1.35; max-width: 980px; }}
+    .nav {{ align-items: center; display: flex; flex: 0 0 auto; flex-wrap: nowrap; gap: 8px; justify-content: flex-end; max-width: 100%; overflow-x: auto; padding-bottom: 2px; }}
+    .nav a {{ background: rgba(85, 190, 255, 0.10); border: 1px solid rgba(112, 205, 255, 0.28); border-radius: 999px; color: #e9f6ff; font-size: 0.84rem; font-weight: 850; line-height: 1; padding: 9px 12px; text-decoration: none; white-space: nowrap; }}
+    .nav a.active {{ background: linear-gradient(135deg, var(--accent), var(--teal)); border-color: rgba(0, 212, 255, 0.72); color: #03111d; }}
+    main {{ display: grid; gap: 22px; margin-top: 22px; margin-bottom: 22px; padding: 0; }}
+    main > * {{ min-width: 0; }}
+    .section-panel {{ background: var(--panel); border: 1px solid rgba(72, 142, 190, 0.34); border-radius: 8px; box-shadow: var(--shadow); min-width: 0; padding: 16px; }}
+    .promo-panel {{ align-items: center; display: grid; gap: 18px; grid-template-columns: minmax(0, 0.95fr) minmax(320px, 0.72fr); }}
+    .promo-copy {{ display: grid; gap: 12px; min-width: 0; }}
+    .promo-kicker {{ color: var(--teal); font-size: 0.78rem; font-weight: 900; letter-spacing: 0.08em; text-transform: uppercase; }}
+    .promo-copy h2 {{ font-size: clamp(1.35rem, 2vw, 1.85rem); line-height: 1.05; margin: 0; overflow-wrap: anywhere; }}
+    .promo-copy p {{ color: var(--muted); font-size: 0.95rem; line-height: 1.45; margin: 0; max-width: 760px; overflow-wrap: anywhere; }}
+    .promo-actions {{ display: flex; flex-wrap: wrap; gap: 10px; }}
+    .promo-button {{ align-items: center; background: rgba(85, 190, 255, 0.10); border: 1px solid rgba(112, 205, 255, 0.28); border-radius: 999px; color: var(--ink); display: inline-flex; font-size: 0.86rem; font-weight: 850; line-height: 1; max-width: 100%; min-height: 36px; padding: 10px 13px; text-decoration: none; }}
+    .promo-button.primary {{ background: linear-gradient(135deg, var(--accent), var(--teal)); border-color: rgba(0, 212, 255, 0.72); color: #03111d; }}
+    .promo-media {{ border: 1px solid rgba(72, 142, 190, 0.34); border-radius: 8px; margin: 0; max-width: 100%; min-width: 0; overflow: hidden; width: 100%; }}
+    .promo-media img {{ aspect-ratio: 1672 / 941; background: var(--panel-soft); display: block; height: auto; object-fit: cover; width: 100%; }}
+    .metrics {{ display: grid; grid-template-columns: repeat(5, minmax(140px, 1fr)); gap: 12px; }}
+    .metric {{ background: var(--panel); border: 1px solid rgba(72, 142, 190, 0.34); border-radius: 8px; box-shadow: 0 12px 30px rgba(0, 10, 24, 0.24); min-width: 0; padding: 14px 16px; }}
+    .metric span {{ color: var(--muted); display: block; font-size: 0.84rem; margin-bottom: 6px; }}
+    .metric b {{ display: block; font-size: clamp(1.25rem, 2vw, 1.65rem); line-height: 1.1; overflow-wrap: anywhere; }}
+    .metric small {{ color: var(--muted); display: block; font-size: 0.78rem; font-weight: 700; margin-top: 8px; }}
+    .metric small a, .metric small strong {{ color: var(--ink); font-weight: 800; }}
+    .panel-title {{ align-items: end; display: flex; gap: 16px; justify-content: space-between; }}
+    .panel-title h2 {{ font-size: 1.25rem; margin: 0; }}
+    .panel-title p {{ color: var(--muted); font-size: 0.9rem; margin: 0; }}
+    .table-controls {{ align-items: end; display: flex; flex-wrap: wrap; gap: 10px; justify-content: space-between; margin: 10px 0; }}
+    .table-controls label {{ color: var(--muted); display: grid; font-size: 0.78rem; font-weight: 700; gap: 4px; }}
+    .table-controls input, .table-controls select {{ background: var(--panel-soft); border: 1px solid var(--line); border-radius: 6px; color: var(--ink); font: inherit; min-height: 36px; padding: 7px 9px; }}
+    .search-control {{ flex: 1 1 300px; max-width: 520px; }}
+    .pagination-controls {{ align-items: end; display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; margin-left: auto; }}
+    .page-size-control {{ width: 110px; }}
+    .pager {{ align-items: center; color: var(--muted); display: flex; gap: 8px; }}
+    .pager button {{ background: var(--panel-soft); border: 1px solid var(--line); border-radius: 6px; color: var(--ink); cursor: pointer; font: inherit; min-height: 36px; padding: 7px 10px; }}
+    .pager button:disabled {{ cursor: default; opacity: 0.45; }}
+    .page-status {{ color: var(--muted); font-size: 0.86rem; min-width: 96px; text-align: center; }}
+    .table-wrap {{ background: var(--panel); border: 1px solid rgba(72, 142, 190, 0.34); border-radius: 8px; max-width: 100%; min-width: 0; overflow-x: auto; width: 100%; }}
+    table {{ background: var(--panel); border-collapse: separate; border-spacing: 0; min-width: 1120px; table-layout: fixed; width: 100%; }}
+    th, td {{ border-bottom: 1px solid var(--line); font-size: 0.9rem; overflow: hidden; padding: 8px 10px; text-align: left; text-overflow: ellipsis; }}
+    th {{ background: var(--panel-soft); box-shadow: 0 1px 0 var(--line); color: var(--muted); font-size: 0.72rem; font-weight: 900; letter-spacing: 0.08em; position: sticky; text-transform: uppercase; top: 0; z-index: 10; }}
+    .sort-button {{ align-items: center; appearance: none; background: transparent; border: 0; color: inherit; cursor: pointer; display: inline-flex; font: inherit; font-weight: 700; gap: 4px; padding: 0; text-align: inherit; white-space: nowrap; }}
+    .sort-button:hover, .sort-button:focus-visible {{ color: #56c9ff; outline: none; }}
+    .sort-icon {{ color: var(--muted); display: inline-block; font-size: 0.75rem; min-width: 1ch; }}
+    th[aria-sort="ascending"] .sort-icon::before {{ content: "^"; }}
+    th[aria-sort="descending"] .sort-icon::before {{ content: "v"; }}
+    th[aria-sort="none"] .sort-icon::before {{ content: ""; }}
+    th:nth-child(1), td:nth-child(1) {{ width: 135px; }}
+    th:nth-child(2), td:nth-child(2) {{ width: 135px; }}
+    th:nth-child(3), td:nth-child(3) {{ width: 105px; }}
+    th:nth-child(4), td:nth-child(4) {{ width: 230px; }}
+    th:nth-child(5), td:nth-child(5) {{ width: 230px; }}
+    th:nth-child(6), td:nth-child(6) {{ width: 165px; }}
+    th:nth-child(7), td:nth-child(7) {{ width: 120px; }}
+    .address {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; white-space: nowrap; }}
+    .empty {{ color: var(--muted); padding: 18px 14px; text-align: center; }}
+    .status, .seniority {{ border-radius: 999px; display: inline-flex; font-size: 0.78rem; font-weight: 700; padding: 4px 8px; white-space: nowrap; }}
+    .status.active {{ background: #15304a; color: #b9dcff; }}
+    .status.down {{ background: #442d13; color: #ffd9a8; }}
+    .seniority.base {{ background: #273234; color: #d7e1dd; }}
+    .seniority.level-1 {{ background: #15304a; color: #b9dcff; }}
+    .seniority.level-2 {{ background: #173823; color: #b7efc7; }}
+    a {{ color: #56c9ff; text-decoration: none; }}
+    @media(max-width: 920px) {{
+      .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .promo-panel {{ grid-template-columns: 1fr; }}
+      .panel-title {{ align-items: start; flex-direction: column; }}
+      .table-controls {{ align-items: stretch; flex-direction: column; }}
+      .search-control, .page-size-control {{ max-width: none; width: 100%; }}
+      .pagination-controls {{ align-items: stretch; flex-direction: column; margin-left: 0; width: 100%; }}
+      .pager {{ justify-content: space-between; }}
+      .topbar {{ align-items: start; flex-direction: column; }}
+      .nav {{ justify-content: flex-start; }}
+      .header-inner, main {{ margin-left: 12px; margin-right: 12px; }}
+      .section-panel {{ padding: 12px; }}
+    }}
+    @media(max-width: 520px) {{
+      .metrics {{ grid-template-columns: 1fr; }}
+      .promo-actions {{ display: grid; grid-template-columns: 1fr; }}
+      .promo-button {{ justify-content: center; width: 100%; }}
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <div class="topbar">
+        <div>
+          <h1>Syscoin SN Comp</h1>
+          <div class="subtitle">Experimental view. Not proof of ownership or intent.</div>
+        </div>
+        <nav class="nav" aria-label="Dashboard pages">
+          <a href="/">Wallet Flows</a>
+          <a href="/sentrynode">Sentry Nodes</a>
+          <a class="active" href="/sn-comp">SN Comp</a>
+          <a href="/top-wallets">Top Wallets</a>
+          <a href="/emissions">Network Emissions</a>
+          <a href="/miners">Miners</a>
+        </nav>
+      </div>
+    </div>
+  </header>
+  <main>
+    <section class="section-panel promo-panel">
+      <div class="promo-copy">
+        <span class="promo-kicker">NodeHub.io Offer</span>
+        <h2>Free Sentry Node hosting for the first 30 days</h2>
+        <p>NodeHub.io posted support for the Syscoin new node campaign with free Sentry Node hosting until June 29.</p>
+        <div class="promo-actions">
+          <a class="promo-button primary" href="{html.escape(SN_COMP_NODEHUB_POST_URL)}"{NEW_TAB_ATTRS}>View NodeHub Post</a>
+          <a class="promo-button" href="{html.escape(SN_COMP_NODEHUB_SYSCOIN_URL)}"{NEW_TAB_ATTRS}>Open NodeHub Syscoin</a>
+        </div>
+      </div>
+      <figure class="promo-media">
+        <a href="{html.escape(SN_COMP_NODEHUB_POST_URL)}"{NEW_TAB_ATTRS}>
+          <img src="{html.escape(SN_COMP_NODEHUB_IMAGE_URL)}" alt="NodeHub.io Syscoin Sentry Node hosting offer">
+        </a>
+      </figure>
+    </section>
+    <section class="section-panel metrics">
+      <div class="metric"><span>Comp Opens</span><b>{html.escape(fmt_table_datetime(SN_COMP_START_TS))}</b><small><a href="https://x.com/syscoin/status/2060330572719751593?s=20"{NEW_TAB_ATTRS}>Source Post</a></small></div>
+      <div class="metric"><span>Comp Ends</span><b>{html.escape(fmt_table_datetime(SN_COMP_END_TS))}</b><small><strong>{days_remaining}</strong> days left · 03:00 UTC</small></div>
+      <div class="metric"><span>Entries</span><b>{entries_count}</b><small>Mock data</small></div>
+      <div class="metric"><span>Still Online</span><b>{active_count}</b><small>{enabled_count} enabled, {banned_count} banned</small></div>
+      <div class="metric"><span>Taken Down</span><b>{taken_down_count}</b><small>Updated <strong>{html.escape(updated_text)}</strong></small></div>
+    </section>
+    <section class="section-panel">
+      <div class="panel-title">
+        <h2>Competition Sentry Nodes</h2>
+        <p>{html.escape(fmt_local_datetime(SN_COMP_START_TS))} to {html.escape(fmt_local_datetime(SN_COMP_END_TS))}</p>
+      </div>
+      <div class="table-controls" aria-label="SN comp table controls">
+        <label class="search-control" for="sn-comp-search">
+          <span>Search</span>
+          <input id="sn-comp-search" type="search" placeholder="IP, collateral address, tx, status" autocomplete="off">
+        </label>
+        <div class="pagination-controls">
+          <label class="page-size-control" for="sn-comp-page-size">
+            <span>Rows</span>
+            <select id="sn-comp-page-size">
+              <option value="20" selected>20</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+          </label>
+          <div class="pager" aria-label="SN comp pagination">
+            <button id="sn-comp-first" type="button">First</button>
+            <button id="sn-comp-prev" type="button">Prev</button>
+            <span class="page-status" id="sn-comp-page-status">0 of 0</span>
+            <button id="sn-comp-next" type="button">Next</button>
+            <button id="sn-comp-last" type="button">Last</button>
+          </div>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="sn-comp-table">
+          <thead>
+            <tr>
+              <th data-sort="number" data-default-dir="desc" aria-sort="descending"><button class="sort-button" type="button">Date Setup<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Date Taken Down<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Seniority<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Collateral Address<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Collateral Tx<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">IP Address<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Status<span class="sort-icon" aria-hidden="true"></span></button></th>
+            </tr>
+          </thead>
+          <tbody>{rows_html}{no_results_html}</tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+  <script>
+    (() => {{
+      const table = document.querySelector(".sn-comp-table");
+      const searchInput = document.querySelector("#sn-comp-search");
+      const pageSizeSelect = document.querySelector("#sn-comp-page-size");
+      const pageStatus = document.querySelector("#sn-comp-page-status");
+      const firstButton = document.querySelector("#sn-comp-first");
+      const prevButton = document.querySelector("#sn-comp-prev");
+      const nextButton = document.querySelector("#sn-comp-next");
+      const lastButton = document.querySelector("#sn-comp-last");
+      if (!table || !pageSizeSelect || !pageStatus || !firstButton || !prevButton || !nextButton || !lastButton) return;
+      let page = 1;
+
+      const dataRows = () => Array.from(table.tBodies[0].rows).filter((row) => !row.classList.contains("sn-no-results"));
+      const apply = () => {{
+        const query = (searchInput?.value || "").trim().toLowerCase();
+        const pageSize = Number(pageSizeSelect.value) || 20;
+        const rows = dataRows();
+        const matchedRows = rows.filter((row) => !query || (row.dataset.search || "").includes(query));
+        const total = matchedRows.length;
+        const totalPages = Math.max(1, Math.ceil(total / pageSize));
+        page = Math.min(Math.max(page, 1), totalPages);
+        const start = total ? (page - 1) * pageSize : 0;
+        const end = Math.min(start + pageSize, total);
+        rows.forEach((row) => {{ row.hidden = true; }});
+        matchedRows.slice(start, end).forEach((row) => {{ row.hidden = false; }});
+        table.querySelectorAll(".sn-no-results").forEach((row) => {{ row.hidden = total !== 0; }});
+        pageStatus.textContent = total ? `${{start + 1}}-${{end}} of ${{total}}` : "0 of 0";
+        firstButton.disabled = page <= 1 || total === 0;
+        prevButton.disabled = page <= 1;
+        nextButton.disabled = page >= totalPages;
+        lastButton.disabled = page >= totalPages || total === 0;
+      }};
+
+      searchInput?.addEventListener("input", () => {{
+        page = 1;
+        apply();
+      }});
+      pageSizeSelect.addEventListener("change", () => {{
+        page = 1;
+        apply();
+      }});
+      firstButton.addEventListener("click", () => {{
+        page = 1;
+        apply();
+      }});
+      prevButton.addEventListener("click", () => {{
+        page -= 1;
+        apply();
+      }});
+      nextButton.addEventListener("click", () => {{
+        page += 1;
+        apply();
+      }});
+      lastButton.addEventListener("click", () => {{
+        const query = (searchInput?.value || "").trim().toLowerCase();
+        const pageSize = Number(pageSizeSelect.value) || 20;
+        const total = dataRows().filter((row) => !query || (row.dataset.search || "").includes(query)).length;
+        page = Math.max(1, Math.ceil(total / pageSize));
+        apply();
+      }});
+
+      const headers = Array.from(table.querySelectorAll("th[data-sort]"));
+      const tbody = table.tBodies[0];
+      let activeIndex = 0;
+      let activeDirection = "desc";
+      const cellValue = (row, index, type) => {{
+        const raw = row.cells[index]?.dataset.sort ?? row.cells[index]?.textContent ?? "";
+        if (type === "number") return Number(raw) || 0;
+        return raw.toLowerCase();
+      }};
+      const updateHeaderState = (index, direction) => {{
+        headers.forEach((header, headerIndex) => {{
+          header.setAttribute("aria-sort", headerIndex === index ? (direction === "asc" ? "ascending" : "descending") : "none");
+        }});
+      }};
+      const sortRows = (index, direction) => {{
+        const type = headers[index].dataset.sort;
+        const multiplier = direction === "asc" ? 1 : -1;
+        const trailingRows = Array.from(tbody.rows).filter((row) => row.classList.contains("sn-no-results"));
+        const rows = Array.from(tbody.rows).filter((row) => !trailingRows.includes(row));
+        rows.sort((left, right) => {{
+          const leftValue = cellValue(left, index, type);
+          const rightValue = cellValue(right, index, type);
+          if (type === "number") return (leftValue - rightValue) * multiplier;
+          return String(leftValue).localeCompare(String(rightValue)) * multiplier;
+        }});
+        rows.forEach((row) => tbody.appendChild(row));
+        trailingRows.forEach((row) => tbody.appendChild(row));
+        activeIndex = index;
+        activeDirection = direction;
+        updateHeaderState(index, direction);
+        apply();
+      }};
+      headers.forEach((header, index) => {{
+        header.querySelector("button")?.addEventListener("click", () => {{
+          const nextDirection =
+            activeIndex === index
+              ? (activeDirection === "asc" ? "desc" : "asc")
+              : (header.dataset.defaultDir || "asc");
+          sortRows(index, nextDirection);
+        }});
+      }});
+      apply();
+    }})();
+  </script>
+</body>
+</html>"""
+
+
 def dashboard_sync_loop(
     db_path: Path,
     blockbook_url: str,
@@ -7877,6 +8298,8 @@ def serve(
                     html_body = emissions_html(store, refresh_seconds=refresh_seconds)
                 elif parsed.path in MINERS_PATHS:
                     html_body = miners_html(refresh_seconds=refresh_seconds, snapshot=miners_snapshot(store))
+                elif parsed.path in SN_COMP_PATHS:
+                    html_body = sn_comp_html(refresh_seconds=refresh_seconds)
                 else:
                     self.send_error(404)
                     return
