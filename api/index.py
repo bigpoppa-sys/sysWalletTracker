@@ -526,7 +526,7 @@ class handler(BaseHTTPRequestHandler):
             elif parsed.path == MINERS_JSON_PATH:
                 html_body = json.dumps(miners_snapshot(), indent=2)
             elif parsed.path in SN_COMP_PATHS:
-                html_body = sn_comp_html(refresh_seconds=env_int("SYS_TRACKER_PAGE_REFRESH_SECONDS", 0))
+                html_body = sn_comp_html(store, refresh_seconds=env_int("SYS_TRACKER_PAGE_REFRESH_SECONDS", 0))
             else:
                 html_body = dashboard_html(
                     store,

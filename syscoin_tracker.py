@@ -4813,7 +4813,7 @@ def publish_static_snapshot(
     emissions_page = emissions_html(store, refresh_seconds=refresh_seconds)
     miners = miners_snapshot(store)
     miners_page = miners_html(refresh_seconds=refresh_seconds, snapshot=miners)
-    sn_comp_page = sn_comp_html(refresh_seconds=refresh_seconds)
+    sn_comp_page = sn_comp_html(store, refresh_seconds=refresh_seconds)
     atomic_write_text(output_dir / "index.html", index_html)
     atomic_write_text(output_dir / "wallet-flows.html", index_html)
     atomic_write_text(output_dir / "sentrynode.html", masternode_page)
@@ -7738,76 +7738,82 @@ def masternodes_html(
 </html>"""
 
 
-def sn_comp_html(refresh_seconds: int = 60) -> str:
-    mock_rows = [
-        {
-            "setup_time": 1_780_071_240,
-            "taken_down_time": None,
-            "seniority": {"label": "Level 2", "sort": 2, "class": "level-2"},
-            "collateral_address": "SUprcf5ez1jMC4mEyDRg6XTFGQRYCsp",
-            "source_txid": "2cc4b9c7594d1bf684190f9f906aee5f2504190f85a66a00d1a6557d72c7cf3e",
-            "source_vout": 0,
-            "service": "31.77.108.142:8369",
-            "status": "ENABLED",
-        },
-        {
-            "setup_time": 1_780_069_860,
-            "taken_down_time": None,
-            "seniority": {"label": "Base", "sort": 0, "class": "base"},
-            "collateral_address": "sys1q2ednqv9jkz6d7473j9emwzk8fl",
-            "source_txid": "cbd5c8a0c8d916bdf8c6d0662a73de35c90108a8e75e6a69e634fb2d94690194",
-            "source_vout": 0,
-            "service": "31.77.108.254:8369",
-            "status": "ENABLED",
-        },
-        {
-            "setup_time": 1_780_069_860,
-            "taken_down_time": None,
-            "seniority": {"label": "Base", "sort": 0, "class": "base"},
-            "collateral_address": "sys1qcwg5aav4z4w5zkk9h247uxcn",
-            "source_txid": "2b86486f3a62f61d69f70f0474488f9c465220e5f1518de163fd404169397e2c9",
-            "source_vout": 0,
-            "service": "31.77.108.30:8369",
-            "status": "ENABLED",
-        },
-        {
-            "setup_time": 1_780_069_860,
-            "taken_down_time": None,
-            "seniority": {"label": "Base", "sort": 0, "class": "base"},
-            "collateral_address": "sys1qg4gpm4gm0r0u2v3jw0zvqzhf",
-            "source_txid": "9ff07af9bcb64e69ea4dd17ba8d741d6e7e5b9f7d05b3d4c1351e42e59d3baf6",
-            "source_vout": 1,
-            "service": "31.77.108.15:8369",
-            "status": "ENABLED",
-        },
-        {
-            "setup_time": 1_780_104_960,
-            "taken_down_time": None,
-            "seniority": {"label": "Level 1", "sort": 1, "class": "level-1"},
-            "collateral_address": "sys1q4x9dz0tzjzupq8t0amr2x3j8jlj",
-            "source_txid": "c3b0a33fb48681f68d13f0085c5cc344eaa7fc4830c1ef89d41f78efbe6078d1",
-            "source_vout": 0,
-            "service": "45.91.12.44:8369",
-            "status": "POSE_BANNED",
-        },
-        {
-            "setup_time": 1_780_359_120,
-            "taken_down_time": 1_780_615_800,
-            "seniority": {"label": "Base", "sort": 0, "class": "base"},
-            "collateral_address": "sys1q8kq80g6t9g2pg4ymr6xt4zxn2um",
-            "source_txid": "acb196ef14a52d7de094097bd35a042b4ff7719c729b24a1f5859f305f65c789",
-            "source_vout": 0,
-            "service": "31.77.109.11:8369",
-            "status": "TAKEN_DOWN",
-        },
-    ]
-    entries_count = len(mock_rows)
-    taken_down_count = sum(1 for row in mock_rows if row["taken_down_time"] or row["status"] == "TAKEN_DOWN")
-    enabled_count = sum(1 for row in mock_rows if row["status"] == "ENABLED" and not row["taken_down_time"])
-    banned_count = sum(1 for row in mock_rows if row["status"] == "POSE_BANNED")
-    active_count = entries_count - taken_down_count
+def sn_comp_html(store: Store, refresh_seconds: int = 60) -> str:
+    if store.conn.execute("SELECT COUNT(*) AS count FROM network_masternodes").fetchone()["count"] == 0:
+        load_network_masternodes_csv(store)
+
+    network_rows = store.conn.execute(
+        """
+        SELECT *
+        FROM network_masternodes
+        WHERE COALESCE(registered_time, collateral_time, 0) >= ?
+          AND COALESCE(registered_time, collateral_time, 0) <= ?
+        ORDER BY COALESCE(registered_time, collateral_time, 0) DESC, collateral_address
+        """,
+        (SN_COMP_START_TS, SN_COMP_END_TS),
+    ).fetchall()
+    masternode_meta = store.get_meta("last_masternode_sync", {})
+    chain_height = int_or_none(masternode_meta.get("chain_height")) or max(
+        (
+            int_or_none(row[key]) or 0
+            for row in network_rows
+            for key in ("collateral_height", "registered_height", "last_paid_block")
+        ),
+        default=0,
+    )
+
+    def iso_timestamp(value: str | None) -> int:
+        if not value:
+            return 0
+        try:
+            parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return 0
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return int(parsed.timestamp())
+
+    def seniority_for(row: sqlite3.Row, reference_height: int | None = None) -> dict[str, Any]:
+        collateral_height = int_or_none(row["collateral_height"])
+        reference_height = reference_height if reference_height is not None else chain_height
+        if not collateral_height or not reference_height:
+            return {"label": "-", "sort": -1, "class": "unknown"}
+
+        blocks_since_collateral = max(reference_height - collateral_height, 0)
+        if blocks_since_collateral >= SENIORITY_LEVEL_2_BLOCKS:
+            return {"label": "Level 2", "sort": 2, "class": "level-2"}
+        if blocks_since_collateral >= SENIORITY_LEVEL_1_BLOCKS:
+            return {"label": "Level 1", "sort": 1, "class": "level-1"}
+        return {"label": "Base", "sort": 0, "class": "base"}
+
+    comp_rows = []
+    for row in network_rows:
+        setup_time = int_or_none(row["registered_time"]) or int_or_none(row["collateral_time"]) or 0
+        taken_down_time = int_or_none(row["taken_down_time"]) or iso_timestamp(row["removed_at"])
+        raw_status = (row["status"] or "").upper()
+        status = "" if raw_status == "TAKEN_DOWN" and not taken_down_time else raw_status
+        seniority_reference_height = int_or_none(row["taken_down_height"]) if taken_down_time else None
+        comp_rows.append(
+            {
+                "setup_time": setup_time,
+                "taken_down_time": taken_down_time,
+                "seniority": seniority_for(row, reference_height=seniority_reference_height),
+                "collateral_address": row["collateral_address"] or "",
+                "source_txid": row["source_txid"] or "",
+                "source_vout": int_or_none(row["source_vout"]) or 0,
+                "service": row["service"] or "-",
+                "status": "TAKEN_DOWN" if taken_down_time else status,
+            }
+        )
+
+    entries_count = len(comp_rows)
+    taken_down_count = sum(1 for row in comp_rows if row["taken_down_time"])
+    enabled_count = sum(1 for row in comp_rows if row["status"] == "ENABLED")
+    banned_count = sum(1 for row in comp_rows if row["status"] == "POSE_BANNED")
+    active_count = enabled_count
     days_remaining = max(0, int((SN_COMP_END_TS - int(time.time()) + 86_399) / 86_400))
-    updated_text = fmt_local_datetime(max(int(row["taken_down_time"] or row["setup_time"] or 0) for row in mock_rows))
+    latest_event_time = max((int(row["taken_down_time"] or row["setup_time"] or 0) for row in comp_rows), default=0)
+    updated_text = fmt_iso_local_datetime(masternode_meta.get("synced_at")) or fmt_local_datetime(latest_event_time) or "-"
 
     def comp_status_label(status: str) -> str:
         if status == "TAKEN_DOWN":
@@ -7843,8 +7849,13 @@ def sn_comp_html(refresh_seconds: int = 60) -> str:
             f"</tr>"
         )
 
-    rows_html = "\n".join(row_html(row) for row in sorted(mock_rows, key=lambda item: int(item["setup_time"]), reverse=True))
-    no_results_html = "<tr class='sn-no-results' hidden><td class='empty' colspan='7'>No matching comp entries.</td></tr>"
+    rows_html = "\n".join(row_html(row) for row in sorted(comp_rows, key=lambda item: int(item["setup_time"]), reverse=True))
+    no_results_text = (
+        "No competition Sentry Node collateral transactions found yet."
+        if entries_count == 0
+        else "No matching comp entries."
+    )
+    no_results_html = f"<tr class='sn-no-results' hidden><td class='empty' colspan='7'>{html.escape(no_results_text)}</td></tr>"
 
     return f"""<!doctype html>
 <html lang="en">
@@ -7923,6 +7934,7 @@ def sn_comp_html(refresh_seconds: int = 60) -> str:
     .seniority.base {{ background: #273234; color: #d7e1dd; }}
     .seniority.level-1 {{ background: #15304a; color: #b9dcff; }}
     .seniority.level-2 {{ background: #173823; color: #b7efc7; }}
+    .seniority.unknown {{ background: #2d3337; color: var(--muted); }}
     a {{ color: #56c9ff; text-decoration: none; }}
     @media(max-width: 920px) {{
       .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
@@ -7981,11 +7993,11 @@ def sn_comp_html(refresh_seconds: int = 60) -> str:
       </figure>
     </section>
     <section class="section-panel metrics">
-      <div class="metric"><span>Comp Opens</span><b>{html.escape(fmt_table_datetime(SN_COMP_START_TS))}</b><small><a href="https://x.com/syscoin/status/2060330572719751593?s=20"{NEW_TAB_ATTRS}>Source Post</a></small></div>
-      <div class="metric"><span>Comp Ends</span><b>{html.escape(fmt_table_datetime(SN_COMP_END_TS))}</b><small><strong>{days_remaining}</strong> days left · 03:00 UTC</small></div>
-      <div class="metric"><span>Entries</span><b>{entries_count}</b><small>Mock data</small></div>
-      <div class="metric"><span>Still Online</span><b>{active_count}</b><small>{enabled_count} enabled, {banned_count} banned</small></div>
-      <div class="metric"><span>Taken Down</span><b>{taken_down_count}</b><small>Updated <strong>{html.escape(updated_text)}</strong></small></div>
+      <div class="metric"><span>Entries</span><b>{entries_count}</b><small>Since <a href="https://x.com/syscoin/status/2060330572719751593?s=20"{NEW_TAB_ATTRS}>{html.escape(fmt_table_datetime(SN_COMP_START_TS))}</a></small></div>
+      <div class="metric"><span>Still Online</span><b>{active_count}</b><small>{enabled_count} enabled</small></div>
+      <div class="metric"><span>Banned</span><b>{banned_count}</b><small>Only qualifying comp rows</small></div>
+      <div class="metric"><span>Taken Down</span><b>{taken_down_count}</b><small>Only qualifying comp rows</small></div>
+      <div class="metric"><span>Updated</span><b>{html.escape(updated_text)}</b><small>Ends {html.escape(fmt_table_datetime(SN_COMP_END_TS))} · <strong>{days_remaining}</strong> days left</small></div>
     </section>
     <section class="section-panel">
       <div class="panel-title">
@@ -8299,7 +8311,7 @@ def serve(
                 elif parsed.path in MINERS_PATHS:
                     html_body = miners_html(refresh_seconds=refresh_seconds, snapshot=miners_snapshot(store))
                 elif parsed.path in SN_COMP_PATHS:
-                    html_body = sn_comp_html(refresh_seconds=refresh_seconds)
+                    html_body = sn_comp_html(store, refresh_seconds=refresh_seconds)
                 else:
                     self.send_error(404)
                     return
