@@ -80,6 +80,7 @@ SN_COMP_PATHS = ("/sn-comp", "/sn-comp.html")
 SN_COMP_HTML = "sn-comp.html"
 SN_COMP_START_TS = 1_780_056_062
 SN_COMP_END_TS = 1_785_121_200
+SN_COMP_SYSCOIN_POST_URL = "https://x.com/syscoin/status/2060330572719751593?s=20"
 SN_COMP_NODEHUB_POST_URL = "https://x.com/nodehubio/status/2060388388818063650?s=20"
 SN_COMP_NODEHUB_SYSCOIN_URL = "https://nodehub.io/dashboard/view_coin?coin=syscoin"
 SN_COMP_NODEHUB_IMAGE_URL = "https://pbs.twimg.com/media/HJf4A8DWgAUjod5.jpg?name=orig"
@@ -257,6 +258,13 @@ def fmt_local_datetime(ts: int | None, timezone_name: str = DEFAULT_TIMEZONE) ->
     return local.strftime("%b %-d, %Y %-I:%M %p")
 
 
+def fmt_utc_datetime(ts: int | None) -> str:
+    if not ts:
+        return ""
+    utc = dt.datetime.fromtimestamp(int(ts), tz=dt.timezone.utc)
+    return utc.strftime("%b %-d, %Y %-I:%M %p UTC")
+
+
 def fmt_local_date(ts: int | None, timezone_name: str = DEFAULT_TIMEZONE) -> str:
     if not ts:
         return "-"
@@ -271,6 +279,13 @@ def fmt_table_datetime(ts: int | None, timezone_name: str = DEFAULT_TIMEZONE) ->
     return local.strftime("%b %-d, %-I:%M %p")
 
 
+def fmt_utc_table_datetime(ts: int | None) -> str:
+    if not ts:
+        return ""
+    utc = dt.datetime.fromtimestamp(int(ts), tz=dt.timezone.utc)
+    return utc.strftime("%b %-d, %-I:%M %p UTC")
+
+
 def fmt_iso_local_datetime(value: str | None, timezone_name: str = DEFAULT_TIMEZONE) -> str:
     if not value:
         return ""
@@ -282,6 +297,19 @@ def fmt_iso_local_datetime(value: str | None, timezone_name: str = DEFAULT_TIMEZ
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=dt.timezone.utc)
     return parsed.astimezone(ZoneInfo(timezone_name)).strftime("%b %-d, %-I:%M %p")
+
+
+def fmt_iso_utc_datetime(value: str | None) -> str:
+    if not value:
+        return ""
+    text = value.replace("Z", "+00:00")
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return value
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc).strftime("%b %-d, %-I:%M %p UTC")
 
 
 def fmt_iso_local_date(value: str | None, timezone_name: str = DEFAULT_TIMEZONE) -> str:
@@ -7813,7 +7841,8 @@ def sn_comp_html(store: Store, refresh_seconds: int = 60) -> str:
     active_count = enabled_count
     days_remaining = max(0, int((SN_COMP_END_TS - int(time.time()) + 86_399) / 86_400))
     latest_event_time = max((int(row["taken_down_time"] or row["setup_time"] or 0) for row in comp_rows), default=0)
-    updated_text = fmt_iso_local_datetime(masternode_meta.get("synced_at")) or fmt_local_datetime(latest_event_time) or "-"
+    synced_at = masternode_meta.get("synced_at")
+    updated_text = fmt_iso_utc_datetime(synced_at) or fmt_utc_table_datetime(latest_event_time) or "-"
 
     def comp_status_label(status: str) -> str:
         if status == "TAKEN_DOWN":
@@ -7836,11 +7865,11 @@ def sn_comp_html(store: Store, refresh_seconds: int = 60) -> str:
         service = str(row["service"])
         status = comp_status_label(str(row["status"]))
         search_terms = html.escape(f"{collateral_address} {source_txid} {service} {status}".lower(), quote=True)
-        taken_down_text = fmt_table_datetime(taken_down_time) if taken_down_time else "-"
+        taken_down_text = fmt_utc_table_datetime(taken_down_time) if taken_down_time else "-"
         return (
             f"<tr data-search='{search_terms}'>"
-            f"<td data-sort='{setup_time}' title='{html.escape(fmt_local_datetime(setup_time))}'>{html.escape(fmt_table_datetime(setup_time))}</td>"
-            f"<td data-sort='{taken_down_time}' title='{html.escape(fmt_local_datetime(taken_down_time))}'>{html.escape(taken_down_text)}</td>"
+            f"<td data-sort='{setup_time}' title='{html.escape(fmt_utc_datetime(setup_time))}'>{html.escape(fmt_utc_table_datetime(setup_time))}</td>"
+            f"<td data-sort='{taken_down_time}' title='{html.escape(fmt_utc_datetime(taken_down_time))}'>{html.escape(taken_down_text)}</td>"
             f"<td data-sort='{seniority['sort']}'><span class='seniority {html.escape(seniority['class'])}'>{html.escape(seniority['label'])}</span></td>"
             f"<td class='address' data-sort='{html.escape(collateral_address.lower())}'><a href='{explorer_address_url(collateral_address)}' title='{html.escape(collateral_address)}'{NEW_TAB_ATTRS}>{html.escape(short_address(collateral_address))}</a></td>"
             f"<td class='address' data-sort='{html.escape(outpoint.lower())}'><a href='{explorer_tx_url(source_txid)}' title='{html.escape(outpoint)}'{NEW_TAB_ATTRS}>{html.escape(short_txid(source_txid))}:{source_vout}</a></td>"
@@ -7880,6 +7909,16 @@ def sn_comp_html(store: Store, refresh_seconds: int = 60) -> str:
     main {{ display: grid; gap: 22px; margin-top: 22px; margin-bottom: 22px; padding: 0; }}
     main > * {{ min-width: 0; }}
     .section-panel {{ background: var(--panel); border: 1px solid rgba(72, 142, 190, 0.34); border-radius: 8px; box-shadow: var(--shadow); min-width: 0; padding: 16px; }}
+    .campaign-panel {{ align-items: start; display: grid; gap: 18px; grid-template-columns: minmax(0, 1fr) minmax(260px, 0.42fr); }}
+    .campaign-copy {{ display: grid; gap: 12px; min-width: 0; }}
+    .campaign-copy h2 {{ font-size: clamp(1.35rem, 2vw, 1.85rem); line-height: 1.05; margin: 0; overflow-wrap: anywhere; }}
+    .campaign-copy p {{ color: var(--muted); font-size: 0.95rem; line-height: 1.45; margin: 0; max-width: 820px; overflow-wrap: anywhere; }}
+    .campaign-facts {{ border-left: 1px solid rgba(72, 142, 190, 0.34); display: grid; gap: 10px; min-width: 0; padding-left: 18px; }}
+    .campaign-fact {{ display: grid; gap: 3px; min-width: 0; }}
+    .campaign-fact span {{ color: var(--muted); font-size: 0.75rem; font-weight: 900; letter-spacing: 0.08em; text-transform: uppercase; }}
+    .campaign-fact b {{ color: var(--ink); font-size: 0.94rem; line-height: 1.25; overflow-wrap: anywhere; }}
+    .campaign-fact ul {{ color: var(--ink); display: grid; gap: 5px; line-height: 1.25; margin: 0; padding-left: 18px; }}
+    .campaign-fact li {{ font-size: 0.94rem; overflow-wrap: anywhere; }}
     .promo-panel {{ align-items: center; display: grid; gap: 18px; grid-template-columns: minmax(0, 0.95fr) minmax(320px, 0.72fr); }}
     .promo-copy {{ display: grid; gap: 12px; min-width: 0; }}
     .promo-kicker {{ color: var(--teal); font-size: 0.78rem; font-weight: 900; letter-spacing: 0.08em; text-transform: uppercase; }}
@@ -7938,6 +7977,8 @@ def sn_comp_html(store: Store, refresh_seconds: int = 60) -> str:
     a {{ color: #56c9ff; text-decoration: none; }}
     @media(max-width: 920px) {{
       .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .campaign-panel {{ grid-template-columns: 1fr; }}
+      .campaign-facts {{ border-left: 0; border-top: 1px solid rgba(72, 142, 190, 0.34); padding-left: 0; padding-top: 14px; }}
       .promo-panel {{ grid-template-columns: 1fr; }}
       .panel-title {{ align-items: start; flex-direction: column; }}
       .table-controls {{ align-items: stretch; flex-direction: column; }}
@@ -7976,14 +8017,28 @@ def sn_comp_html(store: Store, refresh_seconds: int = 60) -> str:
     </div>
   </header>
   <main>
+    <section class="section-panel campaign-panel">
+      <div class="campaign-copy">
+        <span class="promo-kicker">Official Syscoin Campaign</span>
+        <h2>Follow the new Sentry Nodes joining the campaign</h2>
+        <p>Syscoin is running a Sentry Node competition, and this page keeps a running count of new 100,000 SYS collateral transactions during the campaign. Entries are counted by the collateral transaction date, so the timing reflects when the SYS was put up.</p>
+        <div class="promo-actions">
+          <a class="promo-button primary" href="{html.escape(SN_COMP_SYSCOIN_POST_URL)}"{NEW_TAB_ATTRS}>View Syscoin Post</a>
+        </div>
+      </div>
+      <div class="campaign-facts" aria-label="Competition details">
+        <div class="campaign-fact"><span>Starts</span><b>{html.escape(fmt_utc_datetime(SN_COMP_START_TS))}</b></div>
+        <div class="campaign-fact"><span>Ends</span><b>{html.escape(fmt_utc_datetime(SN_COMP_END_TS))}</b></div>
+        <div class="campaign-fact"><span>Entry Rules</span><ul><li>Collateral transaction date within the campaign window</li><li>Node is running the whole time within the campaign window</li></ul></div>
+      </div>
+    </section>
     <section class="section-panel promo-panel">
       <div class="promo-copy">
         <span class="promo-kicker">NodeHub.io Offer</span>
         <h2>Free Sentry Node hosting for the first 30 days</h2>
-        <p>NodeHub.io posted support for the Syscoin new node campaign with free Sentry Node hosting until June 29.</p>
         <div class="promo-actions">
           <a class="promo-button primary" href="{html.escape(SN_COMP_NODEHUB_POST_URL)}"{NEW_TAB_ATTRS}>View NodeHub Post</a>
-          <a class="promo-button" href="{html.escape(SN_COMP_NODEHUB_SYSCOIN_URL)}"{NEW_TAB_ATTRS}>Open NodeHub Syscoin</a>
+          <a class="promo-button" href="{html.escape(SN_COMP_NODEHUB_SYSCOIN_URL)}"{NEW_TAB_ATTRS}>Host on NodeHub</a>
         </div>
       </div>
       <figure class="promo-media">
@@ -7993,16 +8048,16 @@ def sn_comp_html(store: Store, refresh_seconds: int = 60) -> str:
       </figure>
     </section>
     <section class="section-panel metrics">
-      <div class="metric"><span>Entries</span><b>{entries_count}</b><small>Since <a href="https://x.com/syscoin/status/2060330572719751593?s=20"{NEW_TAB_ATTRS}>{html.escape(fmt_table_datetime(SN_COMP_START_TS))}</a></small></div>
+      <div class="metric"><span>Entries</span><b>{entries_count}</b><small>Since <a href="{html.escape(SN_COMP_SYSCOIN_POST_URL)}"{NEW_TAB_ATTRS}>{html.escape(fmt_utc_table_datetime(SN_COMP_START_TS))}</a></small></div>
       <div class="metric"><span>Still Online</span><b>{active_count}</b><small>{enabled_count} enabled</small></div>
       <div class="metric"><span>Banned</span><b>{banned_count}</b><small>Only qualifying comp rows</small></div>
       <div class="metric"><span>Taken Down</span><b>{taken_down_count}</b><small>Only qualifying comp rows</small></div>
-      <div class="metric"><span>Updated</span><b>{html.escape(updated_text)}</b><small>Ends {html.escape(fmt_table_datetime(SN_COMP_END_TS))} · <strong>{days_remaining}</strong> days left</small></div>
+      <div class="metric"><span>Updated</span><b>{html.escape(updated_text)}</b><small>Ends {html.escape(fmt_utc_table_datetime(SN_COMP_END_TS))} · <strong>{days_remaining}</strong> days left</small></div>
     </section>
     <section class="section-panel">
       <div class="panel-title">
         <h2>Competition Sentry Nodes</h2>
-        <p>{html.escape(fmt_local_datetime(SN_COMP_START_TS))} to {html.escape(fmt_local_datetime(SN_COMP_END_TS))}</p>
+        <p>{html.escape(fmt_utc_datetime(SN_COMP_START_TS))} to {html.escape(fmt_utc_datetime(SN_COMP_END_TS))}</p>
       </div>
       <div class="table-controls" aria-label="SN comp table controls">
         <label class="search-control" for="sn-comp-search">
