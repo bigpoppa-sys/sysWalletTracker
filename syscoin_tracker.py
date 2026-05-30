@@ -7746,9 +7746,9 @@ def sn_comp_html(store: Store, refresh_seconds: int = 60) -> str:
         """
         SELECT *
         FROM network_masternodes
-        WHERE COALESCE(registered_time, collateral_time, 0) >= ?
-          AND COALESCE(registered_time, collateral_time, 0) <= ?
-        ORDER BY COALESCE(registered_time, collateral_time, 0) DESC, collateral_address
+        WHERE collateral_time >= ?
+          AND collateral_time <= ?
+        ORDER BY collateral_time DESC, collateral_address
         """,
         (SN_COMP_START_TS, SN_COMP_END_TS),
     ).fetchall()
@@ -7788,7 +7788,7 @@ def sn_comp_html(store: Store, refresh_seconds: int = 60) -> str:
 
     comp_rows = []
     for row in network_rows:
-        setup_time = int_or_none(row["registered_time"]) or int_or_none(row["collateral_time"]) or 0
+        setup_time = int_or_none(row["collateral_time"]) or 0
         taken_down_time = int_or_none(row["taken_down_time"]) or iso_timestamp(row["removed_at"])
         raw_status = (row["status"] or "").upper()
         status = "" if raw_status == "TAKEN_DOWN" and not taken_down_time else raw_status
@@ -8031,7 +8031,7 @@ def sn_comp_html(store: Store, refresh_seconds: int = 60) -> str:
         <table class="sn-comp-table">
           <thead>
             <tr>
-              <th data-sort="number" data-default-dir="desc" aria-sort="descending"><button class="sort-button" type="button">Date Setup<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="descending"><button class="sort-button" type="button">Transaction Date<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Date Taken Down<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Seniority<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Collateral Address<span class="sort-icon" aria-hidden="true"></span></button></th>
