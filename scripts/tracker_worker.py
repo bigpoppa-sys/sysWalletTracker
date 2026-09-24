@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import fcntl
 import gzip
 import json
@@ -52,11 +53,12 @@ def backup_database() -> dict:
     archive = destination / f"tracker-{stamp}.sqlite.gz"
     compressed_temp = archive.with_name(f".{archive.name}.tmp")
     try:
-        with sqlite3.connect(f"file:{DB}?mode=ro", uri=True) as source:
+        with closing(sqlite3.connect(f"file:{DB}?mode=ro", uri=True)) as source:
             if not source.execute("SELECT 1 FROM metadata LIMIT 1").fetchone():
                 raise RuntimeError("Refusing to rotate backups from an uninitialized tracker database")
-            with sqlite3.connect(temporary) as target:
+            with closing(sqlite3.connect(temporary)) as target:
                 source.backup(target, pages=512, sleep=0.05)
+                target.execute("PRAGMA journal_mode=DELETE")
                 if target.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                     raise RuntimeError("Backup integrity check failed")
         if shutil.disk_usage(DATA).free < int(temporary.stat().st_size * 1.01) + 15 * 1024**3:
@@ -169,8 +171,6 @@ def run_job(job: str, store: tracker.Store) -> dict:
         progress.update(confirmations=12, safe_height=result["safe_height"])
         store.set_meta("nevm_emission_index", progress)
         return result
-    if job == "backup":
-        return backup_database()
     if job == "health":
         jobs = {}
         for path in DATA.glob("job-*.json"):

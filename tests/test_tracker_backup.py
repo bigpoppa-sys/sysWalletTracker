@@ -59,6 +59,24 @@ class BackupTests(unittest.TestCase):
                 worker.backup_database()
         self.assertEqual(set(backups.iterdir()), set(previous))
 
+    def test_live_wal_database_produces_standalone_archive_without_sidecars(self):
+        self.seed()
+        writer = sqlite3.connect(self.db)
+        self.addCleanup(writer.close)
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("UPDATE metadata SET value='latest committed data'")
+        writer.commit()
+        result = worker.backup_database()
+        backups = self.data.parent / "backups"
+        archive = backups / result["archive"]
+        self.assertEqual(list(backups.iterdir()), [archive])
+        with gzip.open(archive, "rb") as source:
+            restored = sqlite3.connect(":memory:")
+            self.addCleanup(restored.close)
+            restored.deserialize(source.read())
+        self.assertEqual(restored.execute("PRAGMA quick_check").fetchone()[0], "ok")
+        self.assertEqual(restored.execute("SELECT value FROM metadata").fetchone()[0], "latest committed data")
+
     def test_backup_refuses_insufficient_working_space(self):
         self.seed()
         with patch.object(worker.shutil, "disk_usage", return_value=SimpleNamespace(free=15 * 1024**3)):
