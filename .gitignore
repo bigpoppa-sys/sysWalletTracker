@@ -9,8 +9,8 @@ node_modules/
 .ssh/
 handoff.md
 reports/
-pyproject.toml
-uv.lock
+.playwright-cli/
+output/
 destinations*.csv
 
 .vercel

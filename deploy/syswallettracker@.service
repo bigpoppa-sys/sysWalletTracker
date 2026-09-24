@@ -1,0 +1,27 @@
+[Unit]
+Description=SysWalletTracker %i job
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=syswallettracker
+Group=syswallettracker
+Slice=syswallettracker.slice
+WorkingDirectory=/srv/syswallettracker/app
+EnvironmentFile=-/srv/syswallettracker/data/worker.env
+ExecStart=/usr/bin/python3 /srv/syswallettracker/app/scripts/tracker_worker.py %i
+TimeoutStartSec=30min
+Nice=10
+CPUQuota=75%
+MemoryHigh=1200M
+MemoryMax=1800M
+MemorySwapMax=512M
+IOWeight=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/syswallettracker/data /srv/syswallettracker/backups /var/www/html/syswallettracker
+ReadOnlyPaths=/srv/syswallettracker/core
+UMask=0022

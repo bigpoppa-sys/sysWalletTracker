@@ -1,0 +1,11 @@
+[Unit]
+Description=Verify sentry transaction dates against block data
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=15s
+Unit=syswallettracker@times.service
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

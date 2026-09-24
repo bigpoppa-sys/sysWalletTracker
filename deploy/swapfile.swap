@@ -1,0 +1,8 @@
+[Unit]
+Description=Local swap for temporary memory pressure
+
+[Swap]
+What=/swapfile
+
+[Install]
+WantedBy=swap.target

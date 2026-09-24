@@ -51,7 +51,7 @@ except ImportError:  # pragma: no cover - compatibility for Python 3.8 VPS cron
 
 DEFAULT_BLOCKBOOK_URL = "https://explorer-blockbook.syscoin.org"
 DEFAULT_ADDRESS = "sys1qync7erear7cvpkysvv0a28mj45g2ps0kq9c6qs"
-DEFAULT_TIMEZONE = "Australia/Sydney"
+DEFAULT_TIMEZONE = os.getenv("SYS_TRACKER_TIMEZONE", "Australia/Sydney")
 DEFAULT_EXCHANGE_TAGS_PATH = Path("exchange_tags.csv")
 DEFAULT_EXCHANGE_ROUTES_PATH = Path("exchange_routes.csv")
 DEFAULT_EXCHANGE_HOT_WALLETS_PATH = Path("exchange_hot_wallets.csv")
@@ -59,6 +59,10 @@ DEFAULT_EXCHANGE_COLD_WALLETS_PATH = Path("exchange_cold_wallets.csv")
 DEFAULT_WALLET_LABELS_PATH = Path("wallet_labels.csv")
 DEFAULT_MINER_ADDRESSES_PATH = Path("miner_addresses.csv")
 DEFAULT_NETWORK_MASTERNODES_PATH = Path("network_masternodes.csv")
+DEFAULT_SYSNODE_MNLIST_URL = "https://sysnode.info/mnlist"
+DEFAULT_SYSNODE_MNSTATS_URL = "https://sysnode.info/mnstats"
+DEFAULT_SYSNODE_TIME_LOOKUP_LIMIT = 900
+DEFAULT_SYSNODE_TIME_WINDOW_MARGIN_BLOCKS = 288
 DEFAULT_NODE_OUTPUTS_PATH = Path("node_outputs.csv")
 DEFAULT_VERIFIED_SENTRIES_PATH = Path("verified_sentries.csv")
 DEFAULT_MONITORING_FROM_HEIGHT = 2221358
@@ -130,6 +134,7 @@ SENTRY_REWARD_RATIOS = {
 }
 EMISSION_SUBSET_TOLERANCE_SATS = 25_000
 DB_WRITE_LOCK = threading.Lock()
+DISABLED_ENV_VALUES = {"", "0", "false", "none", "off", "no", "disabled"}
 
 
 def utc(ts: int | None) -> str:
@@ -161,6 +166,36 @@ def int_or_none(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def is_disabled_env_value(value: str | None) -> bool:
+    return (value or "").strip().lower() in DISABLED_ENV_VALUES
+
+
+def ssl_context_for_url(url: str, insecure_tls: bool = False) -> ssl.SSLContext | None:
+    if not url.startswith("https://"):
+        return None
+    if insecure_tls:
+        return ssl._create_unverified_context()
+
+    candidates = [
+        os.getenv("SSL_CERT_FILE"),
+        os.getenv("REQUESTS_CA_BUNDLE"),
+        "/etc/ssl/cert.pem",
+        "/opt/homebrew/etc/ca-certificates/cert.pem",
+        "/usr/local/etc/openssl@3/cert.pem",
+    ]
+    try:
+        import certifi  # type: ignore
+
+        candidates.insert(0, certifi.where())
+    except Exception:
+        pass
+
+    for cafile in candidates:
+        if cafile and Path(cafile).exists():
+            return ssl.create_default_context(cafile=cafile)
+    return ssl.create_default_context()
 
 
 def hex_int(value: Any) -> int:
@@ -255,7 +290,7 @@ def fmt_local_datetime(ts: int | None, timezone_name: str = DEFAULT_TIMEZONE) ->
     if not ts:
         return ""
     local = dt.datetime.fromtimestamp(int(ts), tz=dt.timezone.utc).astimezone(ZoneInfo(timezone_name))
-    return local.strftime("%b %-d, %Y %-I:%M %p")
+    return local.strftime("%b %-d, %Y %-I:%M %p") + (" UTC" if timezone_name == "UTC" else "")
 
 
 def fmt_utc_datetime(ts: int | None) -> str:
@@ -276,7 +311,7 @@ def fmt_table_datetime(ts: int | None, timezone_name: str = DEFAULT_TIMEZONE) ->
     if not ts:
         return ""
     local = dt.datetime.fromtimestamp(int(ts), tz=dt.timezone.utc).astimezone(ZoneInfo(timezone_name))
-    return local.strftime("%b %-d, %-I:%M %p")
+    return local.strftime("%b %-d, %-I:%M %p") + (" UTC" if timezone_name == "UTC" else "")
 
 
 def fmt_utc_table_datetime(ts: int | None) -> str:
@@ -296,7 +331,7 @@ def fmt_iso_local_datetime(value: str | None, timezone_name: str = DEFAULT_TIMEZ
         return value
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=dt.timezone.utc)
-    return parsed.astimezone(ZoneInfo(timezone_name)).strftime("%b %-d, %-I:%M %p")
+    return parsed.astimezone(ZoneInfo(timezone_name)).strftime("%b %-d, %-I:%M %p") + (" UTC" if timezone_name == "UTC" else "")
 
 
 def fmt_iso_utc_datetime(value: str | None) -> str:
@@ -553,29 +588,7 @@ class BlockbookClient:
         self.ssl_context = self._ssl_context()
 
     def _ssl_context(self) -> ssl.SSLContext | None:
-        if not self.base_url.startswith("https://"):
-            return None
-        if self.insecure_tls:
-            return ssl._create_unverified_context()
-
-        candidates = [
-            os.getenv("SSL_CERT_FILE"),
-            os.getenv("REQUESTS_CA_BUNDLE"),
-            "/etc/ssl/cert.pem",
-            "/opt/homebrew/etc/ca-certificates/cert.pem",
-            "/usr/local/etc/openssl@3/cert.pem",
-        ]
-        try:
-            import certifi  # type: ignore
-
-            candidates.insert(0, certifi.where())
-        except Exception:
-            pass
-
-        for cafile in candidates:
-            if cafile and Path(cafile).exists():
-                return ssl.create_default_context(cafile=cafile)
-        return ssl.create_default_context()
+        return ssl_context_for_url(self.base_url, self.insecure_tls)
 
     def get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
         query = urllib.parse.urlencode({k: v for k, v in (params or {}).items() if v is not None})
@@ -811,10 +824,92 @@ def block_times_from_heights(rpc: SyscoinRpcClient, heights: Iterable[int]) -> d
     return times
 
 
-def network_masternode_rows_from_rpc(rpc: SyscoinRpcClient) -> list[dict[str, Any]]:
-    result = rpc.call("masternode_list", ["json"])
+def block_times_from_blockbook(
+    client: BlockbookClient,
+    heights: Iterable[int],
+    *,
+    max_workers: int = 2,
+) -> dict[int, int | None]:
+    unique_heights = sorted(set(int(height) for height in heights if height))
+    if not unique_heights:
+        return {}
+
+    times: dict[int, int | None] = {}
+
+    def fetch_one(height: int) -> tuple[int, int | None]:
+        try:
+            block = client.block(height)
+            return height, int_or_none(block.get("time") or block.get("blockTime"))
+        except Exception:
+            return height, None
+
+    workers = max(1, min(max_workers, len(unique_heights)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        for height, block_time in executor.map(fetch_one, unique_heights):
+            times[height] = block_time
+    return times
+
+
+def tx_times_from_blockbook(
+    client: BlockbookClient,
+    txids: Iterable[str],
+    *,
+    max_workers: int = 2,
+) -> dict[str, int | None]:
+    unique_txids = sorted(set(txid for txid in txids if txid))
+    if not unique_txids:
+        return {}
+
+    times: dict[str, int | None] = {}
+
+    def fetch_one(txid: str) -> tuple[str, int | None]:
+        try:
+            tx = client.tx(txid)
+            return txid, int_or_none(tx.get("blockTime"))
+        except Exception:
+            return txid, None
+
+    workers = max(1, min(max_workers, len(unique_txids)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        for txid, block_time in executor.map(fetch_one, unique_txids):
+            times[txid] = block_time
+    return times
+
+
+def blockbook_tip_height_time(client: BlockbookClient) -> tuple[int | None, int | None]:
+    info = client.info()
+    blockbook_info = info.get("blockbook", {}) if isinstance(info, dict) else {}
+    backend_info = info.get("backend", {}) if isinstance(info, dict) else {}
+    height = int_or_none(blockbook_info.get("bestHeight")) or int_or_none(backend_info.get("blocks"))
+    time_value = blockbook_info.get("lastBlockTime")
+    timestamp: int | None = None
+    if time_value:
+        try:
+            timestamp = int(dt.datetime.fromisoformat(str(time_value).replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            timestamp = None
+    return height, timestamp
+
+
+def estimate_block_time_from_tip(height: int, tip_height: int, tip_time: int) -> int:
+    return int(tip_time - max(0, tip_height - height) * UTXO_BLOCK_TARGET_SECONDS)
+
+
+def estimate_block_height_from_tip(target_ts: int, tip_height: int, tip_time: int) -> int:
+    return max(0, int(round(tip_height - ((tip_time - target_ts) / UTXO_BLOCK_TARGET_SECONDS))))
+
+
+def parsed_network_masternode_entries(
+    result: Any,
+) -> tuple[list[tuple[str, int, dict[str, Any], int | None, int | None]], set[int]]:
     if not isinstance(result, dict):
-        return []
+        return [], set()
+
+    def first_present(info: dict[str, Any], keys: Iterable[str]) -> Any:
+        for key in keys:
+            if key in info and info[key] is not None and info[key] != "":
+                return info[key]
+        return None
 
     parsed_rows: list[tuple[str, int, dict[str, Any], int | None, int | None]] = []
     heights: set[int] = set()
@@ -823,21 +918,43 @@ def network_masternode_rows_from_rpc(rpc: SyscoinRpcClient) -> list[dict[str, An
             continue
         outpoint = normalize_outpoint(str(outpoint_key))
         if ":" not in outpoint:
-            continue
-        source_txid, source_vout_text = outpoint.rsplit(":", 1)
+            source_txid = first_present(
+                info,
+                ("collateralHash", "collateralTxHash", "collateralhash", "collateraltxhash", "txhash"),
+            )
+            source_vout = first_present(
+                info,
+                ("collateralIndex", "collateralOutpointIndex", "collateralindex", "collateraloutpointindex", "outputidx"),
+            )
+            if source_txid is None or source_vout is None:
+                continue
+        else:
+            source_txid, source_vout_text = outpoint.rsplit(":", 1)
+            try:
+                source_vout = int(source_vout_text)
+            except ValueError:
+                continue
         try:
-            source_vout = int(source_vout_text)
-        except ValueError:
+            source_vout_int = int(source_vout)
+        except (TypeError, ValueError):
             continue
-        collateral_height = int(info["collateralheight"]) if info.get("collateralheight") is not None else None
-        registered_height = int(info["registeredheight"]) if info.get("registeredheight") is not None else None
+
+        collateral_height = int_or_none(info.get("collateralheight"))
+        registered_height = int_or_none(info.get("registeredheight"))
         if collateral_height:
             heights.add(collateral_height)
         if registered_height:
             heights.add(registered_height)
-        parsed_rows.append((source_txid, source_vout, info, collateral_height, registered_height))
+        parsed_rows.append((str(source_txid), source_vout_int, info, collateral_height, registered_height))
 
-    height_times = block_times_from_heights(rpc, heights)
+    return parsed_rows, heights
+
+
+def network_masternode_rows_from_masternode_list(
+    result: Any,
+    height_times: dict[int, int | None],
+) -> list[dict[str, Any]]:
+    parsed_rows, _heights = parsed_network_masternode_entries(result)
     rows: list[dict[str, Any]] = []
     seen_at = now_iso()
     for source_txid, source_vout, info, collateral_height, registered_height in parsed_rows:
@@ -858,8 +975,8 @@ def network_masternode_rows_from_rpc(rpc: SyscoinRpcClient) -> list[dict[str, An
                 "collateral_time": height_times.get(collateral_height) if collateral_height else None,
                 "registered_height": registered_height,
                 "registered_time": height_times.get(registered_height) if registered_height else None,
-                "last_paid_time": int(info["lastpaidtime"]) if info.get("lastpaidtime") else None,
-                "last_paid_block": int(info["lastpaidblock"]) if info.get("lastpaidblock") else None,
+                "last_paid_time": int_or_none(info.get("lastpaidtime")),
+                "last_paid_block": int_or_none(info.get("lastpaidblock")),
                 "first_seen_at": seen_at,
                 "last_seen_at": seen_at,
                 "removed_at": "",
@@ -872,11 +989,157 @@ def network_masternode_rows_from_rpc(rpc: SyscoinRpcClient) -> list[dict[str, An
     return rows
 
 
+def network_masternode_rows_from_rpc(rpc: SyscoinRpcClient) -> list[dict[str, Any]]:
+    result = rpc.call("masternode_list", ["json"])
+    _parsed_rows, heights = parsed_network_masternode_entries(result)
+    return network_masternode_rows_from_masternode_list(result, block_times_from_heights(rpc, heights))
+
+
+def fill_network_masternode_times_from_store(store: Store, rows: list[dict[str, Any]]) -> None:
+    existing_rows = store.conn.execute(
+        """
+        SELECT outpoint, collateral_height, collateral_time,
+               registered_height, registered_time, pro_tx_hash
+        FROM network_masternodes
+        """
+    ).fetchall()
+    existing_by_outpoint = {row["outpoint"]: row for row in existing_rows}
+    for row in rows:
+        existing = existing_by_outpoint.get(row["outpoint"])
+        if not existing:
+            continue
+        if row.get("collateral_time") is None and row.get("collateral_height") == existing["collateral_height"]:
+            row["collateral_time"] = int_or_none(existing["collateral_time"])
+        if (
+            row.get("registered_time") is None
+            and row.get("registered_height") == existing["registered_height"]
+            and row.get("pro_tx_hash") == existing["pro_tx_hash"]
+        ):
+            row["registered_time"] = int_or_none(existing["registered_time"])
+
+
+def resolve_missing_network_masternode_times_from_blockbook(
+    client: BlockbookClient,
+    rows: list[dict[str, Any]],
+    *,
+    max_lookups: int = DEFAULT_SYSNODE_TIME_LOOKUP_LIMIT,
+    scope: str = "full",
+) -> dict[str, int]:
+    max_lookups = max(0, max_lookups)
+    tip_height: int | None = None
+    tip_time: int | None = None
+    missing: set[int] = set()
+    for row in rows:
+        for height_key, time_key in (("collateral_height", "collateral_time"), ("registered_height", "registered_time")):
+            height = int_or_none(row.get(height_key))
+            if height and int_or_none(row.get(time_key)) is None:
+                missing.add(height)
+    if not missing or max_lookups == 0:
+        return {"needed": len(missing), "looked_up": 0, "filled": 0, "estimated": 0}
+
+    selected: set[int] = set()
+    try:
+        tip_height, tip_time = blockbook_tip_height_time(client)
+    except Exception:
+        try:
+            tip_height = fetch_sysnode_chain_height()
+        except Exception:
+            tip_height = None
+        tip_time = int(time.time()) if tip_height else None
+
+    try:
+        if tip_height and tip_time:
+            margin = int_or_none(os.getenv("SYS_SYSNODE_TIME_WINDOW_MARGIN_BLOCKS")) or DEFAULT_SYSNODE_TIME_WINDOW_MARGIN_BLOCKS
+            start_height = estimate_block_height_from_tip(SN_COMP_START_TS, tip_height, tip_time)
+            end_height = estimate_block_height_from_tip(SN_COMP_END_TS, tip_height, tip_time)
+            for row in rows:
+                collateral_height = int_or_none(row.get("collateral_height"))
+                if (
+                    collateral_height
+                    and int_or_none(row.get("collateral_time")) is None
+                    and start_height - margin <= collateral_height <= end_height + margin
+                ):
+                    selected.add(collateral_height)
+                if scope != "sn_comp":
+                    registered_height = int_or_none(row.get("registered_height"))
+                    if (
+                        registered_height
+                        and int_or_none(row.get("registered_time")) is None
+                        and start_height - margin <= registered_height <= end_height + margin
+                    ):
+                        selected.add(registered_height)
+    except Exception:
+        selected = set()
+
+    priority_heights = selected
+    candidates = missing if scope != "sn_comp" else priority_heights
+    lookup_heights = set(sorted(candidates, key=lambda height: (height not in priority_heights, -height))[:max_lookups])
+    height_times = block_times_from_blockbook(client, lookup_heights)
+    tx_time_candidates = {
+        str(row.get("source_txid") or "")
+        for row in rows
+        if int_or_none(row.get("collateral_height")) in lookup_heights
+        and int_or_none(row.get("collateral_time")) is None
+        and height_times.get(int_or_none(row.get("collateral_height"))) is None
+    }
+    tx_times = tx_times_from_blockbook(client, tx_time_candidates) if lookup_heights else {}
+    filled = 0
+    for row in rows:
+        for height_key, time_key in (("collateral_height", "collateral_time"), ("registered_height", "registered_time")):
+            if int_or_none(row.get(time_key)) is not None:
+                continue
+            height = int_or_none(row.get(height_key))
+            if height not in lookup_heights:
+                continue
+            block_time = height_times.get(height) if height else None
+            if block_time is None and time_key == "collateral_time":
+                block_time = tx_times.get(str(row.get("source_txid") or ""))
+            if block_time is not None and block_time > 0:
+                row[time_key] = block_time
+                filled += 1
+    return {"needed": len(missing), "looked_up": len(lookup_heights), "filled": filled, "estimated": 0}
+
+
+def fetch_sysnode_masternode_list(
+    url: str | None = None,
+    *,
+    timeout: int = 15,
+    insecure_tls: bool = False,
+) -> Any:
+    url = (url if url is not None else os.getenv("SYS_SYSNODE_MNLIST_URL", DEFAULT_SYSNODE_MNLIST_URL)).strip()
+    if is_disabled_env_value(url):
+        return None
+    req = urllib.request.Request(url, headers={"User-Agent": "syscoin-tracker/0.1"})
+    with urllib.request.urlopen(req, timeout=timeout, context=ssl_context_for_url(url, insecure_tls)) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def fetch_sysnode_chain_height(
+    url: str | None = None,
+    *,
+    timeout: int = 10,
+    insecure_tls: bool = False,
+) -> int | None:
+    url = (url if url is not None else os.getenv("SYS_SYSNODE_MNSTATS_URL", DEFAULT_SYSNODE_MNSTATS_URL)).strip()
+    if is_disabled_env_value(url):
+        return None
+    req = urllib.request.Request(url, headers={"User-Agent": "syscoin-tracker/0.1"})
+    with urllib.request.urlopen(req, timeout=timeout, context=ssl_context_for_url(url, insecure_tls)) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    blockchain_stats = (((payload or {}).get("stats") or {}).get("blockchain_stats") or {}) if isinstance(payload, dict) else {}
+    raw_height = blockchain_stats.get("connections") or blockchain_stats.get("current_block") or blockchain_stats.get("block_height")
+    if isinstance(raw_height, str):
+        raw_height = raw_height.replace(",", "").strip()
+    return int_or_none(raw_height)
+
+
 def write_network_masternodes_csv(rows: list[dict[str, Any]], path: Path) -> None:
-    with path.open("w", newline="") as f:
+    temporary = path.with_name(f".{path.name}.tmp")
+    with temporary.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=NETWORK_MASTERNODE_HEADERS, extrasaction="ignore", lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
+    temporary.replace(path)
 
 
 def network_masternode_rows_from_store(store: Store) -> list[dict[str, Any]]:
@@ -1702,6 +1965,45 @@ def analyze_tx(tx: dict[str, Any], watched: set[str]) -> tuple[dict[str, Any] | 
     return movement, outputs
 
 
+def _iter_address_pages(
+    client: BlockbookClient,
+    address: str,
+    *,
+    page_size: int,
+    max_pages: int | None,
+    from_height: int | None,
+) -> Iterable[tuple[int, int, dict[str, Any]]]:
+    page = 1
+    seen_pages: set[frozenset[str]] = set()
+    while max_pages is None or page <= max_pages:
+        data = client.address(address, page=page, page_size=page_size, details="txs", from_height=from_height)
+        response_page = data.get("page")
+        if response_page is not None and int(response_page) != page:
+            raise RuntimeError(f"Blockbook {address}: requested page {page}, returned page {response_page}")
+
+        txs = data.get("transactions") or []
+        if txs:
+            txids = frozenset(tx["txid"] for tx in txs)
+            if txids in seen_pages:
+                raise RuntimeError(f"Blockbook {address}: repeated transactions on page {page}")
+            seen_pages.add(txids)
+
+        total_pages = int(data.get("totalPages", 1) or 1)
+        yield page, total_pages, data
+
+        if total_pages >= 0:
+            if page >= total_pages:
+                break
+        else:
+            # Blockbook can report an unknown total and cap the requested page size.
+            capacity = int_or_none(data.get("itemsOnPage")) or page_size
+            if capacity <= 0:
+                capacity = page_size
+            if not txs or len(txs) < capacity:
+                break
+        page += 1
+
+
 def sync_address(
     store: Store,
     client: BlockbookClient,
@@ -1713,23 +2015,23 @@ def sync_address(
     watched: set[str],
     quiet: bool = False,
 ) -> dict[str, int]:
-    page = 1
     seen = 0
     inserted = 0
     outbound = 0
-    total_pages = 1
     latest_summary: dict[str, Any] | None = None
 
-    while page <= total_pages:
-        data = client.address(address, page=page, page_size=page_size, details="txs", from_height=from_height)
+    for page, total_pages, data in _iter_address_pages(
+        client, address, page_size=page_size, max_pages=max_pages, from_height=from_height
+    ):
         latest_summary = {k: v for k, v in data.items() if k != "transactions"}
-        total_pages = int(data.get("totalPages", 1) or 1)
-        if max_pages is not None:
-            total_pages = min(total_pages, max_pages)
 
         txs = data.get("transactions") or []
         if not quiet:
-            print(f"Fetched page {page}/{total_pages}: {len(txs)} transactions", file=sys.stderr)
+            if total_pages < 0:
+                page_count = "?"
+            else:
+                page_count = str(total_pages if max_pages is None else min(total_pages, max_pages))
+            print(f"Fetched page {page}/{page_count}: {len(txs)} transactions", file=sys.stderr)
 
         for tx in txs:
             was_inserted = store.save_tx(tx)
@@ -1742,7 +2044,6 @@ def sync_address(
                 store.save_output(output)
             seen += 1
         store.conn.commit()
-        page += 1
 
     if latest_summary:
         store.set_meta(
@@ -1770,20 +2071,15 @@ def find_spending_tx(
     max_pages: int | None,
     from_height: int | None,
 ) -> dict[str, Any] | None:
-    page = 1
-    total_pages = 1
-    while page <= total_pages:
-        data = client.address(address, page=page, page_size=page_size, details="txs", from_height=from_height)
-        total_pages = int(data.get("totalPages", 1) or 1)
-        if max_pages is not None:
-            total_pages = min(total_pages, max_pages)
+    for _, _, data in _iter_address_pages(
+        client, address, page_size=page_size, max_pages=max_pages, from_height=from_height
+    ):
         for tx in data.get("transactions") or []:
             if tx.get("txid") == source_txid:
                 continue
             for vin in tx.get("vin") or []:
                 if vin.get("txid") == source_txid and input_prev_vout(vin) == source_vout:
                     return tx
-        page += 1
     return None
 
 
@@ -1850,11 +2146,32 @@ def sync_network_masternodes(
     store: Store,
     rpc: SyscoinRpcClient,
     client: BlockbookClient | None = None,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     rows = network_masternode_rows_from_rpc(rpc)
     try:
         chain_height = int(rpc.call("getblockcount"))
     except Exception:
+        chain_height = max(
+            (
+                int_or_none(row.get(key)) or 0
+                for row in rows
+                for key in ("collateral_height", "registered_height", "last_paid_block")
+            ),
+            default=0,
+        )
+    return sync_network_masternodes_from_rows(store, rows, client=client, chain_height=chain_height, source="rpc")
+
+
+def sync_network_masternodes_from_rows(
+    store: Store,
+    rows: list[dict[str, Any]],
+    *,
+    client: BlockbookClient | None = None,
+    chain_height: int | None = None,
+    source: str = "feed",
+    trace_removed: bool = True,
+) -> dict[str, Any]:
+    if chain_height is None:
         chain_height = max(
             (
                 int_or_none(row.get(key)) or 0
@@ -1877,7 +2194,7 @@ def sync_network_masternodes(
     for row in existing_rows:
         if row["outpoint"] in current_outpoints or row["removed_at"]:
             continue
-        trace = trace_masternode_collateral_spend(client, row) if client is not None else {}
+        trace = trace_masternode_collateral_spend(client, row) if trace_removed and client is not None else {}
         if trace.get("taken_down_txid"):
             traced += 1
         store.mark_network_masternode_removed(
@@ -1898,8 +2215,61 @@ def sync_network_masternodes(
         "traced": traced,
         "enabled": sum(1 for row in rows if str(row.get("status", "")).upper() == "ENABLED"),
         "chain_height": chain_height,
+        "source": source,
     }
     store.set_meta("last_masternode_sync", {"synced_at": synced_at, **stats})
+    return stats
+
+
+def sync_network_masternodes_from_sysnode(
+    store: Store,
+    client: BlockbookClient,
+    *,
+    url: str | None = None,
+    time_lookup_limit: int | None = None,
+    time_lookup_scope: str = "full",
+    trace_removed: bool = False,
+) -> dict[str, Any] | None:
+    url = (url if url is not None else os.getenv("SYS_SYSNODE_MNLIST_URL", DEFAULT_SYSNODE_MNLIST_URL)).strip()
+    if is_disabled_env_value(url):
+        return None
+    payload = fetch_sysnode_masternode_list(url)
+    _parsed_rows, heights = parsed_network_masternode_entries(payload)
+    rows = network_masternode_rows_from_masternode_list(payload, {})
+    if not rows:
+        raise RuntimeError(f"Sysnode masternode feed returned no parseable rows: {url}")
+    fill_network_masternode_times_from_store(store, rows)
+    lookup_limit = time_lookup_limit
+    if lookup_limit is None:
+        lookup_limit = int_or_none(os.getenv("SYS_SYSNODE_TIME_LOOKUP_LIMIT")) or DEFAULT_SYSNODE_TIME_LOOKUP_LIMIT
+    time_stats = resolve_missing_network_masternode_times_from_blockbook(
+        client,
+        rows,
+        max_lookups=lookup_limit,
+        scope=time_lookup_scope,
+    )
+    try:
+        chain_height, _tip_time = blockbook_tip_height_time(client)
+    except Exception:
+        try:
+            chain_height = fetch_sysnode_chain_height()
+        except Exception:
+            chain_height = None
+    if chain_height is None:
+        chain_height = max(heights, default=0)
+    stats = sync_network_masternodes_from_rows(
+        store,
+        rows,
+        client=client,
+        chain_height=chain_height,
+        source=url,
+        trace_removed=trace_removed,
+    )
+    stats["time_lookup_needed"] = time_stats["needed"]
+    stats["time_lookup_heights"] = time_stats["looked_up"]
+    stats["time_lookup_filled"] = time_stats["filled"]
+    stats["time_lookup_estimated"] = time_stats["estimated"]
+    stats["time_lookup_scope"] = time_lookup_scope
     return stats
 
 
@@ -2196,6 +2566,7 @@ def sync_emission_index(
     to_height: int | None = None,
     reset: bool = False,
     batch_size: int = 50,
+    confirmations: int = 0,
 ) -> dict[str, Any]:
     if reset:
         reset_emission_index(store, start_height=start_height)
@@ -2205,7 +2576,9 @@ def sync_emission_index(
     if last_height is None or last_height < start_height - 1:
         last_height = start_height - 1
     chain_height = int(rpc.call("getblockcount"))
-    target_height = min(chain_height, to_height if to_height is not None else chain_height)
+    confirmations = max(0, confirmations)
+    safe_height = max(0, chain_height - confirmations)
+    target_height = min(safe_height, to_height if to_height is not None else safe_height)
     if max_blocks is not None:
         target_height = min(target_height, last_height + max_blocks)
 
@@ -2217,9 +2590,11 @@ def sync_emission_index(
         "last_height": last_height,
         "target_height": target_height,
         "chain_height": chain_height,
+        "confirmations": confirmations,
+        "safe_height": safe_height,
     }
     if target_height <= last_height:
-        progress.update({"chain_height": chain_height, "synced_at": now_iso()})
+        progress.update({"chain_height": chain_height, "safe_height": safe_height, "synced_at": now_iso()})
         store.set_meta("emission_index", progress)
         return totals
 
@@ -2350,6 +2725,7 @@ def sync_nevm_emission_index(
     to_height: int | None = None,
     reset: bool = False,
     batch_size: int = 50,
+    confirmations: int = 0,
 ) -> dict[str, Any]:
     if reset:
         reset_nevm_emission_index(store, start_height=start_height)
@@ -2359,7 +2735,9 @@ def sync_nevm_emission_index(
     if last_height is None or last_height < start_height - 1:
         last_height = start_height - 1
     chain_height = hex_int(rpc.call("eth_blockNumber"))
-    target_height = min(chain_height, to_height if to_height is not None else chain_height)
+    confirmations = max(0, confirmations)
+    safe_height = max(0, chain_height - confirmations)
+    target_height = min(safe_height, to_height if to_height is not None else safe_height)
     if max_blocks is not None:
         target_height = min(target_height, last_height + max_blocks)
 
@@ -2373,9 +2751,11 @@ def sync_nevm_emission_index(
         "last_height": last_height,
         "target_height": target_height,
         "chain_height": chain_height,
+        "confirmations": confirmations,
+        "safe_height": safe_height,
     }
     if target_height <= last_height:
-        progress.update({"chain_height": chain_height, "synced_at": now_iso()})
+        progress.update({"chain_height": chain_height, "safe_height": safe_height, "synced_at": now_iso()})
         store.set_meta("nevm_emission_index", progress)
         return totals
 
@@ -2750,6 +3130,7 @@ def sync_top_wallet_index(
     to_height: int | None = None,
     reset: bool = False,
     batch_size: int = 50,
+    confirmations: int = 0,
 ) -> dict[str, Any]:
     if reset:
         reset_top_wallet_index(store, start_height=start_height)
@@ -2759,7 +3140,9 @@ def sync_top_wallet_index(
     if last_height is None or last_height < start_height - 1:
         last_height = start_height - 1
     chain_height = int(rpc.call("getblockcount"))
-    target_height = min(chain_height, to_height if to_height is not None else chain_height)
+    confirmations = max(0, confirmations)
+    safe_height = max(0, chain_height - confirmations)
+    target_height = min(safe_height, to_height if to_height is not None else safe_height)
     if max_blocks is not None:
         target_height = min(target_height, last_height + max_blocks)
 
@@ -2773,9 +3156,11 @@ def sync_top_wallet_index(
         "last_height": last_height,
         "target_height": target_height,
         "chain_height": chain_height,
+        "confirmations": confirmations,
+        "safe_height": safe_height,
     }
     if target_height <= last_height:
-        progress.update({"chain_height": chain_height, "synced_at": now_iso()})
+        progress.update({"chain_height": chain_height, "safe_height": safe_height, "synced_at": now_iso()})
         store.set_meta("top_wallet_index", progress)
         return totals
 
@@ -2826,6 +3211,7 @@ def sync_top_wallet_cluster_index(
     to_height: int | None = None,
     reset: bool = False,
     batch_size: int = 50,
+    confirmations: int = 0,
 ) -> dict[str, Any]:
     if reset:
         reset_top_wallet_cluster_index(store, start_height=start_height)
@@ -2835,7 +3221,9 @@ def sync_top_wallet_cluster_index(
     if last_height is None or last_height < start_height - 1:
         last_height = start_height - 1
     chain_height = int(rpc.call("getblockcount"))
-    target_height = min(chain_height, to_height if to_height is not None else chain_height)
+    confirmations = max(0, confirmations)
+    safe_height = max(0, chain_height - confirmations)
+    target_height = min(safe_height, to_height if to_height is not None else safe_height)
     if max_blocks is not None:
         target_height = min(target_height, last_height + max_blocks)
     sentry_collateral_outpoints = top_wallet_sentry_collateral_outpoints(store)
@@ -2855,9 +3243,11 @@ def sync_top_wallet_cluster_index(
         "last_height": last_height,
         "target_height": target_height,
         "chain_height": chain_height,
+        "confirmations": confirmations,
+        "safe_height": safe_height,
     }
     if target_height <= last_height:
-        progress.update({"chain_height": chain_height, "synced_at": now_iso()})
+        progress.update({"chain_height": chain_height, "safe_height": safe_height, "synced_at": now_iso()})
         store.set_meta("top_wallet_cluster_index", progress)
         return totals
 
@@ -2919,11 +3309,54 @@ class UnionFind:
         self.parent[right_root] = left_root
 
 
-def top_wallet_cluster_snapshot(store: Store, limit: int = 100) -> dict[str, Any]:
-    progress = top_wallet_cluster_progress(store)
+def snapshot_index_status(progress: dict[str, Any]) -> dict[str, Any]:
+    """Measure catch-up against the confirmation-safe target, not the chain tip."""
     last_height = int_or_none(progress.get("last_height"))
     chain_height = int_or_none(progress.get("chain_height"))
-    complete = bool(chain_height is not None and last_height is not None and last_height >= chain_height)
+    confirmations = int_or_none(progress.get("confirmations"))
+    safe_height = int_or_none(progress.get("safe_height"))
+    if safe_height is None and chain_height is not None and chain_height >= 0:
+        safe_height = max(0, chain_height - max(0, confirmations or 0))
+    complete = bool(
+        safe_height is not None and safe_height >= 0
+        and last_height is not None and last_height >= safe_height
+    )
+    return {
+        "last_height": last_height,
+        "chain_height": chain_height,
+        "safe_height": safe_height,
+        "confirmations": confirmations,
+        "complete": complete,
+        "rebuilding": not complete,
+        "synced_at": progress.get("synced_at"),
+    }
+
+
+def rebuilding_notice(indexes: list[tuple[str, dict[str, Any]]], *, rankings: bool = False) -> str:
+    if not any(index.get("rebuilding") for _, index in indexes):
+        return ""
+    details = []
+    for label, index in indexes:
+        last_height = index.get("last_height")
+        safe_height = index.get("safe_height")
+        chain_height = index.get("chain_height")
+        detail = f"{label}: indexed height {last_height:,}" if last_height is not None and last_height >= 0 else f"{label}: not indexed"
+        if safe_height is not None and safe_height >= 0:
+            detail += f" / safe height {safe_height:,}"
+        if chain_height is not None and chain_height >= 0:
+            detail += f" (chain height {chain_height:,})"
+        details.append(detail)
+    ranking_note = " Rankings are provisional, not current." if rankings else ""
+    return (
+        '<aside class="rebuilding-notice" role="status">'
+        '<strong>Historical index rebuilding</strong>'
+        f'<p>Figures are incomplete while historical blocks are indexed.{ranking_note}</p>'
+        f'<p>{html.escape(". ".join(details))}.</p></aside>'
+    )
+
+
+def top_wallet_cluster_snapshot(store: Store, limit: int = 100) -> dict[str, Any]:
+    index = snapshot_index_status(top_wallet_cluster_progress(store))
     edge_totals = store.conn.execute(
         """
         SELECT COUNT(*) AS edges,
@@ -2939,6 +3372,10 @@ def top_wallet_cluster_snapshot(store: Store, limit: int = 100) -> dict[str, Any
         """
     ).fetchall()
     balance_total = sum(int(row["balance_sats"] or 0) for row in balance_rows)
+    index["rebuilding"] = (
+        index["rebuilding"] or not balance_rows
+        or not snapshot_index_status(top_wallet_progress(store))["complete"]
+    )
 
     if not edge_totals["edges"]:
         return {
@@ -2946,12 +3383,7 @@ def top_wallet_cluster_snapshot(store: Store, limit: int = 100) -> dict[str, Any
             "type": "estimated_wallet_clusters",
             "stage": "forensic-clusters",
             "limit": limit,
-            "index": {
-                "last_height": last_height,
-                "chain_height": chain_height,
-                "complete": complete,
-                "synced_at": progress.get("synced_at"),
-            },
+            "index": index,
             "totals": {
                 "clusters": 0,
                 "funded_addresses": len(balance_rows),
@@ -3076,12 +3508,7 @@ def top_wallet_cluster_snapshot(store: Store, limit: int = 100) -> dict[str, Any
         "type": "estimated_wallet_clusters",
         "stage": "forensic-clusters",
         "limit": limit,
-        "index": {
-            "last_height": last_height,
-            "chain_height": chain_height,
-            "complete": complete,
-            "synced_at": progress.get("synced_at"),
-        },
+        "index": index,
         "totals": {
             "clusters": len(clusters),
             "funded_addresses": len(balance_rows),
@@ -3144,20 +3571,14 @@ def top_wallets_snapshot(store: Store, limit: int = 100) -> dict[str, Any]:
             }
         )
 
-    last_height = int_or_none(progress.get("last_height"))
-    chain_height = int_or_none(progress.get("chain_height"))
-    complete = bool(chain_height is not None and last_height is not None and last_height >= chain_height)
+    index = snapshot_index_status(progress)
+    index["rebuilding"] = index["rebuilding"] or not totals["addresses"]
     return {
         "generated_at": now_iso(),
         "type": "address_balances",
         "stage": "exact-addresses",
         "limit": limit,
-        "index": {
-            "last_height": last_height,
-            "chain_height": chain_height,
-            "complete": complete,
-            "synced_at": progress.get("synced_at"),
-        },
+        "index": index,
         "totals": {
             "addresses": int(totals["addresses"] or 0),
             "balance_sats": int(totals["balance_sats"] or 0),
@@ -3420,13 +3841,6 @@ def mock_emissions_snapshot() -> dict[str, Any]:
 def emissions_snapshot(store: Store, latest_limit: int = 100) -> dict[str, Any]:
     progress = emission_progress(store)
     nevm_progress = nevm_emission_progress(store)
-    count_row = store.conn.execute("SELECT COUNT(*) AS count FROM emission_blocks").fetchone()
-    nevm_count_row = store.conn.execute("SELECT COUNT(*) AS count FROM nevm_emission_blocks").fetchone()
-    if (
-        (not count_row or int(count_row["count"] or 0) == 0)
-        and (not nevm_count_row or int(nevm_count_row["count"] or 0) == 0)
-    ):
-        return mock_emissions_snapshot()
 
     totals_row = store.conn.execute(
         """
@@ -3583,12 +3997,10 @@ def emissions_snapshot(store: Store, latest_limit: int = 100) -> dict[str, Any]:
             Decimal("12.1667"),
         )
 
-    last_height = int_or_none(progress.get("last_height"))
-    chain_height = int_or_none(progress.get("chain_height"))
-    nevm_last_height = int_or_none(nevm_progress.get("last_height"))
-    nevm_chain_height = int_or_none(nevm_progress.get("chain_height"))
-    complete = bool(chain_height is not None and last_height is not None and last_height >= chain_height)
-    nevm_complete = bool(nevm_chain_height is not None and nevm_last_height is not None and nevm_last_height >= nevm_chain_height)
+    index = snapshot_index_status(progress)
+    nevm_index = snapshot_index_status(nevm_progress)
+    index["rebuilding"] = index["rebuilding"] or not totals_row["blocks"]
+    nevm_index["rebuilding"] = nevm_index["rebuilding"] or not nevm_rows
     totals = {key: int(totals_row[key] or 0) for key in totals_row.keys() if key.endswith("_sats") or key == "blocks"}
     totals.update(
         {
@@ -3623,14 +4035,9 @@ def emissions_snapshot(store: Store, latest_limit: int = 100) -> dict[str, Any]:
         "type": "network_emissions",
         "mock": False,
         "index": {
-            "last_height": last_height,
-            "chain_height": chain_height,
-            "complete": complete,
-            "synced_at": progress.get("synced_at"),
-            "nevm_last_height": nevm_last_height,
-            "nevm_chain_height": nevm_chain_height,
-            "nevm_complete": nevm_complete,
-            "nevm_synced_at": nevm_progress.get("synced_at"),
+            **index,
+            **{f"nevm_{key}": value for key, value in nevm_index.items()},
+            "rebuilding": index["rebuilding"] or nevm_index["rebuilding"],
         },
         "totals": totals,
         "periods": periods,
@@ -4748,6 +5155,8 @@ def sync_static_snapshot(
     csv_path: Path,
     next_hop_limit: int,
     node_spend_limit: int,
+    sysnode_mnlist_url: str | None = None,
+    sysnode_time_lookup_limit: int | None = None,
 ) -> dict[str, Any]:
     watched = {address}
     stats = sync_address(
@@ -4789,7 +5198,20 @@ def sync_static_snapshot(
         masternode_stats = sync_network_masternodes(store, rpc, client)
         write_network_masternodes_csv(network_masternode_rows_from_store(store), csv_path)
     else:
-        load_network_masternodes_csv(store, csv_path)
+        if store.conn.execute("SELECT COUNT(*) AS count FROM network_masternodes").fetchone()["count"] == 0:
+            load_network_masternodes_csv(store, csv_path)
+        try:
+            masternode_stats = sync_network_masternodes_from_sysnode(
+                store,
+                client,
+                url=sysnode_mnlist_url,
+                time_lookup_limit=sysnode_time_lookup_limit,
+            )
+        except Exception as exc:
+            print(f"{now_iso()} Sysnode sentry feed sync failed: {exc}", file=sys.stderr)
+            masternode_stats = store.get_meta("last_masternode_sync", {}) or None
+        if masternode_stats is not None:
+            write_network_masternodes_csv(network_masternode_rows_from_store(store), csv_path)
 
     return {
         "synced_at": now_iso(),
@@ -4799,6 +5221,32 @@ def sync_static_snapshot(
         "exchange_wallets": len(exchange_balances),
         "masternodes": masternode_stats,
     }
+
+
+def saved_miners_html(path: Path, refresh_seconds: int = 0) -> str:
+    try:
+        snapshot = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(snapshot, dict) or snapshot.get("type") != "miners":
+            raise ValueError("not a miners snapshot")
+        if not isinstance(snapshot.get("generated_at"), str) or not snapshot["generated_at"]:
+            raise ValueError("missing snapshot timestamp")
+        dt.datetime.fromisoformat(snapshot["generated_at"].replace("Z", "+00:00"))
+        for key in ("status", "totals"):
+            if not isinstance(snapshot.get(key), dict):
+                raise ValueError(f"invalid {key}")
+        for key in ("pools", "addresses", "address_groups", "recent_blocks"):
+            rows = snapshot.get(key)
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                raise ValueError(f"invalid {key}")
+        return miners_html(refresh_seconds=refresh_seconds, snapshot=snapshot)
+    except (OSError, UnicodeError, ValueError, TypeError, AttributeError, OverflowError):
+        return miners_html(
+            refresh_seconds=refresh_seconds,
+            snapshot={
+                "type": "miners",
+                "unavailable_reason": "Miner data unavailable: no valid saved snapshot.",
+            },
+        )
 
 
 def publish_static_snapshot(
@@ -4817,31 +5265,52 @@ def publish_static_snapshot(
     csv_path: Path,
     next_hop_limit: int,
     node_spend_limit: int,
+    sysnode_mnlist_url: str | None = None,
+    sysnode_time_lookup_limit: int | None = None,
+    skip_sync: bool = False,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = csv_path if csv_path.is_absolute() else Path.cwd() / csv_path
-    sync_stats = sync_static_snapshot(
-        store,
-        client,
-        rpc,
-        address=address,
-        page_size=page_size,
-        max_pages=max_pages,
-        from_height=from_height,
-        since_time=since_time,
-        csv_path=csv_path,
-        next_hop_limit=next_hop_limit,
-        node_spend_limit=node_spend_limit,
-    )
+    if skip_sync:
+        wallet = store.get_meta("last_summary", {}) or {}
+        sync_stats = {
+            "generated_at": now_iso(),
+            "synced_at": wallet.get("synced_at"),
+            "sync_skipped": True,
+            "wallet": wallet,
+            "masternodes": store.get_meta("last_masternode_sync", {}) or None,
+        }
+    else:
+        sync_stats = sync_static_snapshot(
+            store,
+            client,
+            rpc,
+            address=address,
+            page_size=page_size,
+            max_pages=max_pages,
+            from_height=from_height,
+            since_time=since_time,
+            csv_path=csv_path,
+            next_hop_limit=next_hop_limit,
+            node_spend_limit=node_spend_limit,
+            sysnode_mnlist_url=sysnode_mnlist_url,
+            sysnode_time_lookup_limit=sysnode_time_lookup_limit,
+        )
     index_html = dashboard_html(store, since_time=since_time, since_label=since_label, refresh_seconds=refresh_seconds)
     masternode_page = masternodes_html(store, since_time=since_time, since_label=since_label, refresh_seconds=refresh_seconds)
     top_wallets = top_wallets_snapshot(store)
     top_wallets_page = top_wallets_html(store, refresh_seconds=refresh_seconds)
     emissions = emissions_snapshot(store)
     emissions_page = emissions_html(store, refresh_seconds=refresh_seconds)
-    miners = miners_snapshot(store)
-    miners_page = miners_html(refresh_seconds=refresh_seconds, snapshot=miners)
-    sn_comp_page = sn_comp_html(store, refresh_seconds=refresh_seconds)
+    if skip_sync:
+        miners_page = saved_miners_html(output_dir / MINERS_JSON, refresh_seconds=refresh_seconds)
+    else:
+        miners = miners_snapshot(store)
+        miners_page = miners_html(refresh_seconds=refresh_seconds, snapshot=miners)
+    sn_comp_page = None
+    if (not skip_sync or not (output_dir / SN_COMP_HTML).exists()
+            or store.get_meta("sentry_time_verification")):
+        sn_comp_page = sn_comp_html(store, refresh_seconds=refresh_seconds)
     atomic_write_text(output_dir / "index.html", index_html)
     atomic_write_text(output_dir / "wallet-flows.html", index_html)
     atomic_write_text(output_dir / "sentrynode.html", masternode_page)
@@ -4849,10 +5318,13 @@ def publish_static_snapshot(
     atomic_write_text(output_dir / TOP_WALLETS_HTML, top_wallets_page)
     atomic_write_text(output_dir / EMISSIONS_HTML, emissions_page)
     atomic_write_text(output_dir / MINERS_HTML, miners_page)
-    atomic_write_text(output_dir / SN_COMP_HTML, sn_comp_page)
+    if sn_comp_page is not None:
+        atomic_write_text(output_dir / SN_COMP_HTML, sn_comp_page)
     atomic_write_json(output_dir / TOP_WALLETS_JSON, top_wallets)
     atomic_write_json(output_dir / EMISSIONS_JSON, emissions)
-    atomic_write_json(output_dir / MINERS_JSON, miners)
+    # In render-only mode miners.json belongs to the independent data worker.
+    if not skip_sync:
+        atomic_write_json(output_dir / MINERS_JSON, miners)
     if CHART_ASSET_PATH.exists():
         asset_target = output_dir / CHART_ASSET_ROUTE.lstrip("/")
         asset_target.parent.mkdir(parents=True, exist_ok=True)
@@ -4886,28 +5358,146 @@ def publish_static_snapshot(
     return sync_stats
 
 
+def sn_comp_snapshot_stats(store: Store) -> dict[str, Any]:
+    row = store.conn.execute(
+        """
+        SELECT
+            COUNT(*) AS entries,
+            SUM(CASE
+                WHEN UPPER(COALESCE(status, '')) = 'ENABLED'
+                 AND COALESCE(removed_at, '') = ''
+                 AND COALESCE(taken_down_time, 0) = 0
+                THEN 1 ELSE 0
+            END) AS still_online,
+            SUM(CASE
+                WHEN UPPER(COALESCE(status, '')) = 'POSE_BANNED'
+                THEN 1 ELSE 0
+            END) AS banned,
+            SUM(CASE
+                WHEN COALESCE(removed_at, '') != ''
+                  OR COALESCE(taken_down_time, 0) != 0
+                THEN 1 ELSE 0
+            END) AS taken_down
+        FROM network_masternodes
+        WHERE collateral_time >= ?
+          AND collateral_time <= ?
+        """,
+        (SN_COMP_START_TS, SN_COMP_END_TS),
+    ).fetchone()
+    return {
+        "entries": int(row["entries"] or 0),
+        "still_online": int(row["still_online"] or 0),
+        "banned": int(row["banned"] or 0),
+        "taken_down": int(row["taken_down"] or 0),
+    }
+
+
+def publish_sn_comp_snapshot(
+    store: Store,
+    client: BlockbookClient,
+    rpc: SyscoinRpcClient | None,
+    *,
+    output_dir: Path,
+    refresh_seconds: int,
+    csv_path: Path,
+    sysnode_mnlist_url: str | None = None,
+    sysnode_time_lookup_limit: int | None = None,
+) -> dict[str, Any]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = csv_path if csv_path.is_absolute() else Path.cwd() / csv_path
+
+    masternode_stats: dict[str, Any] | None = None
+    if rpc is not None:
+        if store.conn.execute("SELECT COUNT(*) AS count FROM network_masternodes").fetchone()["count"] == 0:
+            load_network_masternodes_csv(store, csv_path)
+        masternode_stats = sync_network_masternodes(store, rpc, client)
+        write_network_masternodes_csv(network_masternode_rows_from_store(store), csv_path)
+    else:
+        if store.conn.execute("SELECT COUNT(*) AS count FROM network_masternodes").fetchone()["count"] == 0:
+            load_network_masternodes_csv(store, csv_path)
+        try:
+            masternode_stats = sync_network_masternodes_from_sysnode(
+                store,
+                client,
+                url=sysnode_mnlist_url,
+                time_lookup_limit=sysnode_time_lookup_limit,
+                time_lookup_scope="sn_comp",
+            )
+        except Exception as exc:
+            print(f"{now_iso()} Sysnode sentry feed sync failed: {exc}", file=sys.stderr)
+            masternode_stats = store.get_meta("last_masternode_sync", {}) or None
+        if masternode_stats is not None:
+            write_network_masternodes_csv(network_masternode_rows_from_store(store), csv_path)
+        else:
+            masternode_stats = store.get_meta("last_masternode_sync", {}) or None
+
+    sn_comp_page = sn_comp_html(store, refresh_seconds=refresh_seconds)
+    atomic_write_text(output_dir / SN_COMP_HTML, sn_comp_page)
+    if csv_path.exists():
+        network_csv = output_dir / "network_masternodes.csv"
+        temp_csv = network_csv.with_name(f".{network_csv.name}.tmp")
+        temp_csv.write_bytes(csv_path.read_bytes())
+        temp_csv.replace(network_csv)
+
+    masternode_meta = store.get_meta("last_masternode_sync", {}) or {}
+    synced_at = str(masternode_meta.get("synced_at") or now_iso())
+    comp_stats = sn_comp_snapshot_stats(store)
+    status_path = output_dir / "status.json"
+    status: dict[str, Any] = {}
+    if status_path.exists():
+        try:
+            existing_status = json.loads(status_path.read_text(encoding="utf-8"))
+            if isinstance(existing_status, dict):
+                status = existing_status
+        except (OSError, json.JSONDecodeError):
+            status = {}
+    pages = status.get("pages") if isinstance(status.get("pages"), dict) else {}
+    status.update(
+        {
+            "synced_at": synced_at,
+            "masternodes": masternode_stats or masternode_meta,
+            "sn_comp": {"synced_at": synced_at, **comp_stats},
+            "pages": {
+                **pages,
+                "sn_comp": SN_COMP_HTML,
+                "network_masternodes": "network_masternodes.csv",
+            },
+        }
+    )
+    atomic_write_json(status_path, status)
+    return {
+        "synced_at": synced_at,
+        "masternodes": masternode_stats or masternode_meta,
+        "sn_comp": comp_stats,
+    }
+
+
 def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
     snapshot = emissions_snapshot(store)
     totals = snapshot["totals"]
     index = snapshot["index"]
-    is_mock = bool(snapshot.get("mock"))
-    block_height = index.get("last_height") or totals.get("last_height")
-    chain_height = index.get("chain_height")
+    block_height = index.get("last_height")
+    if block_height is None or block_height < 0:
+        block_height = totals.get("last_height")
+    safe_height = index.get("safe_height")
     nevm_totals = totals.get("nevm") or {}
-    nevm_height = index.get("nevm_last_height") or nevm_totals.get("last_height")
-    nevm_chain_height = index.get("nevm_chain_height")
+    nevm_height = index.get("nevm_last_height")
+    if nevm_height is None or nevm_height < 0:
+        nevm_height = nevm_totals.get("last_height")
+    nevm_safe_height = index.get("nevm_safe_height")
     blocks_remaining = (
-        max(0, int(chain_height) - int(block_height))
-        if chain_height is not None and block_height is not None
+        max(0, safe_height - (block_height if block_height is not None else -1))
+        if safe_height is not None and safe_height >= 0
         else None
     )
     nevm_blocks_remaining = (
-        max(0, int(nevm_chain_height) - int(nevm_height))
-        if nevm_chain_height is not None and nevm_height is not None
+        max(0, nevm_safe_height - (nevm_height if nevm_height is not None else -1))
+        if nevm_safe_height is not None and nevm_safe_height >= 0
         else None
     )
-    status_text = "Preview data; emission index has not run yet." if is_mock else (
-        "Emission indexes complete" if index.get("complete") and index.get("nevm_complete") else "Emission index in progress"
+    status_text = "Historical index rebuilding" if index["rebuilding"] else "Emission indexes complete to safe heights"
+    recovery_notice = rebuilding_notice(
+        [("UTXO", index), ("NEVM", {key.removeprefix("nevm_"): value for key, value in index.items() if key.startswith("nevm_")})]
     )
     updated_text = fmt_iso_local_datetime(snapshot.get("generated_at"))
 
@@ -5059,6 +5649,8 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
 {refresh_meta_tag(refresh_seconds)}  <title>Syscoin Network Emissions</title>
   <style>
+    .rebuilding-notice {{ border-left: 3px solid var(--gold); margin: 16px 0; padding: 12px 16px; overflow-wrap: anywhere; }}
+    .rebuilding-notice p {{ margin: 8px 0 0; }}
     :root {{ color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --page-gutter: clamp(24px, 3.8vw, 80px); --bg: #050b12; --panel: #0b1622; --panel-soft: #102235; --line: #21384f; --ink: #e9f6ff; --muted: #8da8bb; --teal: #00d4ff; --accent: #2f8cff; --gold: #f5b84b; --shadow: 0 18px 48px rgba(0, 10, 24, 0.34); }}
     *, *::before, *::after {{ box-sizing: border-box; }}
     html, body {{ margin: 0; max-width: 100%; overflow-x: hidden; }}
@@ -5192,6 +5784,7 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
     </div>
   </header>
   <main>
+    {recovery_notice}
     <section class="section-panel metrics">
       {metric("UTXO Height", f"{block_height:,}" if block_height is not None else "Not indexed", f"{blocks_remaining:,} remaining" if blocks_remaining is not None else status_text)}
       {metric("NEVM Height", f"{nevm_height:,}" if nevm_height is not None else "Not indexed", f"{nevm_blocks_remaining:,} remaining" if nevm_blocks_remaining is not None else "NEVM index not run")}
@@ -5657,10 +6250,20 @@ def miners_html(refresh_seconds: int = 60, snapshot: dict[str, Any] | None = Non
     block_rows_html = "\n".join(block_rows) or "<tr><td class='empty' colspan='6'>No recent attributed blocks available yet.</td></tr>"
 
     error_html = ""
+    if snapshot.get("unavailable_reason"):
+        error_html = f"<p class='warning'>{html.escape(str(snapshot['unavailable_reason']))}</p>"
     if snapshot.get("status_error"):
         error_html = f"<p class='warning'>Status API unavailable: {html.escape(str(snapshot.get('status_error')))}</p>"
     if snapshot.get("recent_blocks_error"):
         error_html += f"<p class='warning'>Recent block feed unavailable: {html.escape(str(snapshot.get('recent_blocks_error')))}</p>"
+
+    metrics_html = "\n".join((
+        metric("Network SYS Hashrate", str(status.get("network_hashrate") or "-"), f"Current {status.get('window_size') or '-'} block window"),
+        metric("Known Mining Pools", f"{int(totals.get('pools') or 0):,}", str(top_pool.get("name") or "-") + " leads by indexed blocks"),
+        metric("Latest UTXO Block", f"{int(totals.get('latest_utxo_height') or status.get('utxo_height') or 0):,}", f"{int(totals.get('recent_blocks_sample') or 0):,} latest blocks sampled"),
+        metric("Unknown Blocks", f"{int(totals.get('unknown_blocks') or 0):,}", str(status.get("unknown_blocks_text") or "0%")),
+        metric("Known Payout Groups", f"{int(totals.get('known_address_groups') or 0):,}", f"{int(totals.get('known_addresses') or 0):,} addresses · Updated {updated}" if updated else f"{int(totals.get('known_addresses') or 0):,} addresses"),
+    )) if not snapshot.get("unavailable_reason") else metric("Miner Data", "Unavailable")
 
     return f"""<!doctype html>
 <html lang="en">
@@ -5756,11 +6359,7 @@ def miners_html(refresh_seconds: int = 60, snapshot: dict[str, Any] | None = Non
   <main>
     {error_html}
     <section class="section-panel metrics">
-      {metric("Network SYS Hashrate", str(status.get("network_hashrate") or "-"), f"Current {status.get('window_size') or '-'} block window")}
-      {metric("Known Mining Pools", f"{int(totals.get('pools') or 0):,}", str(top_pool.get("name") or "-") + " leads by indexed blocks")}
-      {metric("Latest UTXO Block", f"{int(totals.get('latest_utxo_height') or status.get('utxo_height') or 0):,}", f"{int(totals.get('recent_blocks_sample') or 0):,} latest blocks sampled")}
-      {metric("Unknown Blocks", f"{int(totals.get('unknown_blocks') or 0):,}", str(status.get("unknown_blocks_text") or "0%"))}
-      {metric("Known Payout Groups", f"{int(totals.get('known_address_groups') or 0):,}", f"{int(totals.get('known_addresses') or 0):,} addresses · Updated {updated}" if updated else f"{int(totals.get('known_addresses') or 0):,} addresses")}
+      {metrics_html}
     </section>
 
     <section class="section-panel">
@@ -6419,10 +7018,11 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     totals = snapshot["totals"]
     last_height = index.get("last_height")
     chain_height = index.get("chain_height")
+    safe_height = index.get("safe_height")
     indexed_blocks = (int(last_height) + 1) if isinstance(last_height, int) and last_height >= 0 else 0
     remaining_blocks = (
-        max(int(chain_height) - int(last_height), 0)
-        if isinstance(chain_height, int) and isinstance(last_height, int)
+        max(safe_height - (last_height if last_height is not None else -1), 0)
+        if isinstance(safe_height, int) and safe_height >= 0
         else None
     )
     block_height_text = (
@@ -6474,25 +7074,30 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     if not rows:
         rows = ["<tr><td class='empty' colspan='7'>No top wallet index data yet.</td></tr>"]
     rows_html = "\n".join(rows)
-    panel_status = f"Updated {html.escape(updated_text or '-')}"
+    panel_status = (
+        "Rebuilding: rankings are provisional"
+        if index["rebuilding"] else f"Updated {html.escape(updated_text or '-')}"
+    )
     cluster_snapshot = snapshot["estimated_clusters"]
     cluster_wallets = cluster_snapshot["wallets"]
     cluster_index = cluster_snapshot["index"]
     cluster_totals = cluster_snapshot["totals"]
     cluster_last_height = cluster_index.get("last_height")
     cluster_chain_height = cluster_index.get("chain_height")
+    cluster_safe_height = cluster_index.get("safe_height")
     cluster_progress_text = (
-        f"{int(cluster_last_height):,} / {int(cluster_chain_height):,}"
-        if isinstance(cluster_last_height, int) and isinstance(cluster_chain_height, int)
+        f"{int(cluster_last_height):,} / safe height {int(cluster_safe_height):,}"
+        if isinstance(cluster_last_height, int) and cluster_last_height >= 0 and isinstance(cluster_safe_height, int)
         else "not started"
     )
     cluster_status = (
-        "Forensic cluster index complete"
-        if cluster_index.get("complete")
-        else f"Building forensic cluster index: {cluster_progress_text}"
+        "Forensic cluster index complete to safe height"
+        if not cluster_index["rebuilding"]
+        else f"Rebuilding forensic cluster index: {cluster_progress_text}"
         if cluster_last_height is not None and int(cluster_last_height) >= 0
         else "Forensic cluster index not started"
     )
+    recovery_notice = rebuilding_notice([("Addresses", index), ("Clusters", cluster_index)], rankings=True)
     cluster_rows_html = "\n".join(render_wallet_row(row) for row in cluster_wallets)
     if not cluster_rows_html:
         cluster_rows_html = "<tr><td class='empty' colspan='7'>No estimated address clusters yet. Run the forensic cluster index to build this table.</td></tr>"
@@ -6711,6 +7316,8 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
   <meta name="viewport" content="width=device-width, initial-scale=1">
 {refresh_meta_tag(refresh_seconds)}  <title>Syscoin Top Wallets</title>
   <style>
+    .rebuilding-notice {{ border-left: 3px solid var(--gold); margin: 16px 0; padding: 12px 16px; overflow-wrap: anywhere; }}
+    .rebuilding-notice p {{ margin: 8px 0 0; }}
     :root {{ color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --page-gutter: clamp(24px, 3.8vw, 80px); --bg: #050b12; --panel: #0b1622; --panel-soft: #102235; --line: #21384f; --ink: #e9f6ff; --muted: #8da8bb; --teal: #00d4ff; --accent: #2f8cff; --gold: #f5b84b; --shadow: 0 18px 48px rgba(0, 10, 24, 0.34); }}
     *, *::before, *::after {{ box-sizing: border-box; }}
     html, body {{ margin: 0; max-width: 100%; overflow-x: hidden; }}
@@ -6843,6 +7450,7 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     </div>
   </header>
   <main>
+    {recovery_notice}
     <section class="section-panel metrics">
       <div class="metric"><span>Block Height</span><b>{html.escape(block_height_text)}</b></div>
       <div class="metric"><span>Blocks Indexed</span><b>{indexed_blocks:,}</b></div>
@@ -6855,7 +7463,7 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
         <h2>Phase 2 Address Cluster Estimate</h2>
         <p>{html.escape(cluster_status)}</p>
       </div>
-      <p class="phase-note">Common-input plus sentry-collateral clustering estimate. Address balances are exact; holder grouping is a forensic estimate, not proof of ownership.</p>
+      <p class="phase-note">Common-input plus sentry-collateral clustering estimate. Balances reflect indexed blocks; holder grouping is a forensic estimate, not proof of ownership.</p>
       <div class="metrics">
         <div class="metric"><span>Estimated Holders</span><b>{int(cluster_totals['clusters']):,}</b></div>
         <div class="metric"><span>Known Exchange Clusters</span><b>{int(cluster_totals['known_exchange_clusters']):,}</b></div>
@@ -7032,6 +7640,14 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
 </html>"""
 
 
+def sentry_time_verification_notice(store: Store) -> str:
+    verification = store.get_meta("sentry_time_verification", {}) or {}
+    if not verification or verification.get("complete"):
+        return ""
+    return ('<p role="status" style="line-height:1.5">Sentry Node dates are being checked '
+            'against the blockchain as historical data is restored. Competition totals are provisional.</p>')
+
+
 def masternodes_html(
     store: Store,
     since_time: int | None = None,
@@ -7114,7 +7730,7 @@ def masternodes_html(
     for row in network_rows:
         setup_time = row["registered_time"] or row["collateral_time"]
         taken_down_sort = row["taken_down_time"] or iso_timestamp(row["removed_at"])
-        taken_down_text = fmt_table_datetime(row["taken_down_time"]) if row["taken_down_time"] else fmt_iso_local_datetime(row["removed_at"])
+        taken_down_text = fmt_utc_table_datetime(row["taken_down_time"]) if row["taken_down_time"] else fmt_iso_utc_datetime(row["removed_at"])
         first_seen_sort = iso_timestamp(row["first_seen_at"])
         is_new = bool(baseline_ts and first_seen_sort > baseline_ts)
         is_removed = bool(row["removed_at"])
@@ -7197,7 +7813,7 @@ def masternodes_html(
             else "-"
         )
         taken_down_display = (
-            fmt_local_date(item["taken_down_sort"])
+            fmt_utc_table_datetime(item["taken_down_sort"])
             if item["change_type"] == "Taken down" and item["taken_down_sort"]
             else "-"
         )
@@ -7212,9 +7828,9 @@ def masternodes_html(
             if include_change
             else ""
         )
-        setup_display = fmt_local_date(item["setup_time"]) if include_change else fmt_table_datetime(item["setup_time"])
+        setup_display = fmt_utc_table_datetime(item["setup_time"])
         setup_cell = (
-            f"<td data-sort='{item['setup_time'] or 0}' title='{html.escape(fmt_local_datetime(item['setup_time']))}'>"
+            f"<td data-sort='{item['setup_time'] or 0}' title='{html.escape(fmt_utc_datetime(item['setup_time']))}'>"
             f"{html.escape(setup_display)}</td>"
         )
         seniority = item["seniority"]
@@ -7254,15 +7870,15 @@ def masternodes_html(
         (int(item["taken_down_sort"] or item["change_sort"] or 0) for item in change_items if item["change_type"] == "Taken down"),
         default=0,
     )
-    last_setup_date = fmt_local_date(last_setup_time)
-    last_taken_down_date = fmt_local_date(last_taken_down_time)
+    last_setup_date = fmt_utc_table_datetime(last_setup_time)
+    last_taken_down_date = fmt_utc_table_datetime(last_taken_down_time)
     change_rows_html = "\n".join(masternode_row_html(item, include_change=True) for item in change_items)
     if not change_rows_html:
         change_rows_html = "<tr class='mn-empty'><td class='empty' colspan='7'>No new setups or takedowns since the banked snapshot.</td></tr>"
     current_no_results_html = "<tr class='mn-no-results' hidden><td class='empty' colspan='6'>No matching sentry nodes.</td></tr>"
-    since_text = f"{fmt_local_datetime(since_time)} Sydney" if since_time else "all tracked history"
-    updated_text = fmt_iso_local_datetime(masternode_meta.get("synced_at") or store.get_meta("last_summary", {}).get("synced_at"))
-    baseline_text = fmt_iso_local_date(baseline_iso) if baseline_iso else "not set"
+    since_text = fmt_utc_datetime(since_time) if since_time else "all tracked history"
+    updated_text = fmt_iso_utc_datetime(masternode_meta.get("synced_at") or store.get_meta("last_summary", {}).get("synced_at"))
+    baseline_text = fmt_iso_utc_datetime(baseline_iso) if baseline_iso else "not set"
     total_count = len(current_items)
 
     def chart_legend(parts: list[tuple[str, int, str]], total: int) -> str:
@@ -7454,6 +8070,7 @@ def masternodes_html(
     </div>
   </header>
   <main>
+    {sentry_time_verification_notice(store)}
     <section class="section-panel metrics">
       <div class="metric"><span>Sentry Nodes</span><b>{total_count}</b></div>
       <div class="metric"><span>Enabled</span><b>{enabled_count}</b></div>
@@ -7506,7 +8123,7 @@ def masternodes_html(
           <thead>
             <tr>
               <th data-sort="number" data-default-dir="desc" aria-sort="descending"><button class="sort-button" type="button">Change<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Date Setup<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Registration Date<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Date Taken Down<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Seniority<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">100k Moved To<span class="sort-icon" aria-hidden="true"></span></button></th>
@@ -7550,7 +8167,7 @@ def masternodes_html(
         <table class="mn-table mn-current">
           <thead>
             <tr>
-              <th data-sort="number" data-default-dir="desc" aria-sort="descending"><button class="sort-button" type="button">Date Setup<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="descending"><button class="sort-button" type="button">Registration Date<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Seniority<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Collateral Address<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Collateral Tx<span class="sort-icon" aria-hidden="true"></span></button></th>
@@ -8017,6 +8634,7 @@ def sn_comp_html(store: Store, refresh_seconds: int = 60) -> str:
     </div>
   </header>
   <main>
+    {sentry_time_verification_notice(store)}
     <section class="section-panel campaign-panel">
       <div class="campaign-copy">
         <span class="promo-kicker">Official Syscoin Campaign</span>
@@ -8407,6 +9025,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rpc-user", help="Syscoin Core RPC username")
     parser.add_argument("--rpc-password", help="Syscoin Core RPC password; prefer SYS_RPC_PASSWORD env var")
     parser.add_argument("--nevm-rpc-url", help="Syscoin NEVM JSON-RPC URL, e.g. http://127.0.0.1:8545/")
+    parser.add_argument(
+        "--sysnode-mnlist-url",
+        default=os.getenv("SYS_SYSNODE_MNLIST_URL", DEFAULT_SYSNODE_MNLIST_URL),
+        help="Sysnode backend /mnlist URL used when Core RPC is unavailable; set to off to disable",
+    )
+    parser.add_argument(
+        "--sysnode-time-lookup-limit",
+        type=int,
+        default=int_or_none(os.getenv("SYS_SYSNODE_TIME_LOOKUP_LIMIT")) or DEFAULT_SYSNODE_TIME_LOOKUP_LIMIT,
+        help="Maximum missing masternode block times to resolve through Blockbook per Sysnode sync",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     sync_p = sub.add_parser("sync", help="Fetch transactions for the watched address")
@@ -8446,6 +9075,7 @@ def build_parser() -> argparse.ArgumentParser:
     top_wallet_p.add_argument("--top", type=int, default=100, help="Number of addresses to include in the JSON snapshot")
     top_wallet_p.add_argument("--json", type=Path, default=Path(TOP_WALLETS_JSON), help="Write top-wallet snapshot JSON")
     top_wallet_p.add_argument("--batch-size", type=int, default=50, help="RPC blocks to fetch per batch")
+    top_wallet_p.add_argument("--confirmations", type=int, default=0, help="Only index blocks this many confirmations behind the chain tip")
 
     cluster_p = sub.add_parser("sync-top-wallet-clusters", help="Build estimated holder clusters from common-input and sentry-collateral history")
     cluster_p.add_argument("--start-height", type=int, default=0, help="Height to start from when the cluster index is empty or reset")
@@ -8455,6 +9085,7 @@ def build_parser() -> argparse.ArgumentParser:
     cluster_p.add_argument("--top", type=int, default=100, help="Number of estimated clusters to include in the JSON snapshot")
     cluster_p.add_argument("--json", type=Path, help="Write estimated cluster snapshot JSON")
     cluster_p.add_argument("--batch-size", type=int, default=50, help="RPC blocks to fetch per batch")
+    cluster_p.add_argument("--confirmations", type=int, default=0, help="Only index blocks this many confirmations behind the chain tip")
 
     emission_p = sub.add_parser("sync-emissions", help="Index miner, sentry, governance, and issuance payouts from coinbase blocks")
     emission_p.add_argument("--start-height", type=int, default=0, help="Height to start from when the emission index is empty or reset")
@@ -8463,6 +9094,7 @@ def build_parser() -> argparse.ArgumentParser:
     emission_p.add_argument("--reset", action="store_true", help="Clear the emission index before syncing")
     emission_p.add_argument("--json", type=Path, default=Path(EMISSIONS_JSON), help="Write emissions snapshot JSON")
     emission_p.add_argument("--batch-size", type=int, default=50, help="RPC blocks to fetch per batch")
+    emission_p.add_argument("--confirmations", type=int, default=0, help="Only index blocks this many confirmations behind the chain tip")
 
     nevm_emission_p = sub.add_parser("sync-nevm-emissions", help="Index NEVM miner rewards, priority fees, and base-fee burns")
     nevm_emission_p.add_argument("--start-height", type=int, default=0, help="NEVM height to start from when the index is empty or reset")
@@ -8471,8 +9103,10 @@ def build_parser() -> argparse.ArgumentParser:
     nevm_emission_p.add_argument("--reset", action="store_true", help="Clear the NEVM emission index before syncing")
     nevm_emission_p.add_argument("--json", type=Path, default=Path(EMISSIONS_JSON), help="Write combined emissions snapshot JSON")
     nevm_emission_p.add_argument("--batch-size", type=int, default=50, help="NEVM RPC blocks to fetch per batch")
+    nevm_emission_p.add_argument("--confirmations", type=int, default=0, help="Only index blocks this many confirmations behind the chain tip")
 
     static_p = sub.add_parser("publish-static", help="Sync data and write pre-rendered dashboard pages")
+    static_p.add_argument("--skip-sync", action="store_true", help="Render stored data without network calls; read worker-owned miners.json from --output-dir")
     static_p.add_argument("--output-dir", type=Path, required=True, help="Directory to publish static HTML/data files")
     static_p.add_argument("--since-date", default="2026-04-14 12:30", help="Only show dashboard movements from this date/time")
     static_p.add_argument("--from-height", type=int, help="Only fetch address transactions from this height")
@@ -8481,6 +9115,11 @@ def build_parser() -> argparse.ArgumentParser:
     static_p.add_argument("--next-hop-limit", type=int, default=8, help="Number of first-hop spends to trace per publish")
     static_p.add_argument("--node-spend-limit", type=int, default=12, help="Number of possible node spends to trace per publish")
     static_p.add_argument("--csv", type=Path, default=DEFAULT_NETWORK_MASTERNODES_PATH, help="Sentry node snapshot CSV path")
+
+    sn_comp_p = sub.add_parser("publish-sn-comp", help="Sync sentry nodes and write only the SN Comp static page")
+    sn_comp_p.add_argument("--output-dir", type=Path, required=True, help="Directory to publish SN Comp HTML/data files")
+    sn_comp_p.add_argument("--refresh-seconds", type=int, default=0, help="HTML meta refresh interval; 0 disables auto reload")
+    sn_comp_p.add_argument("--csv", type=Path, default=DEFAULT_NETWORK_MASTERNODES_PATH, help="Sentry node snapshot CSV path")
 
     watch_p = sub.add_parser("watch", help="Poll repeatedly and emit outbound alerts")
     watch_p.add_argument("--interval", type=int, default=60)
@@ -8581,12 +9220,20 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "sync-masternodes":
         rpc = build_rpc_client(args)
-        if rpc is None:
-            print("No RPC URL/host supplied. Use --rpc-host/--rpc-url or SYS_RPC_URL.")
-            return 1
         if store.conn.execute("SELECT COUNT(*) AS count FROM network_masternodes").fetchone()["count"] == 0 and args.csv:
             load_network_masternodes_csv(store, args.csv)
-        stats = sync_network_masternodes(store, rpc, client)
+        if rpc is not None:
+            stats = sync_network_masternodes(store, rpc, client)
+        else:
+            stats = sync_network_masternodes_from_sysnode(
+                store,
+                client,
+                url=args.sysnode_mnlist_url,
+                time_lookup_limit=args.sysnode_time_lookup_limit,
+            )
+            if stats is None:
+                print("No RPC URL/host supplied and Sysnode feed is disabled.")
+                return 1
         if args.csv:
             write_network_masternodes_csv(network_masternode_rows_from_store(store), args.csv)
         print(
@@ -8608,6 +9255,7 @@ def main(argv: list[str] | None = None) -> int:
             to_height=args.to_height,
             reset=args.reset,
             batch_size=args.batch_size,
+            confirmations=args.confirmations,
         )
         snapshot = top_wallets_snapshot(store, limit=args.top)
         if args.json:
@@ -8634,6 +9282,7 @@ def main(argv: list[str] | None = None) -> int:
             to_height=args.to_height,
             reset=args.reset,
             batch_size=args.batch_size,
+            confirmations=args.confirmations,
         )
         snapshot = top_wallet_cluster_snapshot(store, limit=args.top)
         if args.json:
@@ -8663,6 +9312,7 @@ def main(argv: list[str] | None = None) -> int:
             to_height=args.to_height,
             reset=args.reset,
             batch_size=args.batch_size,
+            confirmations=args.confirmations,
         )
         snapshot = emissions_snapshot(store)
         if args.json:
@@ -8688,6 +9338,7 @@ def main(argv: list[str] | None = None) -> int:
             to_height=args.to_height,
             reset=args.reset,
             batch_size=args.batch_size,
+            confirmations=args.confirmations,
         )
         snapshot = emissions_snapshot(store)
         if args.json:
@@ -8707,9 +9358,9 @@ def main(argv: list[str] | None = None) -> int:
         from_height = args.from_height
         if from_height is None and args.since_date == "2026-04-14 12:30":
             from_height = DEFAULT_MONITORING_FROM_HEIGHT
-        elif from_height is None and since_time:
+        elif from_height is None and since_time and not args.skip_sync:
             from_height = block_height_at_or_after(client, since_time)
-        rpc = build_rpc_client(args)
+        rpc = None if args.skip_sync else build_rpc_client(args)
         stats = publish_static_snapshot(
             store,
             client,
@@ -8725,14 +9376,40 @@ def main(argv: list[str] | None = None) -> int:
             csv_path=args.csv,
             next_hop_limit=args.next_hop_limit,
             node_spend_limit=args.node_spend_limit,
+            sysnode_mnlist_url=args.sysnode_mnlist_url,
+            sysnode_time_lookup_limit=args.sysnode_time_lookup_limit,
+            skip_sync=args.skip_sync,
         )
         masternode_stats = stats.get("masternodes") or {}
         print(
             f"Published static snapshot to {args.output_dir}; "
-            f"wallet_seen={stats['wallet']['seen']} wallet_new={stats['wallet']['inserted']} "
-            f"next_hop_found={stats['next_hop']['found_spends']} "
-            f"node_spends={stats['node_spends']['found_spends']} "
+            f"wallet_seen={stats.get('wallet', {}).get('seen', '-')} wallet_new={stats.get('wallet', {}).get('inserted', '-')} "
+            f"next_hop_found={stats.get('next_hop', {}).get('found_spends', '-')} "
+            f"node_spends={stats.get('node_spends', {}).get('found_spends', '-')} "
             f"sentry_nodes={masternode_stats.get('current', '-')}"
+        )
+        return 0
+
+    if args.command == "publish-sn-comp":
+        rpc = build_rpc_client(args)
+        stats = publish_sn_comp_snapshot(
+            store,
+            client,
+            rpc,
+            output_dir=args.output_dir,
+            refresh_seconds=args.refresh_seconds,
+            csv_path=args.csv,
+            sysnode_mnlist_url=args.sysnode_mnlist_url,
+            sysnode_time_lookup_limit=args.sysnode_time_lookup_limit,
+        )
+        masternode_stats = stats.get("masternodes") or {}
+        comp_stats = stats.get("sn_comp") or {}
+        print(
+            f"Published SN Comp snapshot to {args.output_dir}; "
+            f"sentry_nodes={masternode_stats.get('current', '-')} "
+            f"chain_height={masternode_stats.get('chain_height', '-')} "
+            f"entries={comp_stats.get('entries', '-')} "
+            f"online={comp_stats.get('still_online', '-')}"
         )
         return 0
 
@@ -8805,7 +9482,34 @@ def main(argv: list[str] | None = None) -> int:
             )
             masternode_thread.start()
         elif args.masternode_sync_interval > 0:
-            print("Sentry node live sync disabled: no RPC URL/host supplied.", file=sys.stderr)
+            def sysnode_sync_loop() -> None:
+                sync_store = Store(Path(args.db))
+                sync_client = BlockbookClient(args.blockbook_url, insecure_tls=args.insecure_tls)
+                while True:
+                    started = time.monotonic()
+                    try:
+                        with DB_WRITE_LOCK:
+                            stats = sync_network_masternodes_from_sysnode(
+                                sync_store,
+                                sync_client,
+                                url=args.sysnode_mnlist_url,
+                                time_lookup_limit=args.sysnode_time_lookup_limit,
+                            )
+                        if stats is not None:
+                            print(
+                                f"{now_iso()} sysnode sentry sync current={stats['current']} "
+                                f"enabled={stats['enabled']} added={stats['added']} removed={stats['removed']} "
+                                f"time_heights={stats.get('time_lookup_heights', 0)}",
+                                file=sys.stderr,
+                            )
+                    except Exception as exc:
+                        sync_store.conn.rollback()
+                        print(f"{now_iso()} sysnode sentry sync failed: {exc}", file=sys.stderr)
+                    elapsed = time.monotonic() - started
+                    time.sleep(max(1, args.masternode_sync_interval - int(elapsed)))
+
+            masternode_thread = threading.Thread(target=sysnode_sync_loop, daemon=True)
+            masternode_thread.start()
         serve(
             store,
             args.host,

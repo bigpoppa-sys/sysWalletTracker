@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule SysWalletTracker health
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=1min
+Unit=syswallettracker@health.service
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

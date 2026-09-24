@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule SysWalletTracker backup
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=24h
+Unit=syswallettracker@backup.service
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

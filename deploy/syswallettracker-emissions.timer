@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule SysWalletTracker emissions
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=10s
+Unit=syswallettracker@emissions.service
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

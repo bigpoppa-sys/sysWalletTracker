@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule SysWalletTracker sentry
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=2min
+Unit=syswallettracker@sentry.service
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

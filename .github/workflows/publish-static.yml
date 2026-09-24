@@ -1,0 +1,79 @@
+name: Publish static mirror
+
+# Vercel's GitHub integration still deploys main automatically. This optional
+# mirror job is manual-only and does not require or use a Vercel token.
+on:
+  workflow_dispatch:
+    inputs:
+      vercel_ready:
+        description: Confirm Vercel production is ready for the selected main commit
+        type: boolean
+        required: true
+        default: false
+
+concurrency:
+  group: syswallettracker-live
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish-static:
+    if: github.repository == 'bigpoppa-sys/sysWalletTracker' && github.ref == 'refs/heads/main' && inputs.vercel_ready
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      SYS_TRACKER_VPS_HOST: chris@5.223.55.80
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: Verify source and safe archive
+        run: |
+          set -euo pipefail
+          for script in scripts/*.sh; do bash -n "$script"; done
+          bash scripts/update_vps_from_local.sh --check
+
+      - name: Configure verified SSH access
+        env:
+          SYS_TRACKER_SSH_PRIVATE_KEY: ${{ secrets.SYS_TRACKER_SSH_KEY }}
+          SYS_TRACKER_SSH_KNOWN_HOSTS: ${{ secrets.SYS_TRACKER_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          : "${SYS_TRACKER_SSH_PRIVATE_KEY:?Manual mirror publishing needs SYS_TRACKER_SSH_KEY.}"
+          : "${SYS_TRACKER_SSH_KNOWN_HOSTS:?Set host keys verified independently with the Hetzner console.}"
+          install -d -m 700 "$HOME/.ssh"
+          key="$HOME/.ssh/id_ed25519_hetzner_sysbot"
+          printf '%s\n' "$SYS_TRACKER_SSH_PRIVATE_KEY" > "$key"
+          printf '%s\n' "$SYS_TRACKER_SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$key" "$HOME/.ssh/known_hosts"
+          printf 'SYS_TRACKER_SSH_KEY=%s\n' "$key" >> "$GITHUB_ENV"
+
+      - name: Publish Hetzner static mirror
+        run: bash scripts/update_vps_from_local.sh
+
+      - name: Verify public responses
+        run: |
+          set -euo pipefail
+          stamp="$(date +%s)"
+          for url in \
+            "https://tracker.syscoin.dev/syswallettracker/sentrynode.html?t=$stamp" \
+            "https://tracker.syscoin.dev/syswallettracker/assets/chart.umd.js?t=$stamp" \
+            "https://syswallettracker.vercel.app/sentrynode?force=1&t=$stamp"
+          do
+            curl --fail --silent --show-error --location --connect-timeout 10 --max-time 30 "$url" -o /tmp/tracker-response
+            test -s /tmp/tracker-response
+          done
+
+      - name: Remove deployment credentials
+        if: always()
+        run: rm -f "$HOME/.ssh/id_ed25519_hetzner_sysbot" "$HOME/.ssh/known_hosts"

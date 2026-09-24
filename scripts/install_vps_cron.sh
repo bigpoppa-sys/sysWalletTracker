@@ -3,14 +3,22 @@ set -euo pipefail
 
 REPO_URL="${SYS_TRACKER_REPO_URL:-https://github.com/bigpoppa-sys/sysWalletTracker.git}"
 APP_DIR="${SYS_TRACKER_APP_DIR:-$HOME/sysWalletTracker}"
-RPC_URL="${SYS_RPC_URL:-http://127.0.0.1:8370/}"
-RPC_USER="${SYS_RPC_USER:-u}"
+RPC_URL="${SYS_RPC_URL:-}"
+RPC_USER="${SYS_RPC_USER:-}"
 BLOCKBOOK_URL="${SYS_BLOCKBOOK_URL:-https://explorer-blockbook.syscoin.org}"
+SYSNODE_MNLIST_URL="${SYS_SYSNODE_MNLIST_URL:-https://sysnode.info/mnlist}"
+SYSNODE_TIME_LOOKUP_LIMIT="${SYS_SYSNODE_TIME_LOOKUP_LIMIT:-900}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [ -z "${SYS_RPC_PASSWORD:-}" ]; then
-  echo "Set SYS_RPC_PASSWORD before running this installer." >&2
-  exit 1
+USE_RPC=0
+if [ -n "$RPC_URL" ] || [ -n "$RPC_USER" ] || [ -n "${SYS_RPC_PASSWORD:-}" ]; then
+  USE_RPC=1
+  RPC_URL="${RPC_URL:-http://127.0.0.1:8370/}"
+  RPC_USER="${RPC_USER:-u}"
+  if [ -z "${SYS_RPC_PASSWORD:-}" ]; then
+    echo "Set SYS_RPC_PASSWORD when installing with Syscoin Core RPC enabled." >&2
+    exit 1
+  fi
 fi
 
 for required in python3 crontab; do
@@ -42,22 +50,28 @@ fi
 mkdir -p "$APP_DIR/logs"
 
 {
-  printf 'SYS_RPC_URL=%q\n' "$RPC_URL"
-  printf 'SYS_RPC_USER=%q\n' "$RPC_USER"
-  printf 'SYS_RPC_PASSWORD=%q\n' "$SYS_RPC_PASSWORD"
+  if [ "$USE_RPC" -eq 1 ]; then
+    printf 'SYS_RPC_URL=%q\n' "$RPC_URL"
+    printf 'SYS_RPC_USER=%q\n' "$RPC_USER"
+    printf 'SYS_RPC_PASSWORD=%q\n' "$SYS_RPC_PASSWORD"
+  fi
   printf 'SYS_BLOCKBOOK_URL=%q\n' "$BLOCKBOOK_URL"
+  printf 'SYS_SYSNODE_MNLIST_URL=%q\n' "$SYSNODE_MNLIST_URL"
+  printf 'SYS_SYSNODE_TIME_LOOKUP_LIMIT=%q\n' "$SYSNODE_TIME_LOOKUP_LIMIT"
 } >"$APP_DIR/.env"
 chmod 600 "$APP_DIR/.env"
 
-chmod +x "$APP_DIR/scripts/masternode_cron_sync.sh" "$APP_DIR/scripts/static_snapshot_cron.sh"
+chmod +x "$APP_DIR/scripts/masternode_cron_sync.sh" "$APP_DIR/scripts/static_snapshot_cron.sh" "$APP_DIR/scripts/sn_comp_snapshot_cron.sh"
 
 "$APP_DIR/scripts/static_snapshot_cron.sh"
+"$APP_DIR/scripts/sn_comp_snapshot_cron.sh"
 
 tmp_cron="$(mktemp)"
 crontab -l 2>/dev/null | sed '/# sysWalletTracker sentry node watcher start/,/# sysWalletTracker sentry node watcher end/d' | sed '/# sysWalletTracker masternode watcher start/,/# sysWalletTracker masternode watcher end/d' >"$tmp_cron" || true
 cat >>"$tmp_cron" <<CRON
 # sysWalletTracker sentry node watcher start
 * * * * * "$APP_DIR/scripts/static_snapshot_cron.sh"
+* * * * * "$APP_DIR/scripts/sn_comp_snapshot_cron.sh"
 # sysWalletTracker sentry node watcher end
 CRON
 crontab "$tmp_cron"

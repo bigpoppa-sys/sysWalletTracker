@@ -1,0 +1,31 @@
+[Unit]
+Description=Syscoin archival UTXO node for SysWalletTracker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=syswallettracker
+Group=syswallettracker
+Slice=syswallettracker.slice
+ExecCondition=/usr/bin/python3 /srv/syswallettracker/app/scripts/check_tracker_disk.py
+ExecStart=/usr/local/bin/syscoind -datadir=/srv/syswallettracker/core
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=180
+KillSignal=SIGTERM
+Nice=10
+CPUQuota=150%
+MemoryHigh=2400M
+MemoryMax=3200M
+MemorySwapMax=1G
+IOWeight=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/syswallettracker/core
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

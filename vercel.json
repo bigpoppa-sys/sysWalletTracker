@@ -1,8 +1,10 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "installCommand": "echo \"No install step required\"",
   "functions": {
     "api/index.py": {
-      "maxDuration": 60
+      "maxDuration": 60,
+      "excludeFiles": "{.git/**,.github/**,.vercel/**,.ssh/**,node_modules/**,__pycache__/**,api/__pycache__/**,reports/**,*.sqlite,*.sqlite-*,*.log,handoff.md,destinations*.csv}"
     }
   },
   "rewrites": [

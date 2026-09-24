@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule SysWalletTracker wallet
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+Unit=syswallettracker@wallet.service
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

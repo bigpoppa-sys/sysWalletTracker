@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule SysWalletTracker downstream tracing
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=5min
+Unit=syswallettracker@traces.service
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

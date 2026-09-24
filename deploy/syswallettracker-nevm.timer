@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule SysWalletTracker nevm
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=15s
+Unit=syswallettracker@nevm.service
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

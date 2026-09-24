@@ -1,0 +1,6 @@
+[Unit]
+Description=Pause chain sync if storage runs low
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c '/usr/bin/python3 /srv/syswallettracker/app/scripts/check_tracker_disk.py || /usr/bin/systemctl stop syscoin-tracker.service'

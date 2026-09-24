@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import gzip
 import io
 import json
 import os
@@ -11,6 +12,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
@@ -59,6 +61,7 @@ from syscoin_tracker import (  # noqa: E402
     refresh_spent_first_hops,
     sync_address,
     sync_network_masternodes,
+    sync_network_masternodes_from_sysnode,
     sys_to_sats,
     sn_comp_html,
     top_wallets_snapshot,
@@ -68,8 +71,10 @@ from syscoin_tracker import (  # noqa: E402
 
 DEFAULT_SINCE_DATE = "2026-04-14 12:30"
 DEFAULT_FROM_HEIGHT = 2221358
-DEFAULT_NETWORK_MASTERNODES_URL = "http://142.93.241.64/syswallettracker/network_masternodes.csv"
-DEFAULT_STATIC_BASE_URL = "https://syscoin.dev/syswallettracker"
+DEFAULT_NETWORK_MASTERNODES_URL = ""
+DEFAULT_STATIC_BASE_URL = ""
+STATIC_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
+STATIC_RETRY_AFTER_SECONDS = 60
 DB_PATH = Path(os.getenv("SYS_TRACKER_DB", "/tmp/syscoin_tracker.sqlite"))
 VERIFIED_SENTRIES_PATH = ROOT / "verified_sentries.csv"
 NODE_OUTPUTS_PATH = ROOT / "node_outputs.csv"
@@ -77,6 +82,9 @@ INSTALL_BUNDLE_FILES = (
     "syscoin_tracker.py",
     "DEPLOYMENT.md",
     "README.md",
+    ".python-version",
+    "pyproject.toml",
+    "uv.lock",
     "package.json",
     "package-lock.json",
     "vercel.json",
@@ -111,7 +119,18 @@ _client: BlockbookClient | None = None
 _rpc_client: SyscoinRpcClient | None = None
 _from_height: int | None = None
 _last_sync_at = 0.0
+_last_masternode_sync_at = 0.0
 _static_page_cache: dict[str, tuple[float, bytes]] = {}
+
+
+@dataclass(frozen=True)
+class StaticPage:
+    body: bytes
+    stale_age_seconds: int | None = None
+
+
+class StaticUpstreamUnavailable(Exception):
+    pass
 
 
 def env_int(name: str, default: int) -> int:
@@ -119,6 +138,13 @@ def env_int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except ValueError:
         return default
+
+
+def env_enabled(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"", "0", "false", "none", "off", "no", "disabled"}
 
 
 def get_store() -> Store:
@@ -258,7 +284,7 @@ def load_remote_network_masternodes(store: Store) -> bool:
         return False
 
 
-def fetch_static_page(path: str, *, force: bool = False) -> bytes | None:
+def fetch_static_page(path: str, *, force: bool = False) -> StaticPage | None:
     base_url = os.getenv("SYS_TRACKER_STATIC_BASE_URL", DEFAULT_STATIC_BASE_URL).strip().rstrip("/")
     if not base_url or base_url.lower() in {"0", "false", "none", "off"}:
         return None
@@ -281,17 +307,17 @@ def fetch_static_page(path: str, *, force: bool = False) -> bytes | None:
     else:
         page_name = "index.html"
     url = f"{base_url}/{page_name}"
-    cache_ttl = env_int("SYS_TRACKER_STATIC_CACHE_SECONDS", 30)
+    cache_ttl = min(env_int("SYS_TRACKER_STATIC_CACHE_SECONDS", 30), STATIC_CACHE_MAX_AGE_SECONDS)
     cache_key = f"{base_url}/{page_name}"
     now = time.monotonic()
     if not force and cache_ttl > 0:
         cached = _static_page_cache.get(cache_key)
         if cached and now - cached[0] <= cache_ttl:
-            return cached[1]
+            return StaticPage(cached[1])
     if force:
         url += f"?t={int(time.time())}"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "sysWalletTracker/1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "sysWalletTracker/1.0", "Accept-Encoding": "gzip"})
         context = None
         if url.startswith("https://"):
             candidates = [
@@ -311,29 +337,36 @@ def fetch_static_page(path: str, *, force: bool = False) -> bytes | None:
                 if cafile and Path(cafile).exists():
                     context = ssl.create_default_context(cafile=cafile)
                     break
-        with urllib.request.urlopen(req, timeout=10, context=context) as resp:
+        with urllib.request.urlopen(req, timeout=env_int("SYS_TRACKER_STATIC_TIMEOUT_SECONDS", 2), context=context) as resp:
             if getattr(resp, "status", 200) != 200:
-                return None
+                raise ValueError("Unexpected static response status")
             body = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                body = gzip.decompress(body)
+            if not body.strip():
+                raise ValueError("Empty static response")
             if path in TOP_WALLETS_PATHS and b"Syscoin Top Wallets" not in body:
-                return None
+                raise ValueError("Unexpected top wallets page")
             if path in EMISSIONS_PATHS and b"Syscoin Network Emissions" not in body:
-                return None
+                raise ValueError("Unexpected emissions page")
             if path in MINERS_PATHS and b"Syscoin Miners" not in body:
-                return None
+                raise ValueError("Unexpected miners page")
             if path in SN_COMP_PATHS and b"Syscoin SN Comp" not in body:
-                return None
-            if path == TOP_WALLETS_JSON_PATH and not body.lstrip().startswith(b"{"):
-                return None
-            if path == EMISSIONS_JSON_PATH and not body.lstrip().startswith(b"{"):
-                return None
-            if path == MINERS_JSON_PATH and not body.lstrip().startswith(b"{"):
-                return None
-            if cache_ttl > 0:
-                _static_page_cache[cache_key] = (now, body)
-            return body
+                raise ValueError("Unexpected SN Comp page")
+            if path in (TOP_WALLETS_JSON_PATH, EMISSIONS_JSON_PATH, MINERS_JSON_PATH):
+                if not isinstance(json.loads(body), dict):
+                    raise ValueError("Unexpected static JSON response")
+            # Keep the last success even when fresh-cache reads are disabled.
+            _static_page_cache[cache_key] = (time.monotonic(), body)
+            return StaticPage(body)
     except Exception:
-        return None
+        cached = _static_page_cache.get(cache_key)
+        if cached:
+            age = time.monotonic() - cached[0]
+            if 0 <= age <= STATIC_CACHE_MAX_AGE_SECONDS:
+                return StaticPage(cached[1], stale_age_seconds=int(age))
+            _static_page_cache.pop(cache_key, None)
+        raise StaticUpstreamUnavailable("Static snapshot temporarily unavailable") from None
 
 
 def get_from_height(client: BlockbookClient, since_time: int | None) -> int | None:
@@ -346,6 +379,62 @@ def get_from_height(client: BlockbookClient, since_time: int | None) -> int | No
     if _from_height is None and since_time:
         _from_height = block_height_at_or_after(client, since_time)
     return _from_height
+
+
+def sync_masternodes_for_request(force: bool = False, time_lookup_scope: str = "full") -> Store:
+    global _last_masternode_sync_at
+    interval = env_int("SYS_TRACKER_MASTERNODE_SYNC_INTERVAL", 60)
+    lookup_default = 0
+
+    with _lock:
+        now = time.monotonic()
+        store = get_store()
+        if not force and _last_masternode_sync_at and now - _last_masternode_sync_at < interval:
+            return store
+
+        client = get_client()
+        if store.conn.execute("SELECT COUNT(*) AS count FROM network_masternodes").fetchone()["count"] == 0:
+            if not load_remote_network_masternodes(store):
+                load_network_masternodes_csv(store)
+
+        rpc = get_rpc_client()
+        if rpc is not None:
+            try:
+                sync_network_masternodes(store, rpc, client)
+            except Exception:
+                try:
+                    sync_network_masternodes_from_sysnode(
+                        store,
+                        client,
+                        time_lookup_limit=env_int("SYS_SYSNODE_TIME_LOOKUP_LIMIT", lookup_default),
+                        time_lookup_scope=time_lookup_scope,
+                    )
+                except Exception:
+                    pass
+        else:
+            try:
+                sync_network_masternodes_from_sysnode(
+                    store,
+                    client,
+                    time_lookup_limit=env_int("SYS_SYSNODE_TIME_LOOKUP_LIMIT", lookup_default),
+                    time_lookup_scope=time_lookup_scope,
+                )
+            except Exception:
+                pass
+        _last_masternode_sync_at = now
+        return store
+
+
+def store_for_render_only() -> tuple[Store, int | None, str | None]:
+    since_date = os.getenv("SYS_TRACKER_SINCE_DATE", DEFAULT_SINCE_DATE)
+    since_time, since_label = parse_since_date(since_date, os.getenv("SYS_TRACKER_TIMEZONE", DEFAULT_TIMEZONE))
+    store = get_store()
+    load_node_outputs(store)
+    load_verified_sentries(store)
+    if store.conn.execute("SELECT COUNT(*) AS count FROM network_masternodes").fetchone()["count"] == 0:
+        if not load_remote_network_masternodes(store):
+            load_network_masternodes_csv(store)
+    return store, since_time, since_label
 
 
 def sync_for_request(force: bool = False) -> tuple[Store, int | None, str | None]:
@@ -381,6 +470,22 @@ def sync_for_request(force: bool = False) -> tuple[Store, int | None, str | None
         if rpc is not None:
             try:
                 sync_network_masternodes(store, rpc, client)
+            except Exception:
+                try:
+                    sync_network_masternodes_from_sysnode(
+                        store,
+                        client,
+                        time_lookup_limit=env_int("SYS_SYSNODE_TIME_LOOKUP_LIMIT", 300),
+                    )
+                except Exception:
+                    pass
+        else:
+            try:
+                sync_network_masternodes_from_sysnode(
+                    store,
+                    client,
+                    time_lookup_limit=env_int("SYS_SYSNODE_TIME_LOOKUP_LIMIT", 300),
+                )
             except Exception:
                 pass
         refresh_spent_first_hops(
@@ -480,24 +585,40 @@ class handler(BaseHTTPRequestHandler):
             else "text/html; charset=utf-8"
         )
         try:
-            static_body = fetch_static_page(parsed.path, force=force)
-            if static_body is not None:
+            static_page = fetch_static_page(parsed.path, force=force)
+            if static_page is not None:
+                static_body = static_page.body
                 self.send_response(200)
                 self.send_header("Content-Type", content_type)
                 cache_header = (
                     "no-store"
-                    if force
+                    if force or static_page.stale_age_seconds is not None
                     else "public, max-age=15, s-maxage=30, stale-while-revalidate=60"
                 )
                 self.send_header("Cache-Control", cache_header)
+                if static_page.stale_age_seconds is not None:
+                    self.send_header("X-Tracker-Static-Cache", "stale")
+                    self.send_header("X-Tracker-Static-Age-Seconds", str(static_page.stale_age_seconds))
                 self.send_header("Content-Length", str(len(static_body)))
                 self.end_headers()
                 if include_body:
                     self.wfile.write(static_body)
                 return
 
-            store, since_time, since_label = sync_for_request(force=force)
-            label = f"{since_label} (from {os.getenv('SYS_TRACKER_SINCE_DATE', DEFAULT_SINCE_DATE)} {os.getenv('SYS_TRACKER_TIMEZONE', DEFAULT_TIMEZONE)})"
+            if parsed.path in (*SENTRY_NODE_PATHS, *SN_COMP_PATHS):
+                store = sync_masternodes_for_request(force=force, time_lookup_scope="sn_comp" if parsed.path in SN_COMP_PATHS else "full")
+                since_date = os.getenv("SYS_TRACKER_SINCE_DATE", DEFAULT_SINCE_DATE)
+                since_time, since_label = parse_since_date(since_date, os.getenv("SYS_TRACKER_TIMEZONE", DEFAULT_TIMEZONE))
+                label = f"{since_label} (from {since_date} {os.getenv('SYS_TRACKER_TIMEZONE', DEFAULT_TIMEZONE)})"
+            else:
+                query = urllib.parse.parse_qs(parsed.query)
+                should_sync = env_enabled("SYS_TRACKER_REQUEST_SYNC", False) or query.get("sync", ["0"])[0] == "1"
+                if should_sync:
+                    store, since_time, since_label = sync_for_request(force=force)
+                else:
+                    store, since_time, since_label = store_for_render_only()
+                label = f"{since_label} (from {os.getenv('SYS_TRACKER_SINCE_DATE', DEFAULT_SINCE_DATE)} {os.getenv('SYS_TRACKER_TIMEZONE', DEFAULT_TIMEZONE)})"
+
             if parsed.path in SENTRY_NODE_PATHS:
                 html_body = masternodes_html(
                     store,
@@ -522,9 +643,10 @@ class handler(BaseHTTPRequestHandler):
             elif parsed.path in MINERS_PATHS:
                 html_body = miners_html(
                     refresh_seconds=env_int("SYS_TRACKER_PAGE_REFRESH_SECONDS", 0),
+                    snapshot=miners_snapshot(store),
                 )
             elif parsed.path == MINERS_JSON_PATH:
-                html_body = json.dumps(miners_snapshot(), indent=2)
+                html_body = json.dumps(miners_snapshot(store), indent=2)
             elif parsed.path in SN_COMP_PATHS:
                 html_body = sn_comp_html(store, refresh_seconds=env_int("SYS_TRACKER_PAGE_REFRESH_SECONDS", 0))
             else:
@@ -538,6 +660,33 @@ class handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if include_body:
+                self.wfile.write(body)
+        except StaticUpstreamUnavailable:
+            message = (
+                "Tracker snapshots are temporarily unavailable. "
+                "No balances or indexes are being shown. Please try again in a minute."
+            )
+            if content_type.startswith("application/json"):
+                body = json.dumps({
+                    "error": "static_upstream_unavailable",
+                    "message": message,
+                    "retry_after_seconds": STATIC_RETRY_AFTER_SECONDS,
+                }).encode("utf-8")
+            else:
+                body = (
+                    '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+                    '<meta name="viewport" content="width=device-width, initial-scale=1">'
+                    '<title>Syscoin Tracker - Temporarily unavailable</title></head>'
+                    '<body><main><h1>Syscoin Tracker temporarily unavailable</h1>'
+                    f'<p>{message}</p></main></body></html>'
+                ).encode("utf-8")
+            self.send_response(503)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Retry-After", str(STATIC_RETRY_AFTER_SECONDS))
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             if include_body:

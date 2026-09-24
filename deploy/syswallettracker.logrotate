@@ -1,0 +1,10 @@
+/srv/syswallettracker/core/debug.log {
+    daily
+    maxsize 50M
+    rotate 3
+    compress
+    missingok
+    notifempty
+    copytruncate
+    su syswallettracker syswallettracker
+}
