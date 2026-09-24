@@ -4001,6 +4001,11 @@ def emissions_snapshot(store: Store, latest_limit: int = 100) -> dict[str, Any]:
     nevm_index = snapshot_index_status(nevm_progress)
     index["rebuilding"] = index["rebuilding"] or not totals_row["blocks"]
     nevm_index["rebuilding"] = nevm_index["rebuilding"] or not nevm_rows
+    if index["rebuilding"] or nevm_index["rebuilding"]:
+        issuance_rate_text = "Rebuilding"
+        for records in periods.values():
+            for record in records:
+                record["issuance_rate_text"] = "Rebuilding"
     totals = {key: int(totals_row[key] or 0) for key in totals_row.keys() if key.endswith("_sats") or key == "blocks"}
     totals.update(
         {
@@ -5630,7 +5635,7 @@ def emissions_html(store: Store, refresh_seconds: int = 60) -> str:
                 "l1": round(float(Decimal(int(row["sentry_l1_sats"])) / SATOSHI), 4),
                 "l2": round(float(Decimal(int(row["sentry_l2_sats"])) / SATOSHI), 4),
                 "fees": round(float(Decimal(int(row["fee_sats"])) / SATOSHI), 4),
-                "rate": float(row["issuance_rate_text"].rstrip("%")) if row["issuance_rate_text"].endswith("%") else 0,
+                "rate": float(row["issuance_rate_text"].rstrip("%")) if row["issuance_rate_text"].endswith("%") else None,
             }
             for row in records
         ]

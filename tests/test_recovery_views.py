@@ -99,6 +99,21 @@ class RecoveryViewTests(unittest.TestCase):
             self.assertEqual(result["totals"]["balance_sats"], 0)
         self.assert_banner(tracker.top_wallets_html(self.store, refresh_seconds=0), rankings=True)
 
+    def test_incomplete_emission_rates_are_not_presented_as_supply_estimates(self):
+        self.seed_emissions()
+        self.progress("emission_index", last=100)
+        self.progress("nevm_emission_index", last=100)
+        snapshot = tracker.emissions_snapshot(self.store)
+        self.assertEqual(snapshot["totals"]["issuance_rate_text"], "Rebuilding")
+        for records in snapshot["periods"].values():
+            self.assertTrue(records)
+            self.assertTrue(all(row["issuance_rate_text"] == "Rebuilding" for row in records))
+        page = tracker.emissions_html(self.store, refresh_seconds=0)
+        self.assertIn('"rate": null', page)
+        self.progress("emission_index", confirmations=12)
+        self.progress("nevm_emission_index", confirmations=12)
+        self.assertTrue(tracker.emissions_snapshot(self.store)["totals"]["issuance_rate_text"].endswith("%"))
+
     def test_wallet_completion_uses_safe_height_then_confirmations_then_legacy_tip(self):
         self.seed_wallets()
         cases = (
