@@ -3,7 +3,7 @@ Description=Verify sentry transaction dates against block data
 
 [Timer]
 OnBootSec=3min
-OnUnitInactiveSec=15s
+OnUnitInactiveSec=2min
 Unit=syswallettracker@times.service
 AccuracySec=5s
 

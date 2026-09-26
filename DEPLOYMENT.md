@@ -78,6 +78,23 @@ reconstruct the full wallet, clustering or emissions indexes. Let the relevant
 worker jobs rebuild from chain data and report incomplete indexes honestly.
 Do not run the old cron installer alongside the systemd workers.
 
+## Shared-Host Indexing Budget
+
+Core has `MemoryHigh=3500M` and `MemoryMax=4000M`; the tracker slice has
+`MemoryHigh=5G` and `MemoryMax=5500M` on the existing 7.6 GiB host. This reserves
+roughly 2 GiB outside the tracker hard limit for the MM bot and operating system.
+The node's earlier 2400M high threshold caused continuous reclaim and exhausted
+RPC queues despite spare host RAM. Do not tune from `free` alone: inspect both
+service and parent-slice `memory.pressure`, `memory.events`, and actual index
+checkpoint timestamps. HTTP 200 from a static page does not prove indexing is live.
+
+Heavy database/RPC work is serialized by the worker before opening SQLite.
+Historical Core readers use 500-block invocations with five-block RPC batches,
+and failed Core requests apply a shared cooldown before another indexer retries.
+Health checks remain independent. Keep the shared lock and work bounds when
+changing timers; increasing `rpcworkqueue` does not fix a memory-starved node.
+No chain or index reset is needed when only resource pressure caused a stall.
+
 ## Local Verification
 
 From the repository, inspect intentional existing changes before selecting any

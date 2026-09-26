@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import closing
+from contextlib import ExitStack, closing, contextmanager
 import fcntl
 import gzip
 import json
@@ -26,11 +26,84 @@ DATA = Path(os.getenv("SYS_TRACKER_DATA_DIR", "/srv/syswallettracker/data"))
 PUBLIC = Path(os.getenv("SYS_TRACKER_PUBLIC_DIR", "/var/www/html/syswallettracker"))
 CORE = Path(os.getenv("SYSCOIN_DATA_DIR", "/srv/syswallettracker/core"))
 DB = DATA / "syscoin_tracker.sqlite"
+CORE_JOBS = {"top", "clusters", "emissions", "times", "sentry"}
+HEAVY_JOBS = CORE_JOBS | {"nevm", "publish", "backup"}
+LOCK_WAIT_SECONDS = 600
+LOCK_POLL_SECONDS = 0.25
+CORE_COOLDOWN_SECONDS = 60
+HISTORICAL_RPC_TIMEOUT = 120
+HISTORICAL_MAX_BLOCKS = 500
+HISTORICAL_BATCH_SIZE = 5
 
 
-def core_rpc() -> tracker.SyscoinRpcClient:
+def core_rpc(*, timeout: int = 30) -> tracker.SyscoinRpcClient:
     username, password = (CORE / ".cookie").read_text().strip().split(":", 1)
-    return tracker.SyscoinRpcClient("http://127.0.0.1:8370/", username, password, timeout=30)
+    return tracker.SyscoinRpcClient("http://127.0.0.1:8370/", username, password, timeout=timeout)
+
+
+class HistoricalRpcError(RuntimeError):
+    """Distinguish RPC failures from indexing or SQLite failures."""
+
+
+class HistoricalCoreRpc:
+    def __init__(self, rpc: tracker.SyscoinRpcClient) -> None:
+        self.rpc = rpc
+
+    def _request(self, method: str, *args):
+        try:
+            return getattr(self.rpc, method)(*args)
+        except Exception as exc:
+            raise HistoricalRpcError(str(exc)) from exc
+
+    def call(self, method: str, params=None):
+        return self._request("call", method, params)
+
+    def batch_call(self, calls):
+        return self._request("batch_call", calls)
+
+
+@contextmanager
+def wait_for_lock(path: Path, deadline: float, on_wait):
+    with path.open("a") as lock:
+        waiting = False
+        while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Queue timeout waiting for {path.name}")
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if not waiting:
+                    on_wait()
+                    waiting = True
+                time.sleep(min(LOCK_POLL_SECONDS, max(0, deadline - time.monotonic())))
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def write_job_status(status: dict, *, persist: bool = True) -> None:
+    if persist:
+        tracker.atomic_write_json(DATA / f"job-{status['job']}.json", status)
+    print(json.dumps(status), flush=True)
+
+
+def wait_for_core_cooldown(status: dict, deadline: float) -> None:
+    path = DATA / ".core-cooldown.json"
+    if not path.exists():
+        return
+    until = float(json.loads(path.read_text())["until"])
+    remaining = until - time.time()
+    if remaining <= 0:
+        return
+    status.update(state="cooldown", waiting_for="core_cooldown", cooldown_until=until)
+    write_job_status(status)
+    budget = max(0, deadline - time.monotonic())
+    time.sleep(min(remaining, budget))
+    if remaining >= budget:
+        raise TimeoutError("Queue timeout waiting for Core cooldown")
+    status.pop("cooldown_until", None)
 
 
 def check_disk() -> None:
@@ -74,7 +147,7 @@ def backup_database() -> dict:
     return {"archive": archive.name, "bytes": archive.stat().st_size}
 
 
-def run_job(job: str, store: tracker.Store) -> dict:
+def run_job(job: str, store: tracker.Store | None) -> dict:
     client = tracker.BlockbookClient(
         os.getenv("SYS_BLOCKBOOK_URL", tracker.DEFAULT_BLOCKBOOK_URL), timeout=15, retries=2
     )
@@ -145,7 +218,7 @@ def run_job(job: str, store: tracker.Store) -> dict:
             raise RuntimeError(f"Static publication failed with exit code {result}")
         return {"published_at": tracker.now_iso()}
     if job in {"top", "clusters", "emissions"}:
-        rpc = core_rpc()
+        rpc = HistoricalCoreRpc(core_rpc(timeout=HISTORICAL_RPC_TIMEOUT))
         info = rpc.call("getblockchaininfo")
         if info.get("initialblockdownload"):
             return {"waiting_for_chain": True, "blocks": info["blocks"], "headers": info["headers"]}
@@ -154,7 +227,10 @@ def run_job(job: str, store: tracker.Store) -> dict:
             "clusters": tracker.sync_top_wallet_cluster_index,
             "emissions": tracker.sync_emission_index,
         }[job]
-        result = function(store, rpc, max_blocks=2000, batch_size=50, confirmations=12)
+        result = function(
+            store, rpc, max_blocks=HISTORICAL_MAX_BLOCKS,
+            batch_size=HISTORICAL_BATCH_SIZE, confirmations=12,
+        )
         key = {"top": "top_wallet_index", "clusters": "top_wallet_cluster_index", "emissions": "emission_index"}[job]
         progress = store.get_meta(key, {}) or {}
         progress.update(confirmations=12, safe_height=result["safe_height"])
@@ -165,7 +241,8 @@ def run_job(job: str, store: tracker.Store) -> dict:
         if not url:
             return {"configured": False}
         result = tracker.sync_nevm_emission_index(
-            store, tracker.EvmRpcClient(url), max_blocks=2000, batch_size=50, confirmations=12
+            store, tracker.EvmRpcClient(url, timeout=HISTORICAL_RPC_TIMEOUT),
+            max_blocks=HISTORICAL_MAX_BLOCKS, batch_size=HISTORICAL_BATCH_SIZE, confirmations=12,
         )
         progress = store.get_meta("nevm_emission_index", {}) or {}
         progress.update(confirmations=12, safe_height=result["safe_height"])
@@ -191,38 +268,74 @@ def run_job(job: str, store: tracker.Store) -> dict:
     raise ValueError(job)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("job", choices=["wallet", "traces", "sentry", "times", "miners", "publish", "top", "clusters", "emissions", "nevm", "backup", "health"])
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     DATA.mkdir(parents=True, exist_ok=True)
     PUBLIC.mkdir(parents=True, exist_ok=True)
-    with (DATA / f".{args.job}.lock").open("a") as lock:
+    deadline = time.monotonic() + LOCK_WAIT_SECONDS
+    status = {
+        "queued_at": tracker.now_iso(), "job": args.job, "state": "queued",
+        "ok": None, "waiting_for": f".{args.job}.lock",
+    }
+    owns_status = False
+    with ExitStack() as locks:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return 0
-        status = {"started_at": tracker.now_iso(), "job": args.job}
-        store = None
-        try:
-            if args.job != "health":
-                check_disk()
-            if not DB.is_file() or DB.stat().st_size == 0:
-                raise RuntimeError("Tracker database is missing or empty; restore it before running jobs")
-            if args.job == "backup":
-                status["result"] = backup_database()
-            else:
-                store = tracker.Store(DB)
-                status["result"] = run_job(args.job, store)
-            status["ok"] = True
+            locks.enter_context(wait_for_lock(
+                DATA / f".{args.job}.lock", deadline,
+                lambda: write_job_status(status, persist=False),
+            ))
+            owns_status = True
+            status_path = DATA / f"job-{args.job}.json"
+            previous = json.loads(status_path.read_text()) if status_path.exists() else {}
+            if previous.get("ok") is True:
+                status["last_success"] = {key: value for key, value in previous.items() if key != "last_success"}
+            elif previous.get("last_success") is not None:
+                status["last_success"] = previous["last_success"]
+
+            if args.job in HEAVY_JOBS:
+                status["waiting_for"] = ".heavy.lock"
+                write_job_status(status)
+                locks.enter_context(wait_for_lock(
+                    DATA / ".heavy.lock", deadline, lambda: None,
+                ))
+                if args.job in CORE_JOBS:
+                    wait_for_core_cooldown(status, deadline)
+
+            status.pop("waiting_for", None)
+            status.update(state="running", started_at=tracker.now_iso())
+            write_job_status(status)
+            store = None
+            try:
+                if args.job == "health":
+                    status["result"] = run_job(args.job, None)
+                else:
+                    check_disk()
+                    if not DB.is_file() or DB.stat().st_size == 0:
+                        raise RuntimeError("Tracker database is missing or empty; restore it before running jobs")
+                    if args.job == "backup":
+                        status["result"] = backup_database()
+                    else:
+                        store = tracker.Store(DB)
+                        status["result"] = run_job(args.job, store)
+            finally:
+                if store is not None:
+                    store.conn.close()
+            status.update(ok=True, state="succeeded")
         except Exception as exc:
-            status.update(ok=False, error=str(exc))
-        finally:
-            if store is not None:
-                store.conn.close()
+            status.update(ok=False, state="failed", error=str(exc))
+            if isinstance(exc, HistoricalRpcError):
+                until = time.time() + CORE_COOLDOWN_SECONDS
+                tracker.atomic_write_json(DATA / ".core-cooldown.json", {
+                    "until": until, "job": args.job, "error": str(exc),
+                })
+                status["cooldown_until"] = until
         status["finished_at"] = tracker.now_iso()
-        tracker.atomic_write_json(DATA / f"job-{args.job}.json", status)
-        print(json.dumps(status), flush=True)
+        if status["ok"]:
+            status["last_success"] = {key: value for key, value in status.items() if key != "last_success"}
+        # A duplicate invocation must not overwrite the current owner's status.
+        write_job_status(status, persist=owns_status)
         return 0 if status["ok"] else 1
 
 
