@@ -395,13 +395,9 @@ def explorer_tx_url(txid: str) -> str:
     return f"https://explorer-blockbook.syscoin.org/tx/{urllib.parse.quote(txid)}"
 
 
-def exchange_labels_for_address(address: str, exchange_tags: dict[str, str], exchange_routes: dict[str, str]) -> set[str]:
-    labels = set()
-    if address in exchange_tags:
-        labels.add(exchange_tags[address])
-    if address in exchange_routes:
-        labels.add(exchange_routes[address])
-    return labels
+def exchange_labels_for_address(address: str, exchange_tags: dict[str, str]) -> set[str]:
+    label = exchange_tags.get(address)
+    return {label} if label else set()
 
 
 def load_exchange_tags(path: Path = DEFAULT_EXCHANGE_TAGS_PATH) -> dict[str, str]:
@@ -412,6 +408,7 @@ def load_exchange_tags(path: Path = DEFAULT_EXCHANGE_TAGS_PATH) -> dict[str, str
             row["address"].strip(): row["label"].strip()
             for row in csv.DictReader(f)
             if row.get("address") and row.get("label")
+            and (row.get("status") or "").strip() == "identified"
         }
 
 
@@ -422,7 +419,7 @@ def load_wallet_labels(path: Path = DEFAULT_WALLET_LABELS_PATH) -> dict[str, dic
     with path.open(newline="") as f:
         for row in csv.DictReader(f):
             address = (row.get("address") or "").strip()
-            if not address:
+            if not address or (row.get("status") or "").strip() != "identified":
                 continue
             labels[address] = {
                 "name": (row.get("name") or "").strip(),
@@ -2822,6 +2819,8 @@ def reset_top_wallet_index(store: Store, start_height: int = 0) -> None:
         "top_wallet_index",
         {
             "last_height": start_height - 1,
+            "history_start_height": start_height,
+            "history_complete": start_height == 0,
             "last_hash": "",
             "chain_height": None,
             "synced_at": now_iso(),
@@ -3030,7 +3029,7 @@ def process_top_wallet_cluster_block(
 ) -> dict[str, int]:
     block_height = int(block.get("height") or 0)
     block_time = int_or_none(block.get("time"))
-    sentry_collateral_outpoints = sentry_collateral_outpoints or {}
+    # Keep the argument for older callers; funding collateral is not ownership evidence.
     stats = {
         "txs": 0,
         "outputs": 0,
@@ -3090,22 +3089,6 @@ def process_top_wallet_cluster_block(
             if value_sats <= 0:
                 continue
             output_index = int(vout.get("n", 0) or 0)
-            collateral_address = sentry_collateral_outpoints.get((txid, output_index))
-            if (
-                collateral_address
-                and value_sats == SENTRY_COLLATERAL_SATS
-                and unique_input_addresses
-            ):
-                sentry_edges = 0
-                for input_address in unique_input_addresses:
-                    if input_address == collateral_address:
-                        continue
-                    save_top_wallet_cluster_edge(store, input_address, collateral_address, block_height, block_time)
-                    stats["edges"] += 1
-                    stats["sentry_edges"] += 1
-                    sentry_edges += 1
-                if sentry_edges:
-                    stats["sentry_groups"] += 1
             cursor = store.conn.execute(
                 """
                 INSERT OR IGNORE INTO top_wallet_cluster_utxos(
@@ -3137,6 +3120,11 @@ def sync_top_wallet_index(
 
     progress = top_wallet_progress(store)
     last_height = int_or_none(progress.get("last_height"))
+    if last_height is not None and last_height >= 0 and start_height > last_height + 1:
+        raise ValueError("Cannot skip unindexed blocks in an existing address index")
+    if last_height is None or last_height < 0:
+        progress.setdefault("history_start_height", start_height)
+        progress.setdefault("history_complete", start_height == 0)
     if last_height is None or last_height < start_height - 1:
         last_height = start_height - 1
     chain_height = int(rpc.call("getblockcount"))
@@ -3160,7 +3148,8 @@ def sync_top_wallet_index(
         "safe_height": safe_height,
     }
     if target_height <= last_height:
-        progress.update({"chain_height": chain_height, "safe_height": safe_height, "synced_at": now_iso()})
+        progress.update({"chain_height": chain_height, "safe_height": safe_height,
+                         "confirmations": confirmations, "synced_at": now_iso()})
         store.set_meta("top_wallet_index", progress)
         return totals
 
@@ -3183,12 +3172,14 @@ def sync_top_wallet_index(
 
             store.conn.execute("BEGIN")
             block_stats = process_top_wallet_block(store, block)
-            progress = {
+            progress.update({
                 "last_height": block_height,
                 "last_hash": block_hash,
                 "chain_height": chain_height,
+                "safe_height": safe_height,
+                "confirmations": confirmations,
                 "synced_at": now_iso(),
-            }
+            })
             store.set_meta("top_wallet_index", progress, commit=False)
             store.conn.commit()
 
@@ -3356,175 +3347,76 @@ def rebuilding_notice(indexes: list[tuple[str, dict[str, Any]]], *, rankings: bo
 
 
 def top_wallet_cluster_snapshot(store: Store, limit: int = 100) -> dict[str, Any]:
+    # Legacy edges mix co-spends with funding links, so they cannot establish ownership.
     index = snapshot_index_status(top_wallet_cluster_progress(store))
-    edge_totals = store.conn.execute(
-        """
-        SELECT COUNT(*) AS edges,
-               COALESCE(SUM(tx_count), 0) AS edge_observations
-        FROM top_wallet_cluster_edges
-        """
+    totals = store.conn.execute(
+        "SELECT COUNT(*) AS edges, COALESCE(SUM(tx_count), 0) AS edge_observations "
+        "FROM top_wallet_cluster_edges"
     ).fetchone()
-    balance_rows = store.conn.execute(
-        """
-        SELECT address, balance_sats, utxo_count, last_seen_height, last_seen_time
-        FROM top_wallet_balances
-        WHERE balance_sats > 0
-        """
-    ).fetchall()
-    balance_total = sum(int(row["balance_sats"] or 0) for row in balance_rows)
-    index["rebuilding"] = (
-        index["rebuilding"] or not balance_rows
-        or not snapshot_index_status(top_wallet_progress(store))["complete"]
-    )
-
-    if not edge_totals["edges"]:
-        return {
-            "generated_at": now_iso(),
-            "type": "estimated_wallet_clusters",
-            "stage": "forensic-clusters",
-            "limit": limit,
-            "index": index,
-            "totals": {
-                "clusters": 0,
-                "funded_addresses": len(balance_rows),
-                "known_exchange_clusters": 0,
-                "estimated_private_holders": 0,
-                "balance_sats": balance_total,
-                "balance_sys": sats_to_sys_string(balance_total),
-                "known_exchange_sats": 0,
-                "known_exchange_sys": "0",
-                "private_unknown_sats": balance_total,
-                "private_unknown_sys": sats_to_sys_string(balance_total),
-                "edges": 0,
-                "edge_observations": 0,
-            },
-            "wallets": [],
-        }
-
-    union = UnionFind()
-    for row in store.conn.execute("SELECT address_a, address_b FROM top_wallet_cluster_edges"):
-        union.union(row["address_a"], row["address_b"])
-    member_counts: dict[str, int] = {}
-    for address in list(union.parent):
-        root = union.find(address)
-        member_counts[root] = member_counts.get(root, 0) + 1
-    node_counts: dict[str, int] = {}
-    if store.conn.execute("SELECT COUNT(*) AS count FROM network_masternodes").fetchone()["count"] == 0:
-        load_network_masternodes_csv(store)
-    for row in store.conn.execute(
-        """
-        SELECT collateral_address
-        FROM network_masternodes
-        WHERE collateral_address != '' AND COALESCE(removed_at, '') = ''
-        """
-    ):
-        collateral_address = str(row["collateral_address"] or "")
-        if not collateral_address:
-            continue
-        root = union.find(collateral_address)
-        node_counts[root] = node_counts.get(root, 0) + 1
-
-    exchange_tags = load_exchange_tags()
-    wallet_labels = load_wallet_labels()
-    clusters: dict[str, dict[str, Any]] = {}
-    for row in balance_rows:
-        address = row["address"]
-        root = union.find(address)
-        balance_sats = int(row["balance_sats"] or 0)
-        cluster = clusters.setdefault(
-            root,
-            {
-                "address": address,
-                "address_count": member_counts.get(root, 0),
-                "funded_address_count": 0,
-                "balance_sats": 0,
-                "utxo_count": 0,
-                "last_seen_height": None,
-                "last_seen_time": None,
-                "representative_balance_sats": -1,
-                "name": short_address(address),
-                "label": "Unknown",
-                "label_priority": 0,
-                "node_count": node_counts.get(root, 0),
-            },
-        )
-        cluster["funded_address_count"] += 1
-        if int(cluster["address_count"]) < int(cluster["funded_address_count"]):
-            cluster["address_count"] = int(cluster["funded_address_count"])
-        cluster["balance_sats"] += balance_sats
-        cluster["utxo_count"] += int(row["utxo_count"] or 0)
-        if balance_sats > int(cluster["representative_balance_sats"]):
-            cluster["address"] = address
-            cluster["representative_balance_sats"] = balance_sats
-        row_height = int_or_none(row["last_seen_height"])
-        if row_height is not None and row_height >= (int_or_none(cluster["last_seen_height"]) or -1):
-            cluster["last_seen_height"] = row_height
-            cluster["last_seen_time"] = row["last_seen_time"]
-
-        identity = wallet_identity_for_address(address, wallet_labels, exchange_tags)
-        label = identity["label"]
-        priority = 2 if label == "Exchange" else 1 if label != "Unknown" else 0
-        if priority > int(cluster["label_priority"]):
-            cluster["name"] = identity["name"]
-            cluster["label"] = label
-            cluster["label_priority"] = priority
-
-    for root, node_count in node_counts.items():
-        cluster = clusters.get(root)
-        if not cluster:
-            continue
-        cluster["node_count"] = node_count
-        if cluster["label"] == "Unknown":
-            cluster["label"] = "Node Operator"
-            cluster["label_priority"] = 1
-
-    ordered = sorted(clusters.values(), key=lambda item: (-int(item["balance_sats"]), str(item["address"])))
-    wallets = []
-    for rank, cluster in enumerate(ordered[:limit], 1):
-        balance_sats = int(cluster["balance_sats"])
-        wallets.append(
-            {
-                "rank": rank,
-                "name": cluster["name"],
-                "label": cluster["label"],
-                "address": cluster["address"],
-                "addresses": [cluster["address"]],
-                "address_count": int(cluster["address_count"]),
-                "balance_sats": balance_sats,
-                "balance_sys": sats_to_sys_string(balance_sats),
-                "utxo_count": int(cluster["utxo_count"]),
-                "node_count": int(cluster.get("node_count") or 0),
-                "last_seen_height": cluster["last_seen_height"],
-                "last_seen_time": cluster["last_seen_time"],
-                "percent_text": fmt_percent(balance_sats, balance_total),
-            }
-        )
-
-    known_exchange_clusters = sum(1 for item in clusters.values() if item["label"] == "Exchange")
-    known_exchange_sats = sum(int(item["balance_sats"]) for item in clusters.values() if item["label"] == "Exchange")
-    private_unknown_sats = balance_total - known_exchange_sats
     return {
         "generated_at": now_iso(),
-        "type": "estimated_wallet_clusters",
-        "stage": "forensic-clusters",
+        "type": "legacy_link_diagnostics",
+        "available": False,
+        "reason": "Historical links do not establish common ownership. Use individual address balances.",
         "limit": limit,
         "index": index,
-        "totals": {
-            "clusters": len(clusters),
-            "funded_addresses": len(balance_rows),
-            "known_exchange_clusters": known_exchange_clusters,
-            "estimated_private_holders": len(clusters) - known_exchange_clusters,
-            "balance_sats": balance_total,
-            "balance_sys": sats_to_sys_string(balance_total),
-            "known_exchange_sats": known_exchange_sats,
-            "known_exchange_sys": sats_to_sys_string(known_exchange_sats),
-            "private_unknown_sats": private_unknown_sats,
-            "private_unknown_sys": sats_to_sys_string(private_unknown_sats),
-            "edges": int(edge_totals["edges"] or 0),
-            "edge_observations": int(edge_totals["edge_observations"] or 0),
-        },
-        "wallets": wallets,
+        "totals": dict(totals),
+        "wallets": [],
     }
+
+
+def address_balance_for_display(store: Store, address: str) -> dict[str, Any] | None:
+    progress = top_wallet_progress(store)
+    index = snapshot_index_status(progress)
+    has_balances = store.conn.execute(
+        "SELECT 1 FROM top_wallet_balances WHERE balance_sats > 0 LIMIT 1"
+    ).fetchone()
+    if index["complete"] and has_balances and progress.get("history_complete") is not False:
+        row = store.conn.execute(
+            "SELECT balance_sats FROM top_wallet_balances WHERE address = ?", (address,)
+        ).fetchone()
+        # Older indexes did not record history coverage; absence alone cannot prove zero.
+        if row is not None or progress.get("history_complete") is True:
+            return {
+                "balance_sats": int(row["balance_sats"] or 0) if row else 0,
+                "source": "address_index",
+                "height": index.get("last_height"),
+                "updated_at": index.get("synced_at"),
+            }
+
+    cached = (store.get_meta("exchange_hot_wallet_balances", {}) or {}).get(address)
+    if not isinstance(cached, dict) or "balance_sats" not in cached:
+        summary = store.get_meta("last_summary", {}) or {}
+        cached = summary if summary.get("address") == address else None
+    if isinstance(cached, dict) and cached.get("balance_sats") is not None:
+        return {
+            "balance_sats": int(cached["balance_sats"]),
+            "source": "blockbook_cache",
+            "updated_at": cached.get("refreshed_at") or cached.get("synced_at"),
+        }
+    return None
+
+
+def sentry_collateral_address_rows(store: Store) -> list[dict[str, Any]]:
+    if store.conn.execute("SELECT 1 FROM network_masternodes LIMIT 1").fetchone() is None:
+        load_network_masternodes_csv(store)
+    rows = store.conn.execute(
+        """
+        SELECT n.collateral_address AS address, COUNT(*) AS nodes,
+               SUM(CASE WHEN n.status = 'ENABLED' THEN 1 ELSE 0 END) AS enabled,
+               SUM(CASE WHEN UPPER(n.status) LIKE '%BANNED%' THEN 1 ELSE 0 END) AS banned,
+               b.balance_sats
+        FROM network_masternodes n
+        LEFT JOIN top_wallet_balances b ON b.address = n.collateral_address
+        WHERE n.collateral_address != '' AND COALESCE(n.removed_at, '') = ''
+        GROUP BY n.collateral_address
+        ORDER BY nodes DESC, n.collateral_address
+        """
+    ).fetchall()
+    return [
+        {"rank": rank, **dict(row), "collateral_sats": int(row["nodes"]) * SENTRY_COLLATERAL_SATS}
+        for rank, row in enumerate(rows, 1)
+    ]
 
 
 def top_wallets_snapshot(store: Store, limit: int = 100) -> dict[str, Any]:
@@ -3572,7 +3464,9 @@ def top_wallets_snapshot(store: Store, limit: int = 100) -> dict[str, Any]:
         )
 
     index = snapshot_index_status(progress)
-    index["rebuilding"] = index["rebuilding"] or not totals["addresses"]
+    index["history_complete"] = progress.get("history_complete")
+    index["history_start_height"] = progress.get("history_start_height")
+    index["rebuilding"] = index["rebuilding"] or not totals["addresses"] or index["history_complete"] is False
     return {
         "generated_at": now_iso(),
         "type": "address_balances",
@@ -3586,7 +3480,6 @@ def top_wallets_snapshot(store: Store, limit: int = 100) -> dict[str, Any]:
             "utxos": int(totals["utxos"] or 0),
         },
         "wallets": wallets,
-        "estimated_clusters": top_wallet_cluster_snapshot(store, limit=limit),
     }
 
 
@@ -5326,6 +5219,9 @@ def publish_static_snapshot(
     if sn_comp_page is not None:
         atomic_write_text(output_dir / SN_COMP_HTML, sn_comp_page)
     atomic_write_json(output_dir / TOP_WALLETS_JSON, top_wallets)
+    legacy_clusters = output_dir / "top-wallet-clusters.json"
+    if legacy_clusters.exists():
+        atomic_write_json(legacy_clusters, top_wallet_cluster_snapshot(store))
     atomic_write_json(output_dir / EMISSIONS_JSON, emissions)
     # In render-only mode miners.json belongs to the independent data worker.
     if not skip_sync:
@@ -6515,24 +6411,18 @@ def dashboard_html(
         """,
         top_params,
     ).fetchall()
-    roots_by_address: dict[str, set[str]] = {}
     address_by_root: dict[str, str] = {}
     sentry_candidates_by_address: dict[str, int] = {}
     for row in first_hop_outputs:
-        roots_by_address.setdefault(row["address"], set()).add(row["path"])
         address_by_root[row["path"]] = row["address"]
         if row["value_sats"] == SENTRY_COLLATERAL_SATS:
             sentry_candidates_by_address[row["address"]] = sentry_candidates_by_address.get(row["address"], 0) + 1
 
     exchange_tags = load_exchange_tags()
-    exchange_routes = load_exchange_routes()
     exchange_hot_wallets = load_exchange_hot_wallets()
     exchange_cold_wallets = load_exchange_cold_wallets()
-    exchange_hot_wallet_balances = store.get_meta("exchange_hot_wallet_balances", {}) or {}
-    later_exchanges_by_address: dict[str, set[str]] = {}
     downstream_sentry_by_address: dict[str, int] = {}
     verified_sentry_by_address: dict[str, int] = {}
-    downstream_sats_by_address: dict[str, int] = {}
     if first_hop_outputs:
         downstream_rows = store.conn.execute(
             """
@@ -6545,11 +6435,8 @@ def dashboard_html(
             origin = address_by_root.get(root_path(row["path"]))
             if not origin:
                 continue
-            if row["address"] in exchange_tags:
-                later_exchanges_by_address.setdefault(origin, set()).add(exchange_tags[row["address"]])
             if row["value_sats"] == SENTRY_COLLATERAL_SATS:
                 downstream_sentry_by_address[origin] = downstream_sentry_by_address.get(origin, 0) + 1
-            downstream_sats_by_address[origin] = downstream_sats_by_address.get(origin, 0) + int(row["value_sats"])
         verified_rows = store.conn.execute(
             """
             SELECT path
@@ -6564,44 +6451,40 @@ def dashboard_html(
     def explorer_addr(addr: str) -> str:
         return f"https://explorer-blockbook.syscoin.org/address/{urllib.parse.quote(addr)}"
 
-    exchange_sent_sats_by_label: dict[str, int] = {}
-    for row in top_rows:
-        labels = set()
-        if row["address"] in exchange_routes:
-            labels.add(exchange_routes[row["address"]])
-        if row["address"] in exchange_tags:
-            labels.add(exchange_tags[row["address"]])
-        labels.update(later_exchanges_by_address.get(row["address"], set()))
-        for label in labels:
-            exchange_sent_sats_by_label[label] = exchange_sent_sats_by_label.get(label, 0) + int(row["total_sats"] or 0)
+    direct_receipts = {row["address"]: int(row["total_sats"] or 0) for row in top_rows}
 
     def wallet_card_rows(wallets: list[dict[str, str]], include_sent_total: bool = False) -> list[str]:
         rows = []
         for wallet in wallets:
+            if exchange_tags.get(wallet["address"]) != wallet["label"]:
+                continue
             note = wallet["note"]
             note_html = f"<span>{html.escape(note)}</span>" if note else ""
             if include_sent_total:
-                sent_sats = exchange_sent_sats_by_label.get(wallet["label"], 0)
+                sent_sats = direct_receipts.get(wallet["address"], 0)
                 sent_html = (
-                    f"<span class='wallet-flow'>From Binance: "
+                    f"<span class='wallet-flow'>Direct receipts (tracked): "
                     f"<b title='{fmt_sys(sent_sats)} SYS'>{fmt_compact_sys(sent_sats)}</b></span>"
                     if sent_sats
-                    else "<span class='wallet-flow muted'>From Binance: -</span>"
+                    else "<span class='wallet-flow muted'>Direct receipts (tracked): -</span>"
                 )
             else:
                 sent_html = ""
-            wallet_balance = exchange_hot_wallet_balances.get(wallet["address"], {})
+            wallet_balance = address_balance_for_display(store, wallet["address"])
             if isinstance(wallet_balance, dict) and "balance_sats" in wallet_balance:
                 balance_sats = int(wallet_balance.get("balance_sats") or 0)
-                if balance_sats < SATOSHI:
-                    continue
                 balance_text = fmt_compact_sys(balance_sats)
                 balance_html = (
-                    f"<span class='wallet-balance'>Final balance: "
+                    f"<span class='wallet-balance'>Address balance: "
                     f"<b title='{fmt_sys(balance_sats)} SYS'>{html.escape(balance_text)}</b></span>"
                 )
+                if wallet_balance["source"] == "address_index":
+                    balance_html += f"<span>At block {int(wallet_balance['height']):,}</span>"
+                else:
+                    cached_at = fmt_iso_utc_datetime(wallet_balance.get("updated_at")) or "time unavailable"
+                    balance_html += f"<span>Cached Blockbook balance: {html.escape(cached_at)}</span>"
             else:
-                balance_html = "<span class='wallet-balance muted'>Final balance: -</span>"
+                balance_html = "<span class='wallet-balance muted'>Address balance: unavailable</span>"
             rows.append(
                 f"<article class='wallet-card'>"
                 f"<strong>{html.escape(wallet['label'])}</strong>"
@@ -6623,22 +6506,7 @@ def dashboard_html(
 
     html_rows = []
     for rank, row in enumerate(top_rows, 1):
-        exchange_bits = set()
-        if row["address"] in exchange_routes:
-            exchange_bits.add(exchange_routes[row["address"]])
-        if row["address"] in exchange_tags:
-            exchange_bits.add(exchange_tags[row["address"]])
-        exchange_bits.update(later_exchanges_by_address.get(row["address"], set()))
-        downstream_sats = downstream_sats_by_address.get(row["address"], 0)
-        if (
-            not exchange_bits
-            and row["total_sats"] >= sys_to_sats("100")
-            and downstream_sats >= int(Decimal(row["total_sats"]) * Decimal("0.98"))
-            and not sentry_candidates_by_address.get(row["address"], 0)
-            and not downstream_sentry_by_address.get(row["address"], 0)
-            and not verified_sentry_by_address.get(row["address"], 0)
-        ):
-            exchange_bits.add("Ex-like")
+        exchange_bits = exchange_labels_for_address(row["address"], exchange_tags)
         exchange_text = ", ".join(sorted(exchange_bits)) if exchange_bits else "-"
 
         direct_sentry = sentry_candidates_by_address.get(row["address"], 0)
@@ -6655,8 +6523,8 @@ def dashboard_html(
         sentry_sort = verified_sentry * 10000 + direct_sentry * 100 + downstream_sentry
         full_address = row["address"]
         display_address = short_address(full_address)
-        last_seen_full = fmt_local_datetime(row["last_time"])
-        last_seen_short = fmt_table_datetime(row["last_time"])
+        last_seen_full = fmt_utc_datetime(row["last_time"])
+        last_seen_short = fmt_utc_table_datetime(row["last_time"])
 
         html_rows.append(
             f"<tr><td class='rank' data-sort='{rank}'>{rank}</td>"
@@ -6670,12 +6538,18 @@ def dashboard_html(
             f"<td data-sort='{row['last_time'] or 0}' title='{html.escape(last_seen_full)}'>{html.escape(last_seen_short)}</td></tr>"
         )
     top_html = "\n".join(html_rows)
-    since_text = dt.datetime.fromtimestamp(since_time, tz=dt.timezone.utc).astimezone(ZoneInfo(DEFAULT_TIMEZONE)).strftime("%b %-d, %Y") if since_time else "all tracked history"
-    updated_text = fmt_iso_local_datetime(last_summary.get("synced_at"))
+    updated_text = fmt_iso_utc_datetime(last_summary.get("synced_at"))
     total_sent_full = fmt_sys(window_summary["external_sats"])
-    wallet_balance_sats = int(last_summary.get("balance_sats") or 0)
-    wallet_balance_full = fmt_sys(wallet_balance_sats)
     hot_wallet_address = last_summary.get("address") or DEFAULT_ADDRESS
+    wallet_balance = address_balance_for_display(store, hot_wallet_address)
+    wallet_balance_sats = wallet_balance["balance_sats"] if wallet_balance else None
+    wallet_balance_full = fmt_sys(wallet_balance_sats) + " SYS" if wallet_balance_sats is not None else "Unavailable"
+    wallet_balance_text = fmt_compact_sys(wallet_balance_sats) if wallet_balance_sats is not None else "Unavailable"
+    wallet_balance_source = (
+        f"At block {int(wallet_balance['height']):,}"
+        if wallet_balance and wallet_balance["source"] == "address_index"
+        else "Cached Blockbook balance" if wallet_balance else ""
+    )
 
     return f"""<!doctype html>
 <html lang="en">
@@ -6723,6 +6597,7 @@ def dashboard_html(
     .wallet-card a {{ display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 0.72rem; }}
     .wallet-card .wallet-balance, .wallet-card .wallet-flow {{ color: var(--ink); font-size: 0.82rem; }}
     .wallet-card .wallet-balance b, .wallet-card .wallet-flow b {{ font-weight: 800; }}
+    .wallet-card .wallet-flow b {{ white-space: nowrap; }}
     .wallet-card .muted {{ color: #7b858a; }}
     .table-wrap {{ background: var(--panel); border: 1px solid rgba(72, 142, 190, 0.34); border-radius: 8px; max-width: 100%; min-width: 0; overflow-x: auto; width: 100%; }}
     table {{ width: 100%; min-width: 1100px; border-collapse: separate; border-spacing: 0; background: var(--panel); table-layout: fixed; }}
@@ -6752,8 +6627,7 @@ def dashboard_html(
     th:nth-child(5), td:nth-child(5),
     th:nth-child(6), td:nth-child(6) {{ text-align: right; white-space: nowrap; }}
     th:nth-child(7), td:nth-child(7),
-    th:nth-child(8), td:nth-child(8),
-    th:nth-child(9), td:nth-child(9) {{ white-space: nowrap; }}
+    th:nth-child(8), td:nth-child(8) {{ white-space: nowrap; }}
     .address {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; white-space: nowrap; }}
     .amount {{ font-weight: 700; }}
     .subtle {{ color: var(--muted); font-weight: 600; }}
@@ -6813,22 +6687,22 @@ def dashboard_html(
   <main>
     <section class="section-panel metrics">
       <div class="metric"><span>SYS Sent</span><b title="{html.escape(total_sent_full)} SYS">{fmt_compact_sys(window_summary["external_sats"])}</b></div>
-      <div class="metric"><span>Binance Hot Wallet</span><b title="{html.escape(wallet_balance_full)} SYS">{fmt_compact_sys(wallet_balance_sats)}</b><a class="metric-address" href="{explorer_addr(hot_wallet_address)}" title="{html.escape(hot_wallet_address)}"{NEW_TAB_ATTRS}>{html.escape(short_address(hot_wallet_address))}</a></div>
+      <div class="metric"><span>{html.escape(exchange_tags.get(hot_wallet_address, 'Tracked'))} Address</span><b title="{html.escape(wallet_balance_full)}">{wallet_balance_text}</b><a class="metric-address" href="{explorer_addr(hot_wallet_address)}" title="{html.escape(hot_wallet_address)}"{NEW_TAB_ATTRS}>{html.escape(short_address(hot_wallet_address))}</a><span>{html.escape(wallet_balance_source)}</span></div>
       <div class="metric"><span>Transfers</span><b>{window_summary["txs"]}</b></div>
       <div class="metric"><span>Recipients</span><b>{destination_count}</b></div>
       <div class="metric"><span>Updated</span><b>{html.escape(updated_text)}</b></div>
     </section>
     <section class="section-panel hot-wallets">
       <div class="panel-title">
-        <h2>Known Exchange Hot Wallets</h2>
-        <p>{visible_hot_wallet_count} Blockbook links</p>
+        <h2>Tracked Exchange Addresses</h2>
+        <p>{visible_hot_wallet_count} individual address balances</p>
       </div>
       <div class="wallet-list">{hot_wallet_html}</div>
     </section>
     <section class="section-panel cold-wallets">
       <div class="panel-title">
-        <h2>Known Cold Wallets</h2>
-        <p>{visible_cold_wallet_count} Blockbook links</p>
+        <h2>Tracked Cold Addresses</h2>
+        <p>{visible_cold_wallet_count} individual address{' balances' if visible_cold_wallet_count != 1 else ' balance'}</p>
       </div>
       <div class="wallet-list">{cold_wallet_html}</div>
     </section>
@@ -7038,15 +6912,15 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
         else "not started"
     )
     remaining_text = f"{remaining_blocks:,}" if remaining_blocks is not None else "-"
-    updated_text = fmt_iso_local_datetime(index.get("synced_at"))
+    updated_text = fmt_iso_utc_datetime(index.get("synced_at"))
     indexed_total_sats = int(totals["balance_sats"] or 0)
 
     def explorer_addr(addr: str) -> str:
         return f"https://explorer-blockbook.syscoin.org/address/{urllib.parse.quote(addr)}"
 
     def render_wallet_row(row: dict[str, Any]) -> str:
-        last_seen = fmt_table_datetime(row["last_seen_time"]) if row.get("last_seen_time") else "-"
-        last_seen_full = fmt_local_datetime(row["last_seen_time"]) if row.get("last_seen_time") else ""
+        last_seen = fmt_utc_table_datetime(row["last_seen_time"]) if row.get("last_seen_time") else "-"
+        last_seen_full = fmt_utc_datetime(row["last_seen_time"]) if row.get("last_seen_time") else ""
         address = row["address"]
         balance_sats = int(row["balance_sats"])
         name = row.get("name") or short_address(address)
@@ -7061,14 +6935,12 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
             if "private" in label_lower or "holder" in label_lower or "user" in label_lower or "person" in label_lower
             else "unknown"
         )
-        address_count = int(row.get("address_count") or 1)
-        address_word = "address" if address_count == 1 else "addresses"
         return (
             "<tr>"
             f"<td class='rank' data-sort='{row['rank']}'>{row['rank']}</td>"
             f"<td class='wallet-name' data-sort='{html.escape(name.lower())}'>{html.escape(name)}</td>"
             f"<td data-sort='{html.escape(label.lower())}'><span class='label-pill {label_class}'>{html.escape(label)}</span></td>"
-            f"<td class='address-list' data-sort='{address_count}'><a href='{explorer_addr(address)}' title='{html.escape(address)}'{NEW_TAB_ATTRS}>{address_count:,} {address_word}</a><span>{html.escape(short_address(address))}</span></td>"
+            f"<td class='address-list' data-sort='{html.escape(address)}'><a href='{explorer_addr(address)}' title='{html.escape(address)}'{NEW_TAB_ATTRS}>{html.escape(short_address(address))}</a></td>"
             f"<td class='amount' data-sort='{balance_sats}' title='{html.escape(row['balance_sys'])} SYS'>{fmt_compact_sys(balance_sats)}</td>"
             f"<td data-sort='{balance_sats}'>{row.get('percent_text') or fmt_percent(balance_sats, indexed_total_sats)}</td>"
             f"<td data-sort='{row['last_seen_time'] or 0}' title='{html.escape(last_seen_full)}'>{html.escape(last_seen)}</td>"
@@ -7077,35 +6949,13 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
 
     rows = [render_wallet_row(row) for row in wallets]
     if not rows:
-        rows = ["<tr><td class='empty' colspan='7'>No top wallet index data yet.</td></tr>"]
+        rows = ["<tr><td class='empty' colspan='7'>No address balance data yet.</td></tr>"]
     rows_html = "\n".join(rows)
     panel_status = (
         "Rebuilding: rankings are provisional"
-        if index["rebuilding"] else f"Updated {html.escape(updated_text or '-')}"
+        if index["rebuilding"] else f"At block {int(last_height):,}. Updated {html.escape(updated_text or '-')}"
     )
-    cluster_snapshot = snapshot["estimated_clusters"]
-    cluster_wallets = cluster_snapshot["wallets"]
-    cluster_index = cluster_snapshot["index"]
-    cluster_totals = cluster_snapshot["totals"]
-    cluster_last_height = cluster_index.get("last_height")
-    cluster_chain_height = cluster_index.get("chain_height")
-    cluster_safe_height = cluster_index.get("safe_height")
-    cluster_progress_text = (
-        f"{int(cluster_last_height):,} / safe height {int(cluster_safe_height):,}"
-        if isinstance(cluster_last_height, int) and cluster_last_height >= 0 and isinstance(cluster_safe_height, int)
-        else "not started"
-    )
-    cluster_status = (
-        "Forensic cluster index complete to safe height"
-        if not cluster_index["rebuilding"]
-        else f"Rebuilding forensic cluster index: {cluster_progress_text}"
-        if cluster_last_height is not None and int(cluster_last_height) >= 0
-        else "Forensic cluster index not started"
-    )
-    recovery_notice = rebuilding_notice([("Addresses", index), ("Clusters", cluster_index)], rankings=True)
-    cluster_rows_html = "\n".join(render_wallet_row(row) for row in cluster_wallets)
-    if not cluster_rows_html:
-        cluster_rows_html = "<tr><td class='empty' colspan='7'>No estimated address clusters yet. Run the forensic cluster index to build this table.</td></tr>"
+    recovery_notice = rebuilding_notice([("Addresses", index)], rankings=True)
 
     def wallet_table_controls(control_id: str, label: str) -> str:
         return f"""
@@ -7129,190 +6979,23 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
         </div>
       </div>"""
 
-    def operator_label_for_count(node_count: int) -> str:
-        if node_count >= 100:
-            return "Major Sentry Operator"
-        if node_count >= 10:
-            return "Large Sentry Operator"
-        if node_count == 1:
-            return "Solo Sentry Operator"
-        return "Sentry Operator"
-
-    def build_operator_rows() -> list[dict[str, Any]]:
-        edge_count = store.conn.execute("SELECT COUNT(*) AS count FROM top_wallet_cluster_edges").fetchone()["count"]
-        balance_count = store.conn.execute("SELECT COUNT(*) AS count FROM top_wallet_balances WHERE balance_sats > 0").fetchone()["count"]
-        if not edge_count or not balance_count:
-            return []
-
-        wallet_labels = load_wallet_labels()
-        exchange_tags = load_exchange_tags()
-        exchange_addresses = set(exchange_tags)
-
-        union = UnionFind()
-        for edge in store.conn.execute("SELECT address_a, address_b FROM top_wallet_cluster_edges"):
-            address_a = str(edge["address_a"] or "")
-            address_b = str(edge["address_b"] or "")
-            if address_a in exchange_addresses or address_b in exchange_addresses:
-                continue
-            union.union(address_a, address_b)
-
-        clusters: dict[str, dict[str, Any]] = {}
-        for balance_row in store.conn.execute(
-            """
-            SELECT address, balance_sats
-            FROM top_wallet_balances
-            WHERE balance_sats > 0
-            """
-        ):
-            address = str(balance_row["address"] or "")
-            if address in exchange_addresses:
-                continue
-            balance_sats = int(balance_row["balance_sats"] or 0)
-            root = union.find(address)
-            cluster = clusters.setdefault(
-                root,
-                {
-                    "address": address,
-                    "balance_sats": 0,
-                    "representative_balance_sats": -1,
-                    "name": short_address(address),
-                    "label": "Unknown",
-                    "label_priority": 0,
-                },
-            )
-            cluster["balance_sats"] += balance_sats
-            if balance_sats > int(cluster["representative_balance_sats"]):
-                cluster["address"] = address
-                cluster["representative_balance_sats"] = balance_sats
-            identity = wallet_identity_for_address(address, wallet_labels, {})
-            label = identity["label"]
-            priority = 1 if label != "Unknown" else 0
-            if priority > int(cluster["label_priority"]):
-                cluster["name"] = identity["name"]
-                cluster["label"] = label
-                cluster["label_priority"] = priority
-
-        if store.conn.execute("SELECT COUNT(*) AS count FROM network_masternodes").fetchone()["count"] == 0:
-            load_network_masternodes_csv(store)
-
-        operators: dict[str, dict[str, Any]] = {}
-        for node_row in store.conn.execute(
-            """
-            SELECT collateral_address, status, collateral_height
-            FROM network_masternodes
-            WHERE collateral_address != '' AND COALESCE(removed_at, '') = ''
-            """
-        ):
-            collateral_address = str(node_row["collateral_address"] or "")
-            if not collateral_address:
-                continue
-            if collateral_address in exchange_addresses:
-                continue
-            root = union.find(collateral_address)
-            cluster = clusters.get(root)
-            if not cluster:
-                continue
-            operator = operators.setdefault(
-                root,
-                {
-                    "name": cluster["name"],
-                    "address": cluster["address"],
-                    "nodes": 0,
-                    "locked_sats": 0,
-                    "net_sats": int(cluster["balance_sats"]),
-                    "seniority_counts": {"Base": 0, "Level 1": 0, "Level 2": 0},
-                    "status_counts": {},
-                },
-            )
-            operator["nodes"] += 1
-            operator["locked_sats"] += SENTRY_COLLATERAL_SATS
-            operator["net_sats"] = int(cluster["balance_sats"])
-
-            collateral_height = int_or_none(node_row["collateral_height"])
-            if collateral_height is not None and isinstance(cluster_chain_height, int):
-                blocks_since_collateral = max(cluster_chain_height - collateral_height, 0)
-                if blocks_since_collateral >= SENIORITY_LEVEL_2_BLOCKS:
-                    seniority_label = "Level 2"
-                elif blocks_since_collateral >= SENIORITY_LEVEL_1_BLOCKS:
-                    seniority_label = "Level 1"
-                else:
-                    seniority_label = "Base"
-                operator["seniority_counts"][seniority_label] += 1
-
-            status = str(node_row["status"] or "").upper()
-            status_key = "Banned" if "BANNED" in status else "Enabled" if status == "ENABLED" else status.title() or "Unknown"
-            operator["status_counts"][status_key] = operator["status_counts"].get(status_key, 0) + 1
-
-        def mix_text(counts: dict[str, int]) -> str:
-            parts = []
-            for label in ("Base", "Level 1", "Level 2"):
-                count = int(counts.get(label) or 0)
-                if count:
-                    short_label = "L1" if label == "Level 1" else "L2" if label == "Level 2" else "Base"
-                    parts.append(f"{count:,} {short_label}")
-            return ", ".join(parts) if parts else "-"
-
-        def status_text(counts: dict[str, int]) -> str:
-            parts = []
-            for label in ("Enabled", "Banned", "Unknown"):
-                count = int(counts.get(label) or 0)
-                if count:
-                    parts.append(f"{count:,} {label.lower()}")
-            for label, count in sorted(counts.items()):
-                if label not in {"Enabled", "Banned", "Unknown"} and count:
-                    parts.append(f"{count:,} {label.lower()}")
-            return ", ".join(parts) if parts else "-"
-
-        rows = []
-        ordered = sorted(
-            operators.values(),
-            key=lambda item: (-int(item["nodes"]), -int(item["net_sats"]), str(item["name"]).lower()),
-        )
-        for rank, item in enumerate(ordered, 1):
-            node_count = int(item["nodes"])
-            rows.append(
-                {
-                    "rank": rank,
-                    "name": item["name"],
-                    "label": operator_label_for_count(node_count),
-                    "nodes": node_count,
-                    "locked_sats": int(item["locked_sats"]),
-                    "net_sats": int(item["net_sats"]),
-                    "seniority": mix_text(item["seniority_counts"]),
-                    "status": status_text(item["status_counts"]),
-                }
-            )
-        return rows
-
-    operator_rows = build_operator_rows()
-
-    def operator_label_class(label: str) -> str:
-        label_lower = label.lower()
-        if label_lower.startswith("major"):
-            return "major"
-        if label_lower.startswith("large"):
-            return "large"
-        if label_lower.startswith("solo"):
-            return "solo"
-        return "operator"
-
-    operator_rows_html = "\n".join(
+    collateral_rows = sentry_collateral_address_rows(store)
+    collateral_rows_html = "\n".join(
         (
             "<tr>"
             f"<td class='rank' data-sort='{row['rank']}'>{row['rank']}</td>"
-            f"<td class='wallet-name' data-sort='{html.escape(row['name'].lower())}'>{html.escape(row['name'])}</td>"
-            f"<td data-sort='{html.escape(row['label'].lower())}'><span class='label-pill operator-label {operator_label_class(row['label'])}'>{html.escape(row['label'])}</span></td>"
+            f"<td class='address-list' data-sort='{html.escape(row['address'])}'><a href='{explorer_addr(row['address'])}' title='{html.escape(row['address'])}'{NEW_TAB_ATTRS}>{html.escape(short_address(row['address']))}</a></td>"
             f"<td class='amount' data-sort='{row['nodes']}'>{row['nodes']:,}</td>"
-            f"<td class='amount' data-sort='{row['locked_sats']}'>{fmt_compact_sys(row['locked_sats'])}</td>"
-            f"<td class='amount' data-sort='{row['net_sats']}'>{fmt_compact_sys(row['net_sats'])}</td>"
-            f"<td data-sort='{html.escape(row['seniority'].lower())}'>{html.escape(row['seniority'])}</td>"
-            f"<td data-sort='{html.escape(row['status'].lower())}'>{html.escape(row['status'])}</td>"
+            f"<td class='amount' data-sort='{row['collateral_sats']}'>{fmt_compact_sys(row['collateral_sats'])}</td>"
+            f"<td class='amount' data-sort='{row['balance_sats'] if row['balance_sats'] is not None else -1}'>{fmt_compact_sys(row['balance_sats']) if row['balance_sats'] is not None else '-'}</td>"
+            f"<td data-sort='{row['enabled']}'>{row['enabled']:,}</td>"
+            f"<td data-sort='{row['banned']}'>{row['banned']:,}</td>"
             "</tr>"
         )
-        for row in operator_rows
+        for row in collateral_rows
     )
-    if not operator_rows_html:
-        operator_rows_html = "<tr><td class='empty' colspan='8'>No sentry operator clusters found yet. Run the forensic cluster index to build this table.</td></tr>"
+    if not collateral_rows_html:
+        collateral_rows_html = "<tr><td class='empty' colspan='7'>No Sentry collateral addresses available.</td></tr>"
 
     return f"""<!doctype html>
 <html lang="en">
@@ -7381,20 +7064,9 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     .label-pill.operator {{ background: #fff4dd; color: #805313; }}
     .label-pill.private {{ background: #f4edff; color: #6840a3; }}
     .label-pill.unknown {{ background: #eef1ef; color: #596268; }}
-    .label-pill.operator-label.major {{ background: #e9f8ef; color: #126237; }}
-    .label-pill.operator-label.large {{ background: #eef5ff; color: #1c5f96; }}
-    .label-pill.operator-label.operator {{ background: #fff4dd; color: #805313; }}
-    .label-pill.operator-label.solo {{ background: #f2efff; color: #5f45a6; }}
     .amount {{ font-weight: 800; white-space: nowrap; }}
-    .operator-table {{ min-width: 1120px; }}
-    .operator-table th:nth-child(1), .operator-table td:nth-child(1) {{ width: 70px; text-align: right; }}
-    .operator-table th:nth-child(2), .operator-table td:nth-child(2) {{ width: 210px; }}
-    .operator-table th:nth-child(3), .operator-table td:nth-child(3) {{ width: 210px; }}
-    .operator-table th:nth-child(4), .operator-table td:nth-child(4) {{ width: 125px; text-align: right; }}
-    .operator-table th:nth-child(5), .operator-table td:nth-child(5) {{ width: 145px; text-align: right; }}
-    .operator-table th:nth-child(6), .operator-table td:nth-child(6) {{ width: 145px; text-align: right; }}
-    .operator-table th:nth-child(7), .operator-table td:nth-child(7) {{ width: 210px; }}
-    .operator-table th:nth-child(8), .operator-table td:nth-child(8) {{ width: 160px; }}
+    .collateral-table th, .collateral-table td {{ width: 130px; text-align: right; }}
+    .collateral-table th:nth-child(2), .collateral-table td:nth-child(2) {{ width: 260px; text-align: left; }}
     .empty {{ color: var(--muted); padding: 18px 14px; text-align: center; }}
     a {{ color: #56c9ff; text-decoration: none; }}
     @media(max-width: 820px) {{
@@ -7427,10 +7099,6 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
       .label-pill.operator {{ background: #443111; color: #ffd98a; }}
       .label-pill.private {{ background: #352451; color: #d6bcff; }}
       .label-pill.unknown {{ background: #30383d; color: #c0c9ce; }}
-      .label-pill.operator-label.major {{ background: #143e28; color: #aef0c6; }}
-      .label-pill.operator-label.large {{ background: #173754; color: #9ed2ff; }}
-      .label-pill.operator-label.operator {{ background: #443111; color: #ffd98a; }}
-      .label-pill.operator-label.solo {{ background: #332652; color: #d8c7ff; }}
       .sort-button:hover, .sort-button:focus-visible {{ color: #56c9ff; }}
     }}
   </style>
@@ -7465,67 +7133,6 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
     </section>
     <section class="section-panel">
       <div class="panel-title">
-        <h2>Phase 2 Address Cluster Estimate</h2>
-        <p>{html.escape(cluster_status)}</p>
-      </div>
-      <p class="phase-note">Common-input plus sentry-collateral clustering estimate. Balances reflect indexed blocks; holder grouping is a forensic estimate, not proof of ownership.</p>
-      <div class="metrics">
-        <div class="metric"><span>Estimated Holders</span><b>{int(cluster_totals['clusters']):,}</b></div>
-        <div class="metric"><span>Known Exchange Clusters</span><b>{int(cluster_totals['known_exchange_clusters']):,}</b></div>
-        <div class="metric"><span>Estimated Private Holders</span><b>{int(cluster_totals['estimated_private_holders']):,}</b></div>
-        <div class="metric"><span>Known Exchange SYS</span><b title="{html.escape(cluster_totals['known_exchange_sys'])} SYS">{fmt_compact_sys(int(cluster_totals['known_exchange_sats']))}</b></div>
-        <div class="metric"><span>Private / Unknown SYS</span><b title="{html.escape(cluster_totals['private_unknown_sys'])} SYS">{fmt_compact_sys(int(cluster_totals['private_unknown_sats']))}</b></div>
-      </div>
-    </section>
-    <section class="section-panel">
-      <div class="panel-title">
-        <h2>Estimated Address Clusters</h2>
-        <p>{int(cluster_totals['edges']):,} forensic links</p>
-      </div>
-      {wallet_table_controls("estimated-clusters", "Estimated address clusters")}
-      <div class="table-wrap">
-        <table class="sortable-wallet-table" id="estimated-clusters-table">
-          <thead>
-            <tr>
-              <th data-sort="number" data-default-dir="asc" aria-sort="ascending"><button class="sort-button" type="button">Rank<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Name<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Label<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Addresses<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Net Worth<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Percent of coins<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Last Change<span class="sort-icon" aria-hidden="true"></span></button></th>
-            </tr>
-          </thead>
-          <tbody>{cluster_rows_html}</tbody>
-        </table>
-      </div>
-    </section>
-    <section class="section-panel">
-      <div class="panel-title">
-        <h2>Sentry Operator View</h2>
-      </div>
-      <p class="phase-note">Derived from estimated wallet clusters that contain active 100,000 SYS sentry collateral. Labels are thresholds, not identity proof.</p>
-      {wallet_table_controls("sentry-operators", "Sentry operator view")}
-      <div class="table-wrap">
-        <table class="sortable-wallet-table operator-table" id="sentry-operators-table">
-          <thead>
-            <tr>
-              <th data-sort="number" data-default-dir="asc" aria-sort="ascending"><button class="sort-button" type="button">Rank<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Name<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Label<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Sentry Nodes<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Locked SYS<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Net Worth<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Seniority Mix<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Status<span class="sort-icon" aria-hidden="true"></span></button></th>
-            </tr>
-          </thead>
-          <tbody>{operator_rows_html}</tbody>
-        </table>
-      </div>
-    </section>
-    <section class="section-panel">
-      <div class="panel-title">
         <h2>Largest Addresses</h2>
         <p>{panel_status}</p>
       </div>
@@ -7537,13 +7144,31 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
               <th data-sort="number" data-default-dir="asc" aria-sort="ascending"><button class="sort-button" type="button">Rank<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Name<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Label<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Addresses<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Net Worth<span class="sort-icon" aria-hidden="true"></span></button></th>
-              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Percent of coins<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Address<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Address Balance<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">% of Indexed SYS<span class="sort-icon" aria-hidden="true"></span></button></th>
               <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Last Change<span class="sort-icon" aria-hidden="true"></span></button></th>
             </tr>
           </thead>
           <tbody>{rows_html}</tbody>
+        </table>
+      </div>
+    </section>
+    <section class="section-panel">
+      <div class="panel-title"><h2>Sentry Collateral Addresses</h2><p>{len(collateral_rows):,} addresses</p></div>
+      {wallet_table_controls("sentry-collateral", "Sentry collateral addresses")}
+      <div class="table-wrap">
+        <table class="sortable-wallet-table collateral-table" id="sentry-collateral-table">
+          <thead><tr>
+              <th data-sort="number" data-default-dir="asc" aria-sort="ascending"><button class="sort-button" type="button">Rank<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Collateral Address<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Sentry Nodes<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Collateral SYS<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Address Balance<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Enabled<span class="sort-icon" aria-hidden="true"></span></button></th>
+              <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Banned<span class="sort-icon" aria-hidden="true"></span></button></th>
+          </tr></thead>
+          <tbody>{collateral_rows_html}</tbody>
         </table>
       </div>
     </section>
@@ -7664,7 +7289,6 @@ def masternodes_html(
 
     prepared_rows = []
     exchange_tags = load_exchange_tags()
-    exchange_routes = load_exchange_routes()
     network_rows = store.conn.execute(
         """
         SELECT *
@@ -7765,7 +7389,7 @@ def masternodes_html(
             reference_label=seniority_reference_label,
         )
         moved_to_address = row["moved_to_address"] or ""
-        exchange_labels = exchange_labels_for_address(moved_to_address, exchange_tags, exchange_routes) if moved_to_address else set()
+        exchange_labels = exchange_labels_for_address(moved_to_address, exchange_tags) if moved_to_address else set()
         exchange_text = ", ".join(sorted(exchange_labels)) if exchange_labels else "-"
         prepared_rows.append(
             {
@@ -9082,13 +8706,13 @@ def build_parser() -> argparse.ArgumentParser:
     top_wallet_p.add_argument("--batch-size", type=int, default=50, help="RPC blocks to fetch per batch")
     top_wallet_p.add_argument("--confirmations", type=int, default=0, help="Only index blocks this many confirmations behind the chain tip")
 
-    cluster_p = sub.add_parser("sync-top-wallet-clusters", help="Build estimated holder clusters from common-input and sentry-collateral history")
+    cluster_p = sub.add_parser("sync-top-wallet-clusters", help="Index common-input observations for research; does not establish ownership")
     cluster_p.add_argument("--start-height", type=int, default=0, help="Height to start from when the cluster index is empty or reset")
     cluster_p.add_argument("--to-height", type=int, help="Stop at this block height")
     cluster_p.add_argument("--max-blocks", type=int, default=1000, help="Maximum blocks to index in this run")
     cluster_p.add_argument("--reset", action="store_true", help="Clear the top-wallet cluster index before syncing")
-    cluster_p.add_argument("--top", type=int, default=100, help="Number of estimated clusters to include in the JSON snapshot")
-    cluster_p.add_argument("--json", type=Path, help="Write estimated cluster snapshot JSON")
+    cluster_p.add_argument("--top", type=int, default=100, help="Legacy compatibility option; ownership rankings are no longer exported")
+    cluster_p.add_argument("--json", type=Path, help="Write link-index diagnostics without ownership totals")
     cluster_p.add_argument("--batch-size", type=int, default=50, help="RPC blocks to fetch per batch")
     cluster_p.add_argument("--confirmations", type=int, default=0, help="Only index blocks this many confirmations behind the chain tip")
 
@@ -9300,7 +8924,7 @@ def main(argv: list[str] | None = None) -> int:
             f"sentry_edges={stats['sentry_edges']} "
             f"sentry_outpoints={stats['sentry_collateral_outpoints']} "
             f"height={stats['last_height']}/{stats['chain_height']} "
-            f"clusters={snapshot['totals']['clusters']}"
+            f"ownership_attribution=disabled"
         )
         return 0
 

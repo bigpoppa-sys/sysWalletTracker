@@ -131,6 +131,18 @@ class PublishStaticTests(unittest.TestCase):
         self.assertFalse((self.output / tracker.MINERS_JSON).exists())
         self.assertTrue((self.output / tracker.SN_COMP_HTML).exists())
 
+    def test_publisher_retires_existing_cluster_ownership_export(self):
+        legacy = self.output / "top-wallet-clusters.json"
+        legacy.write_text('{"wallets":[{"name":"Binance","balance_sats":6700000000000000}]}')
+        before = list(self.store.conn.iterdump())
+        self.publish(skip_sync=True)
+        replacement = json.loads(legacy.read_text())
+        self.assertFalse(replacement["available"])
+        self.assertEqual(replacement["wallets"], [])
+        self.assertNotIn("known_exchange_sats", replacement["totals"])
+        self.assertNotIn("estimated_clusters", json.loads((self.output / tracker.TOP_WALLETS_JSON).read_text()))
+        self.assertEqual(list(self.store.conn.iterdump()), before)
+
     def test_recovery_republishes_competition_with_verification_notice(self):
         self.store.set_meta("sentry_time_verification", {"complete": False})
         page = self.output / tracker.SN_COMP_HTML

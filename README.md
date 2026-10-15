@@ -28,12 +28,29 @@ The dashboard has these pages:
 
 - `/` tracks Binance hot-wallet recipient flows.
 - `/sentrynode` tracks the current network sentry node list from RPC, setup/takedown dates, moved collateral destination, and exchange label when the moved-to address is known.
-- `/top-wallets` shows the top 100 exact address balances from the local RPC-derived UTXO index and, when enabled, estimated holder clusters built from common-input and sentry-collateral history. `/top-wallets.json` exposes the same prebuilt data.
+- `/top-wallets` shows the top 100 individual address balances from the local RPC-derived UTXO index, followed by Sentry counts at each collateral address. `/top-wallets.json` exposes address balances only. Neither page nor JSON assigns ownership to connected address groups.
 - `/emissions` shows indexed UTXO miner, sentry node, governance, NEVM miner reward, priority fee, and fee-burn data. `/emissions.json` exposes the same prebuilt data.
 
 Manual top-wallet names can be added to `wallet_labels.csv` with
-`address,name,label`; for example, use labels such as `Exchange` or
-`Private Wallet`. Known exchange names still come from `exchange_tags.csv`.
+`address,name,label,status`; use `identified` only for an explicitly identified
+address. Exchange names come from `exchange_tags.csv`, which also requires
+`status=identified` and records the attribution basis. Blank or `unverified`
+statuses are excluded. Existing manually recorded labels are not independent
+exchange attestations. Labels never propagate through funding or co-spend links.
+
+The homepage uses the same completed address index as Top Wallets. During a
+rebuild it may show a dated, cached Blockbook balance instead; partial rankings
+remain marked provisional. Direct receipts are historical first-hop transfers
+to that exact address, not its current holdings or receipts of related addresses.
+Legacy graph rows are retained for research, but their mixed link types cannot
+establish common ownership. The legacy cluster JSON export returns
+`available=false` with link counts only, not holder rankings or exchange totals.
+Normal publication also replaces an existing `top-wallet-clusters.json` with
+these diagnostics, even when the historical link-index job is disabled.
+New address scans retain their starting height and confirmation target. Scans
+started after genesis stay provisional and cannot replace cached balances.
+Legacy indexes retain existing rows, but without recorded full-history coverage
+a missing row falls back to the dated cache or unavailable, rather than zero.
 
 ## Vercel
 
@@ -113,21 +130,16 @@ python3 syscoin_tracker.py report --since-date "2026-04-14 12:30" --all-destinat
 
 ## Exchange And Sentry Checks
 
-Known exchange end wallets live in `exchange_hot_wallets.csv`. These are the
-endpoint wallets shown at the top of the dashboard; personal deposit addresses
-or intermediate wallets should not be listed here.
+Tracked address cards are configured in `exchange_hot_wallets.csv` and
+`exchange_cold_wallets.csv`. Only addresses also marked `identified` with the
+same exchange name in `exchange_tags.csv` appear publicly. Candidate records
+remain in the CSVs for research but do not contribute public labels or holdings.
 
 | Exchange | End wallet | Note |
 | --- | --- | --- |
 | Bitget | [`sys1qwhd5dz4mxkfwylg9jz4x56ggnc4z2d22u4l78w`](https://explorer-blockbook.syscoin.org/address/sys1qwhd5dz4mxkfwylg9jz4x56ggnc4z2d22u4l78w) | main hot/cold wallet |
 | Gate | [`ScM7oHdCXXZistSxPr7YjxyZ8tUf3HG8c2`](https://explorer-blockbook.syscoin.org/address/ScM7oHdCXXZistSxPr7YjxyZ8tUf3HG8c2) | main hot wallet |
-| MEXC | [`sys1qeyt05mxwlud4q66u8u2jtyq4markks4ru5ldk8`](https://explorer-blockbook.syscoin.org/address/sys1qeyt05mxwlud4q66u8u2jtyq4markks4ru5ldk8) | main candidate |
-| MEXC | [`sys1q3ec7z8up0phw83t0rund94h0d577lfls9eel38`](https://explorer-blockbook.syscoin.org/address/sys1q3ec7z8up0phw83t0rund94h0d577lfls9eel38) | large downstream wallet |
-| Ex(Unknown) | [`sys1qna83egqpe3yj3nnl8puqwv8tqwguy96zhg9tvh`](https://explorer-blockbook.syscoin.org/address/sys1qna83egqpe3yj3nnl8puqwv8tqwguy96zhg9tvh) | repeated downstream cluster |
-| Ex(Unknown) | [`sys1qexf95pzlun27jr0vuyt55emtxvrlxa44ddk859`](https://explorer-blockbook.syscoin.org/address/sys1qexf95pzlun27jr0vuyt55emtxvrlxa44ddk859) | repeated downstream cluster |
-| Ex(Unknown) | [`sys1qkah23xlfjs0hx66u48q639e72k3fyhwecsn4py`](https://explorer-blockbook.syscoin.org/address/sys1qkah23xlfjs0hx66u48q639e72k3fyhwecsn4py) | repeated downstream cluster |
-| Ex(Unknown) | [`sys1qe5vdffvlpyvkj3z3fqw8kc639s2dykp7smun9w`](https://explorer-blockbook.syscoin.org/address/sys1qe5vdffvlpyvkj3z3fqw8kc639s2dykp7smun9w) | repeated downstream cluster |
-| Ex(Unknown) | [`sys1qcfz9dne8ffk5at79p3et76fzgvwxlxymsc6lje`](https://explorer-blockbook.syscoin.org/address/sys1qcfz9dne8ffk5at79p3et76fzgvwxlxymsc6lje) | repeated downstream cluster |
+| MEXC | [`sys1qeyt05mxwlud4q66u8u2jtyq4markks4ru5ldk8`](https://explorer-blockbook.syscoin.org/address/sys1qeyt05mxwlud4q66u8u2jtyq4markks4ru5ldk8) | user-confirmed withdrawal source, tx `6fc58d94eeff904cd4890d90e5b6a7bd31737904d0aadab99524af60c792adc6` |
 
 Known cold wallets live in `exchange_cold_wallets.csv` and are shown separately
 on the dashboard.
@@ -136,10 +148,13 @@ on the dashboard.
 | --- | --- | --- |
 | Binance | [`SUBbe8vb7ng9CxZE9J3hma2CCkBh5VBHrv`](https://explorer-blockbook.syscoin.org/address/SUBbe8vb7ng9CxZE9J3hma2CCkBh5VBHrv) | confirmed cold wallet |
 
-Direct end-wallet labels are mirrored in `exchange_tags.csv`. Proven deposit or
-intermediate routes can live in `exchange_routes.csv`; for example, your
+Research routes can live in `exchange_routes.csv`; for example, your
 `sys1qs05...` Bitget deposit address is kept as a route to the Bitget end wallet,
-not as a direct exchange wallet.
+not as a direct exchange wallet. Routes never label the intermediate address as
+exchange-owned, including in the Sentry takedown destination table. The old MEXC
+`sys1q796zh...` and `sys1q3ec7z...` labels and `Ex(Unknown)` guesses are unverified
+and excluded pending stronger evidence. This does not assert that they are
+unrelated; it avoids presenting that relationship as established ownership.
 
 To use Syscoin Core RPC without storing credentials in the repo:
 
@@ -199,10 +214,10 @@ Set `SYS_TOP_WALLET_MAX_BLOCKS` in `$HOME/sysWalletTracker/.env` to index top-wa
 blocks during each cron run; leave it at `0` to only publish the latest existing
 top-wallet snapshot. `SYS_TOP_WALLET_BATCH_SIZE` controls how many blocks are
 fetched per RPC batch.
-Set `SYS_TOP_WALLET_CLUSTER_MAX_BLOCKS` to backfill estimated holder clusters in
-chunks during the same cron run. This builds common-input links from historical
-transactions and links known 100,000 SYS sentry collateral outputs to their
-funding inputs. It does not reset the exact address-balance index.
+Set `SYS_TOP_WALLET_CLUSTER_MAX_BLOCKS` to backfill common-input observations for
+research. New collateral-funding links are no longer added. Historical mixed
+edges are retained but are not used for public ownership attribution, and this
+job does not reset or affect the exact address-balance index.
 Set `SYS_EMISSIONS_MAX_BLOCKS` to backfill the Network Emissions index in chunks
 during the static cron run. The index reads each block's coinbase transaction,
 separates miner, sentry, and governance payouts, and subtracts RPC-reported

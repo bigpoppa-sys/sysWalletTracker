@@ -92,11 +92,10 @@ class RecoveryViewTests(unittest.TestCase):
 
     def test_empty_wallets_are_explicitly_rebuilding(self):
         snapshot = tracker.top_wallets_snapshot(self.store)
-        for result in (snapshot, snapshot["estimated_clusters"]):
-            self.assertEqual(result["wallets"], [])
-            self.assertFalse(result["index"]["complete"])
-            self.assertTrue(result["index"]["rebuilding"])
-            self.assertEqual(result["totals"]["balance_sats"], 0)
+        self.assertEqual(snapshot["wallets"], [])
+        self.assertFalse(snapshot["index"]["complete"])
+        self.assertTrue(snapshot["index"]["rebuilding"])
+        self.assertEqual(snapshot["totals"]["balance_sats"], 0)
         self.assert_banner(tracker.top_wallets_html(self.store, refresh_seconds=0), rankings=True)
 
     def test_incomplete_emission_rates_are_not_presented_as_supply_estimates(self):
@@ -128,14 +127,14 @@ class RecoveryViewTests(unittest.TestCase):
                 for key in ("top_wallet_index", "top_wallet_cluster_index"):
                     self.progress(key, **metadata)
                 snapshot = tracker.top_wallets_snapshot(self.store)
-                for result in (snapshot, snapshot["estimated_clusters"]):
+                for result in (snapshot, tracker.top_wallet_cluster_snapshot(self.store)):
                     self.assertEqual(result["index"]["safe_height"], target)
                     self.assertEqual(result["index"]["complete"], complete)
                     self.assertEqual(result["index"]["rebuilding"], not complete)
                 page = tracker.top_wallets_html(self.store, refresh_seconds=0)
                 if complete:
                     self.assertNotIn('<aside class="rebuilding-notice"', page)
-                    self.assertIn("Forensic cluster index complete to safe height", page)
+                    self.assertNotIn("Forensic cluster index", page)
                     self.assertIn("<span>Blocks Remaining</span><b>0</b>", page)
                 else:
                     self.assert_banner(page, rankings=True)
@@ -147,7 +146,7 @@ class RecoveryViewTests(unittest.TestCase):
         snapshot = tracker.top_wallets_snapshot(self.store)
         self.assertEqual(snapshot["totals"]["balance_sats"], 300_000_000)
         self.assertEqual([row["balance_sats"] for row in snapshot["wallets"]], [200_000_000, 100_000_000])
-        self.assertEqual(len(snapshot["estimated_clusters"]["wallets"]), 1)
+        self.assertNotIn("estimated_clusters", snapshot)
         page = tracker.top_wallets_html(self.store, refresh_seconds=0)
         self.assert_banner(page, rankings=True)
         self.assertIn("Addresses: indexed height 100 / safe height 1,988 (chain height 2,000)", page)
@@ -155,13 +154,14 @@ class RecoveryViewTests(unittest.TestCase):
         self.assertIn("Rebuilding: rankings are provisional", page)
         self.assertNotIn("Address balances are exact", page)
 
-    def test_cluster_rankings_stay_provisional_if_address_index_is_behind(self):
+    def test_address_rankings_stay_provisional_even_if_link_index_is_complete(self):
         self.seed_wallets()
         self.progress("top_wallet_index", last=100, confirmations=12)
         self.progress("top_wallet_cluster_index", confirmations=12)
         cluster = tracker.top_wallet_cluster_snapshot(self.store)
         self.assertTrue(cluster["index"]["complete"])
-        self.assertTrue(cluster["index"]["rebuilding"])
+        self.assertFalse(cluster["available"])
+        self.assertEqual(cluster["wallets"], [])
         page = tracker.top_wallets_html(self.store, refresh_seconds=0)
         self.assert_banner(page, rankings=True)
         self.assertNotIn("Forensic cluster index complete", page)
