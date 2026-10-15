@@ -77,13 +77,17 @@ class AddressAttributionTests(unittest.TestCase):
             self.assertNotIn(key, snapshot["totals"])
         self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM top_wallet_cluster_edges").fetchone()[0], 3)
 
-    def test_public_page_does_not_depend_on_cluster_progress_or_claim_holders(self):
+    def test_group_progress_does_not_change_exact_address_status_or_claim_holders(self):
         self.seed_node("customer", 1)
         self.seed_node("other", 2)
         page = tracker.top_wallets_html(self.store, refresh_seconds=0)
         for phrase in ("Estimated Holders", "Estimated Address Clusters", "Net Worth", "Sentry Operator", "Known Exchange SYS"):
             self.assertNotIn(phrase, page)
-        self.assertNotIn('class="rebuilding-notice"', page)
+        self.assertIn("Grouped Wallets", page)
+        self.assertIn("Links: not indexed", page)
+        exact_section = page.split("<h2>Largest Addresses</h2>", 1)[1].split("</section>", 1)[0]
+        self.assertNotIn("provisional", exact_section)
+        self.assertNotIn('class="rebuilding-notice"', exact_section)
         self.assertIn("Largest Addresses", page)
         self.assertIn("Sentry Collateral Addresses", page)
 

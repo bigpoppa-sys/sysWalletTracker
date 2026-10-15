@@ -3419,6 +3419,104 @@ def sentry_collateral_address_rows(store: Store) -> list[dict[str, Any]]:
     ]
 
 
+def estimated_wallet_groups_snapshot(store: Store, limit: int = 100) -> dict[str, Any]:
+    exchange_tags = load_exchange_tags()
+    wallet_labels = load_wallet_labels()
+    protected = set(exchange_tags) | set(wallet_labels)
+    union = UnionFind()
+    exchange_neighbors: list[tuple[str, str]] = []
+    edge_count = 0
+    # A recorded exchange/private address must never join its customers into one wallet.
+    for row in store.conn.execute("SELECT address_a, address_b FROM top_wallet_cluster_edges"):
+        a, b = row["address_a"], row["address_b"]
+        edge_count += 1
+        if a in protected or b in protected:
+            if a in exchange_tags and b not in protected:
+                exchange_neighbors.append((b, exchange_tags[a]))
+            if b in exchange_tags and a not in protected:
+                exchange_neighbors.append((a, exchange_tags[b]))
+            continue
+        union.union(a, b)
+
+    def group_key(address: str) -> str:
+        if address in wallet_labels:
+            return f"recorded:{address}"
+        if address in exchange_tags:
+            return f"exchange:{exchange_tags[address]}"
+        return f"linked:{union.find(address)}"
+
+    member_counts: dict[str, int] = {}
+    for address in list(union.parent):
+        key = group_key(address)
+        member_counts[key] = member_counts.get(key, 0) + 1
+    exchange_links: dict[str, set[str]] = {}
+    for address, exchange in exchange_neighbors:
+        exchange_links.setdefault(group_key(address), set()).add(exchange)
+    node_counts = {row["address"]: int(row["nodes"]) for row in sentry_collateral_address_rows(store)}
+    group_nodes: dict[str, int] = {}
+    for address, count in node_counts.items():
+        key = group_key(address)
+        group_nodes[key] = group_nodes.get(key, 0) + count
+
+    groups: dict[str, dict[str, Any]] = {}
+    for row in store.conn.execute(
+        "SELECT address, balance_sats, utxo_count, last_seen_height, last_seen_time "
+        "FROM top_wallet_balances WHERE balance_sats > 0 ORDER BY balance_sats DESC, address"
+    ):
+        address = row["address"]
+        key = group_key(address)
+        identity = wallet_identity_for_address(address, wallet_labels, exchange_tags)
+        group = groups.setdefault(key, {
+            "id": key, "address": address, "name": identity["name"], "label": identity["label"],
+            "balance_sats": 0, "utxo_count": 0, "members": [],
+            "last_seen_height": None, "last_seen_time": None,
+            "node_count": group_nodes.get(key, 0), "exchange_links": sorted(exchange_links.get(key, set())),
+        })
+        balance_sats = int(row["balance_sats"])
+        group["balance_sats"] += balance_sats
+        group["utxo_count"] += int(row["utxo_count"] or 0)
+        group["members"].append({
+            "address": address, "balance_sats": balance_sats, "balance_sys": sats_to_sys_string(balance_sats),
+            **identity, "node_count": node_counts.get(address, 0),
+        })
+        height = int_or_none(row["last_seen_height"])
+        if height is not None and height > (int_or_none(group["last_seen_height"]) or -1):
+            group["last_seen_height"], group["last_seen_time"] = height, row["last_seen_time"]
+
+    for key, group in groups.items():
+        group["address_count"] = len(group["members"])
+        group["linked_address_count"] = max(member_counts.get(key, 0), group["address_count"])
+        group["is_estimate"] = key.startswith("linked:") and group["linked_address_count"] > 1
+        group["balance_sys"] = sats_to_sys_string(group["balance_sats"])
+        if key.startswith("linked:"):
+            group["label"] = (
+                "Node-linked" if group["node_count"] else
+                "Exchange-linked" if group["exchange_links"] else
+                "Linked addresses" if group["is_estimate"] else "Unknown"
+            )
+
+    ordered = sorted(groups.values(), key=lambda item: (-item["balance_sats"], item["id"]))
+    balance_progress = top_wallet_progress(store)
+    balance_index = snapshot_index_status(balance_progress)
+    balance_index["rebuilding"] = balance_index["rebuilding"] or not groups or balance_progress.get("history_complete") is False
+    link_progress = top_wallet_cluster_progress(store)
+    index = snapshot_index_status(link_progress)
+    common_target = max(index.get("safe_height") or 0, balance_index.get("safe_height") or 0)
+    balance_index["rebuilding"] = balance_index["rebuilding"] or (balance_index.get("last_height") or 0) < common_target
+    index["rebuilding"] = (
+        index["rebuilding"] or balance_index["rebuilding"] or not edge_count
+        or (index.get("last_height") or 0) < common_target or link_progress.get("history_complete") is False
+    )
+    total_sats = sum(group["balance_sats"] for group in ordered)
+    return {
+        "generated_at": now_iso(), "type": "estimated_relationship_groups", "available": bool(edge_count),
+        "basis": "Historical links include joint spending and node funding, not proof of common ownership. Recorded identities are isolated.",
+        "index": index, "balance_index": balance_index, "limit": limit,
+        "totals": {"groups": len(groups), "balance_sats": total_sats, "edges": edge_count},
+        "groups": [{"rank": rank, **group} for rank, group in enumerate(ordered[:limit], 1)],
+    }
+
+
 def top_wallets_snapshot(store: Store, limit: int = 100) -> dict[str, Any]:
     progress = top_wallet_progress(store)
     exchange_tags = load_exchange_tags()
@@ -3480,6 +3578,7 @@ def top_wallets_snapshot(store: Store, limit: int = 100) -> dict[str, Any]:
             "utxos": int(totals["utxos"] or 0),
         },
         "wallets": wallets,
+        "estimated_groups": estimated_wallet_groups_snapshot(store, limit=limit),
     }
 
 
@@ -6892,6 +6991,7 @@ def dashboard_html(
 
 def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) -> str:
     snapshot = top_wallets_snapshot(store, limit=limit)
+    grouped = snapshot["estimated_groups"]
     wallets = snapshot["wallets"]
     index = snapshot["index"]
     totals = snapshot["totals"]
@@ -6956,6 +7056,41 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
         if index["rebuilding"] else f"At block {int(last_height):,}. Updated {html.escape(updated_text or '-')}"
     )
     recovery_notice = rebuilding_notice([("Addresses", index)], rankings=True)
+    group_notice = rebuilding_notice([("Links", grouped["index"]), ("Balances", grouped["balance_index"])], rankings=True)
+    group_rows = []
+    for group in grouped["groups"]:
+        label_class = (
+            "exchange" if group["label"] == "Exchange" else
+            "linked" if group["label"] == "Exchange-linked" else
+            "operator" if group["node_count"] else "unknown"
+        )
+        basis = "Estimated links" if group["is_estimate"] else "Recorded addresses" if group["label"] == "Exchange" else "Single address"
+        connections = ", ".join(group["exchange_links"])
+        connection_html = (
+            f"<small title='Historical transaction links, not proof of exchange ownership'>Linked to {html.escape(connections)}</small>"
+            if connections else ""
+        )
+        members = "".join(
+            f"<li><a href='{explorer_addr(member['address'])}'{NEW_TAB_ATTRS}>{html.escape(member['address'])}</a>"
+            f"<span>{html.escape(member['balance_sys'])} SYS</span></li>"
+            for member in group["members"]
+        )
+        member_label = "address" if group["address_count"] == 1 else "addresses"
+        node_label = "node" if group["node_count"] == 1 else "nodes"
+        node_html = f"<small>{group['node_count']:,} recorded {node_label}</small>" if group["node_count"] else ""
+        last_seen = fmt_utc_table_datetime(group["last_seen_time"]) if group["last_seen_time"] else "-"
+        group_rows.append(
+            "<tr>"
+            f"<td data-sort='{group['rank']}'>{group['rank']}</td>"
+            f"<td class='wallet-name' data-sort='{html.escape(group['name'].lower())}'>{html.escape(group['name'])}{connection_html}</td>"
+            f"<td data-sort='{html.escape(group['label'].lower())}'><span class='label-pill {label_class}'>{html.escape(group['label'])}</span>{node_html}</td>"
+            f"<td data-sort='{group['address_count']}'><details class='group-members'><summary>{group['address_count']:,} funded {member_label}</summary><ul>{members}</ul></details></td>"
+            f"<td class='amount' data-sort='{group['balance_sats']}' title='{html.escape(group['balance_sys'])} SYS'>{fmt_compact_sys(group['balance_sats'])}<small>{basis}</small></td>"
+            f"<td data-sort='{group['balance_sats']}'>{fmt_percent(group['balance_sats'], indexed_total_sats)}</td>"
+            f"<td data-sort='{group['last_seen_time'] or 0}'>{html.escape(last_seen)}</td>"
+            "</tr>"
+        )
+    grouped_rows_html = "\n".join(group_rows) or "<tr><td class='empty' colspan='7'>No wallet grouping data yet.</td></tr>"
 
     def wallet_table_controls(control_id: str, label: str) -> str:
         return f"""
@@ -7006,6 +7141,15 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
   <style>
     .rebuilding-notice {{ border-left: 3px solid var(--gold); margin: 16px 0; padding: 12px 16px; overflow-wrap: anywhere; }}
     .rebuilding-notice p {{ margin: 8px 0 0; }}
+    .group-note {{ color: var(--muted); font-size: 0.9rem; line-height: 1.5; margin: 10px 0; max-width: 1000px; }}
+    .group-table td small {{ color: var(--muted); display: block; font-size: 0.75rem; font-weight: 400; margin-top: 5px; white-space: normal; }}
+    .group-table .label-pill {{ line-height: 1.2; max-width: 100%; overflow-wrap: anywhere; white-space: normal; }}
+    .group-table .label-pill.linked {{ background: #143d3c; color: #a8ead3; }}
+    .group-members summary {{ color: #56c9ff; cursor: pointer; font-weight: 700; white-space: normal; }}
+    .group-members ul {{ list-style: none; margin: 8px 0 0; max-height: 240px; overflow-y: auto; padding: 0; }}
+    .group-members li {{ border-bottom: 1px solid var(--line); padding: 8px 0; }}
+    .group-members a {{ display: block; font-family: ui-monospace, monospace; font-size: 0.75rem; overflow-wrap: anywhere; }}
+    .group-members li span {{ color: var(--muted); display: block; font-size: 0.75rem; margin-top: 4px; }}
     :root {{ color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --page-gutter: clamp(24px, 3.8vw, 80px); --bg: #050b12; --panel: #0b1622; --panel-soft: #102235; --line: #21384f; --ink: #e9f6ff; --muted: #8da8bb; --teal: #00d4ff; --accent: #2f8cff; --gold: #f5b84b; --shadow: 0 18px 48px rgba(0, 10, 24, 0.34); }}
     *, *::before, *::after {{ box-sizing: border-box; }}
     html, body {{ margin: 0; max-width: 100%; overflow-x: hidden; }}
@@ -7130,6 +7274,29 @@ def top_wallets_html(store: Store, refresh_seconds: int = 60, limit: int = 100) 
       <div class="metric"><span>Blocks Remaining</span><b>{html.escape(remaining_text)}</b></div>
       <div class="metric"><span>Addresses</span><b>{int(totals['addresses']):,}</b></div>
       <div class="metric"><span>Indexed Balance</span><b title="{html.escape(str(totals['balance_sys']))} SYS">{fmt_compact_sys(indexed_total_sats)}</b></div>
+    </section>
+    <section class="section-panel">
+      <div class="panel-title">
+        <h2>Grouped Wallets</h2>
+        <p>Relationship estimates</p>
+      </div>
+      <p class="group-note">Linked addresses can belong to different owners. Node-linked groups contain Sentry collateral; exchange links do not prove ownership. Named exchange balances include recorded addresses only.</p>
+      {group_notice}
+      {wallet_table_controls("wallet-groups", "Grouped wallets")}
+      <div class="table-wrap">
+        <table class="sortable-wallet-table group-table" id="wallet-groups-table">
+          <thead><tr>
+            <th data-sort="number" data-default-dir="asc" aria-sort="ascending"><button class="sort-button" type="button">Rank<span class="sort-icon" aria-hidden="true"></span></button></th>
+            <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Wallet / Group<span class="sort-icon" aria-hidden="true"></span></button></th>
+            <th data-sort="text" data-default-dir="asc" aria-sort="none"><button class="sort-button" type="button">Label<span class="sort-icon" aria-hidden="true"></span></button></th>
+            <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Members<span class="sort-icon" aria-hidden="true"></span></button></th>
+            <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Combined Balance<span class="sort-icon" aria-hidden="true"></span></button></th>
+            <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">% of Indexed SYS<span class="sort-icon" aria-hidden="true"></span></button></th>
+            <th data-sort="number" data-default-dir="desc" aria-sort="none"><button class="sort-button" type="button">Last Change<span class="sort-icon" aria-hidden="true"></span></button></th>
+          </tr></thead>
+          <tbody>{grouped_rows_html}</tbody>
+        </table>
+      </div>
     </section>
     <section class="section-panel">
       <div class="panel-title">

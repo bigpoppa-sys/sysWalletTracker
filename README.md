@@ -28,7 +28,7 @@ The dashboard has these pages:
 
 - `/` tracks Binance hot-wallet recipient flows.
 - `/sentrynode` tracks the current network sentry node list from RPC, setup/takedown dates, moved collateral destination, and exchange label when the moved-to address is known.
-- `/top-wallets` shows the top 100 individual address balances from the local RPC-derived UTXO index, followed by Sentry counts at each collateral address. `/top-wallets.json` exposes address balances only. Neither page nor JSON assigns ownership to connected address groups.
+- `/top-wallets` shows grouped-wallet relationship estimates, followed by the top 100 individual address balances and Sentry counts at each collateral address. `/top-wallets.json` keeps exact address rows in `wallets` and relationship estimates separately in `estimated_groups`.
 - `/emissions` shows indexed UTXO miner, sentry node, governance, NEVM miner reward, priority fee, and fee-burn data. `/emissions.json` exposes the same prebuilt data.
 
 Manual top-wallet names can be added to `wallet_labels.csv` with
@@ -42,8 +42,16 @@ The homepage uses the same completed address index as Top Wallets. During a
 rebuild it may show a dated, cached Blockbook balance instead; partial rankings
 remain marked provisional. Direct receipts are historical first-hop transfers
 to that exact address, not its current holdings or receipts of related addresses.
-Legacy graph rows are retained for research, but their mixed link types cannot
-establish common ownership. The legacy cluster JSON export returns
+Historical links include joint spending and collateral-funding payments; they
+cannot establish common ownership. The grouped view excludes recorded exchange
+and private identities, including their incident links, before connecting other
+addresses. Named exchange rows sum only explicitly recorded same-exchange
+addresses. Adjacent exchange links are relationship notes, not ownership labels.
+Node-linked groups contain recorded collateral but are not verified operators.
+Each group exposes its funded members and individual balances, and shows whether
+its grouping is estimated. Incomplete link/balance indexes make grouped rankings
+provisional without changing the status of the independent address table.
+The legacy cluster JSON export still returns
 `available=false` with link counts only, not holder rankings or exchange totals.
 Normal publication also replaces an existing `top-wallet-clusters.json` with
 these diagnostics, even when the historical link-index job is disabled.
